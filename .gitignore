@@ -1,14 +1,106 @@
-.env
-*.log
-.DS_Store
+# Based on github/gitignore (macOS + Bash + common editor/tooling)
+# https://github.com/github/gitignore
 
-# Editor swap files
+# ────────────────────────────────────────────────────────────────────────────
+# Project secrets and runtime state (most important — never commit these)
+# ────────────────────────────────────────────────────────────────────────────
+# Local environment / credentials (use .env.example as the template)
+.env
+.env.local
+.env.*.local
+
+# Runtime logs and backups
+*.log
+logs/
+*.bak
+*.orig
+
+# Pre-commit hook scratch
+/tmp/precommit-hit.*
+
+# ────────────────────────────────────────────────────────────────────────────
+# macOS — https://github.com/github/gitignore/blob/main/Global/macOS.gitignore
+# ────────────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# ────────────────────────────────────────────────────────────────────────────
+# Editors / IDEs
+# ────────────────────────────────────────────────────────────────────────────
+# vim / nvim
 *.swp
 *.swo
+*.swn
+Session.vim
+.netrwhist
+tags
 
-# Ruby (in case anything ruby-ish gets added)
+# VS Code (keep .vscode/settings.json if it ever gets shared; ignore the rest)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+.history/
+
+# JetBrains
+.idea/
+*.iml
+
+# Sublime / TextMate
+*.sublime-workspace
+*.tmproj
+
+# Emacs
+*~
+\#*\#
+.\#*
+.dir-locals.el
+
+# ────────────────────────────────────────────────────────────────────────────
+# Tooling — anything that might land here later
+# ────────────────────────────────────────────────────────────────────────────
+# Ruby / bundler (if fastlane or similar gets added)
 vendor/bundle/
 .bundle/
+Gemfile.lock
 
-# Hook test artifacts
-/tmp/precommit-hit.*
+# Node (very unlikely but defensive)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python (defensive)
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# AI / coding assistants (don't leak local notes)
+.cursor/
+.cursorignore
+.windsurf/
+.continue/
+.aider*
