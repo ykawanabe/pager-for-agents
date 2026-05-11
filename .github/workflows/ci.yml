@@ -18,6 +18,7 @@ jobs:
           shellcheck \
             install.sh \
             uninstall.sh \
+            scripts/check-no-secrets.sh \
             scripts/restart_claude.sh \
             scripts/start_agents.sh \
             scripts/watch_network.sh
@@ -28,7 +29,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: bash -n on every shell script
         run: |
-          for f in install.sh uninstall.sh scripts/*.sh; do
+          for f in install.sh uninstall.sh scripts/*.sh tests/*.sh; do
             echo "→ $f"
             bash -n "$f"
           done
+
+  tests:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shell tests
+        run: tests/run.sh

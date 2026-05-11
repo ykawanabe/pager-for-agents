@@ -21,10 +21,19 @@ PATTERNS=(
   '\b[0-9]{8,12}:[A-Za-z0-9_-]{35,}\b'
   # Personal home paths — we use $HOME everywhere.
   '/Users/[a-z][a-z0-9_-]+'
-  # Personal email pattern (anyone's, not just the maintainer's).
-  # Excludes the literal example "you@example.com".
-  # Note: matches user@example.com generally; tighten if too noisy.
-  '\b[A-Za-z0-9._%+-]+@(?!example\.com)[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+  # Email addresses. BSD/macOS `grep -E` has no PCRE lookahead, so we filter
+  # known-safe domains (example.com, noreply addresses) after the match
+  # instead of trying to bake them into the regex.
+  '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+)
+
+# Post-match filter: lines containing any of these substrings are dropped
+# before deciding whether to block the commit.
+ALLOW=(
+  '@example.com'
+  '@example.org'
+  '@example.net'
+  'users.noreply.github.com'
 )
 
 HIT=0
@@ -37,16 +46,17 @@ for file in $CHANGED; do
   [[ -f "$file" ]] || continue
 
   for pat in "${PATTERNS[@]}"; do
-    if grep -nE "$pat" "$file" > /tmp/precommit-hit.$$ 2>/dev/null; then
-      if [[ -s /tmp/precommit-hit.$$ ]]; then
-        printf '\033[31m✗ %s — matched %s\033[0m\n' "$file" "$pat" >&2
-        cat /tmp/precommit-hit.$$ | sed 's/^/    /' >&2
-        HIT=1
-      fi
-    fi
+    matches=$(grep -nE "$pat" "$file" 2>/dev/null || true)
+    [[ -n "$matches" ]] || continue
+    for allow in "${ALLOW[@]}"; do
+      matches=$(printf '%s\n' "$matches" | grep -Fv "$allow" || true)
+    done
+    [[ -n "$matches" ]] || continue
+    printf '\033[31m✗ %s — matched %s\033[0m\n' "$file" "$pat" >&2
+    printf '%s\n' "$matches" | sed 's/^/    /' >&2
+    HIT=1
   done
 done
-rm -f /tmp/precommit-hit.$$
 
 if [[ $HIT -ne 0 ]]; then
   cat >&2 <<EOF

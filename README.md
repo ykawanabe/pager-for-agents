@@ -5,7 +5,7 @@ Run [Claude Code](https://code.claude.com/) as a persistent Telegram agent on ma
 `install.sh` wires together three things:
 
 1. A `tmux` session that keeps `claude` running in a `while true` loop with the official Telegram channel plugin attached.
-2. A network watchdog that restarts the session when connectivity returns after an outage.
+2. A watchdog that restarts the session when the network returns after an outage **or** when the MCP plugin silently dies (claude alive, `bun server.ts` gone).
 3. A `launchd` LaunchAgent so both come up automatically at login.
 
 It also (optionally) provisions the bot token and allowlist at the canonical location the Claude Code Telegram plugin auto-discovers — so once `install.sh` finishes, the bot is live.
@@ -111,6 +111,16 @@ Common issues:
 - `claude: command not found` from the LaunchAgent — PATH issue in the plist, see troubleshooting doc.
 - Messages not arriving — check the allowlist matches your Telegram user ID.
 - After network outage, claude doesn't reconnect — verify both `claude` and `watchdog` tmux sessions are alive: `tmux ls`.
+
+## Development
+
+Run the shell test suite locally:
+
+```sh
+tests/run.sh
+```
+
+Covers `mcp_healthy`, `kick_claude_session`, and the `check-no-secrets` pre-commit hook. CI runs the same suite on every push.
 
 ## Uninstall
 

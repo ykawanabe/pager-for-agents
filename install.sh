@@ -117,7 +117,7 @@ else
 
   if [[ -z "${ALLOW_ID:-}" ]]; then
     printf "⚠  No allowlist configured. ANYONE who finds the bot can DM Claude.\n"
-    printf "   Strongly recommend: set ALLOWED_USERS later in $TELEGRAM_ACCESS.\n"
+    printf '   Strongly recommend: set ALLOWED_USERS later in %s.\n' "$TELEGRAM_ACCESS"
     cat > "$TELEGRAM_ACCESS" <<'EOF'
 {
   "dmPolicy": "open",
