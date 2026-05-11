@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: brew install shellcheck
+      - name: Lint shell scripts
+        run: |
+          shellcheck \
+            install.sh \
+            uninstall.sh \
+            scripts/restart_claude.sh \
+            scripts/start_agents.sh \
+            scripts/watch_network.sh
+
+  bash-syntax:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n on every shell script
+        run: |
+          for f in install.sh uninstall.sh scripts/*.sh; do
+            echo "→ $f"
+            bash -n "$f"
+          done

@@ -1,0 +1,24 @@
+# Pre-commit hooks. Install with:
+#   brew install pre-commit gitleaks
+#   pre-commit install
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: no-personal-info
+        name: Block personal info (regex)
+        entry: scripts/check-no-secrets.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+
+      - id: shell-syntax
+        name: bash -n (shell syntax check)
+        entry: bash -c 'for f in install.sh uninstall.sh scripts/*.sh; do bash -n "$f" || exit 1; done'
+        language: system
+        pass_filenames: false
+        always_run: true
