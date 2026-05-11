@@ -104,3 +104,10 @@ __pycache__/
 .windsurf/
 .continue/
 .aider*
+
+# Claude Code auto-memory. The real files live at
+# ~/.claude/projects/-<encoded-cwd>/memory/ (auto-memory home); the
+# in-repo `memory` is a symlink there for convenience. Contains personal
+# context — never commit to the OSS repo. No trailing slash so the rule
+# also matches the symlink itself, not just a real directory.
+/memory
