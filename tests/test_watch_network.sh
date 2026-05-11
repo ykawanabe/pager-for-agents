@@ -80,6 +80,27 @@ fi
 
 unset -f tmux sleep
 
+# Failure path: when the session isn't present after restart, kick must
+# return non-zero so callers can detect it (instead of logging fake success
+# and moving on, which is what happened before the verify step was added).
+TMUX_CALLS=()
+tmux() {
+  TMUX_CALLS+=("$*")
+  case "$1" in
+    has-session) return 1 ;;  # simulate session didn't actually start
+    *)           return 0 ;;
+  esac
+}
+sleep() { :; }
+
+if kick_claude_session "verify failure" > /dev/null 2>&1; then
+  ng "kick_claude_session: returns non-zero on verify failure"
+else
+  ok "kick_claude_session: returns non-zero on verify failure"
+fi
+
+unset -f tmux sleep
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo

@@ -64,6 +64,17 @@ else
   say "Wrote $CONFIG_DIR/.env (CLAUDE_CWD=$CLAUDE_CWD_INPUT)"
 fi
 
+# Generate a stable session UUID if one isn't already present. With it,
+# `restart_claude.sh` passes `--session-id $BOT_SESSION_ID` so the bot resumes
+# the same Claude Code conversation across restarts (sleep, crash, kick).
+# Without it, every restart wipes context — bad UX for a chat bot.
+# This is a v0 patch; multi-topic mode replaces it with per-topic sessions.
+if ! grep -q '^BOT_SESSION_ID=..*' "$CONFIG_DIR/.env" 2>/dev/null; then
+  bot_uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  printf '\nBOT_SESSION_ID=%s\n' "$bot_uuid" >> "$CONFIG_DIR/.env"
+  say "Generated BOT_SESSION_ID=$bot_uuid for conversation persistence"
+fi
+
 # ---- 3. Install scripts -----------------------------------------------------
 mkdir -p "$BIN_DIR"
 for s in restart_claude.sh watch_network.sh start_agents.sh; do

@@ -17,6 +17,9 @@ set +a
 
 BIN_DIR="$HOME/.local/bin"
 LOG_FILE="$HOME/.claude-telegram-agent/agent.log"
+LOG_DIR="$(dirname "$LOG_FILE")"
+LOG_ROTATE_MAX_BYTES=$((10 * 1024 * 1024))  # 10 MB
+LOG_ARCHIVE_RETAIN_DAYS=30
 
 # `tmux pipe-pane` mirrors pane output to a file while still rendering it in
 # the pane itself. We use it so `~/agent.log` actually contains live activity
@@ -26,6 +29,26 @@ pipe_to_log() {
   local session="$1"
   tmux pipe-pane -t "$session" -o "cat >> $LOG_FILE" || true
 }
+
+# Archive the active log if it has grown past the size threshold, then prune
+# archives older than $LOG_ARCHIVE_RETAIN_DAYS. Runs every time the agents
+# (re)start — combined with the watchdog kicks during the day, this keeps
+# disk usage bounded without needing a separate cron job. In-place rotation
+# during a tmux pipe-pane run isn't safe (the writer's fd holds the old
+# inode), so we only rotate at startup.
+rotate_logs() {
+  if [[ -f "$LOG_FILE" ]]; then
+    local size
+    size=$(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
+    if [[ "$size" -gt "$LOG_ROTATE_MAX_BYTES" ]]; then
+      /bin/mv -f "$LOG_FILE" "$LOG_FILE.$(date +%Y%m%d-%H%M%S)"
+    fi
+  fi
+  find "$LOG_DIR" -maxdepth 1 -name 'agent.log.*' -type f \
+    -mtime +"$LOG_ARCHIVE_RETAIN_DAYS" -delete 2>/dev/null || true
+}
+
+rotate_logs
 
 # Kill any existing sessions before relaunching.
 tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true

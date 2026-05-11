@@ -41,6 +41,15 @@ kick_claude_session() {
   # Re-attach pipe-pane so the recreated session's output keeps landing in
   # the activity log; otherwise the log goes silent after the first kick.
   tmux pipe-pane -t "$TMUX_SESSION_CLAUDE" -o "cat >> $HOME/.claude-telegram-agent/agent.log" || true
+  # Verify: silent failures here used to leave the user with a dead bot and
+  # a log line that lied about success. Return non-zero so callers can see
+  # the failure (and so the test can assert against it).
+  if tmux has-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] kick complete — session active"
+    return 0
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ kick failed — session not present after restart" >&2
+  return 1
 }
 
 # Returns 0 (healthy) if claude isn't running yet, OR if both claude and the
@@ -53,14 +62,40 @@ mcp_healthy() {
 
 main_loop() {
   load_env
+  # Two probes: general internet (PING_TARGET) and Telegram itself
+  # (TELEGRAM_PING_TARGET). Pinging only 8.8.8.8 misses the failure mode
+  # where the network is up but api.telegram.org is unreachable (carrier
+  # block, Telegram outage, DNS issue) — the bot's poll loop sits idle
+  # without any external signal. We kick on transition out of either down
+  # state.
+  local NET_TARGET="${PING_TARGET:-8.8.8.8}"
+  local TG_TARGET="${TELEGRAM_PING_TARGET:-api.telegram.org}"
   local WAS_OFFLINE=0
+  local WAS_TG_DOWN=0
   local MCP_FAILS=0
 
   while true; do
-    if ping -c 1 -W 2 "$PING_TARGET" > /dev/null 2>&1; then
-      if [[ "$WAS_OFFLINE" -eq 1 ]]; then
-        kick_claude_session "Network restored"
+    local net_up=0 tg_up=0
+    ping -c 1 -W 2 "$NET_TARGET" > /dev/null 2>&1 && net_up=1
+    ping -c 1 -W 2 "$TG_TARGET"  > /dev/null 2>&1 && tg_up=1
+
+    if [[ "$net_up" -eq 0 && "$tg_up" -eq 0 ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Offline (network + Telegram both unreachable)"
+      WAS_OFFLINE=1
+      WAS_TG_DOWN=1
+      MCP_FAILS=0
+    elif [[ "$tg_up" -eq 0 ]]; then
+      # Network is up but Telegram is blocked. Don't kick — the bot can't
+      # reach Telegram anyway, restarting won't help. Wait for recovery.
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online but Telegram unreachable"
+      WAS_TG_DOWN=1
+      MCP_FAILS=0
+    else
+      # Both reachable.
+      if [[ "$WAS_OFFLINE" -eq 1 || "$WAS_TG_DOWN" -eq 1 ]]; then
+        kick_claude_session "Connectivity restored"
         WAS_OFFLINE=0
+        WAS_TG_DOWN=0
         MCP_FAILS=0
       else
         if mcp_healthy; then
@@ -75,10 +110,6 @@ main_loop() {
           fi
         fi
       fi
-    else
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Offline"
-      WAS_OFFLINE=1
-      MCP_FAILS=0
     fi
     sleep "$PING_INTERVAL"
   done
