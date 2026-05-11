@@ -38,6 +38,9 @@ kick_claude_session() {
   tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
   sleep 2
   tmux new-session -d -s "$TMUX_SESSION_CLAUDE" "$HOME/.local/bin/restart_claude.sh" || true
+  # Re-attach pipe-pane so the recreated session's output keeps landing in
+  # the activity log; otherwise the log goes silent after the first kick.
+  tmux pipe-pane -t "$TMUX_SESSION_CLAUDE" -o "cat >> $HOME/.claude-telegram-agent/agent.log" || true
 }
 
 # Returns 0 (healthy) if claude isn't running yet, OR if both claude and the

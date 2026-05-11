@@ -70,6 +70,14 @@ else
   ng "kick_claude_session: spawns new restart_claude.sh session (got '${TMUX_CALLS[1]}')"
 fi
 
+# Recreated session must get pipe-pane re-attached, otherwise the activity
+# log goes dark after the first kick — exactly the bug the user hit.
+if [[ "${TMUX_CALLS[2]}" == "pipe-pane -t claude-test -o cat >> "*"agent.log" ]]; then
+  ok "kick_claude_session: re-attaches pipe-pane to agent.log"
+else
+  ng "kick_claude_session: re-attaches pipe-pane to agent.log (got '${TMUX_CALLS[2]}')"
+fi
+
 unset -f tmux sleep
 
 # ─── summary ─────────────────────────────────────────────────────────────────
