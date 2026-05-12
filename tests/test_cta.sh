@@ -326,6 +326,111 @@ RC=$?
 
 rm -rf "$CFG_TMP"
 
+# ─── _caffeinate_alive: PID-file liveness check ──────────────────────────────
+#
+# Pure liveness test. No file → not alive. File with bogus PID → not alive.
+# File with our own $$ → alive (we're running, by definition).
+
+CAFFEINATE_PID_FILE=$(mktemp -u)   # path, not file — start absent
+
+! _caffeinate_alive && ok "_caffeinate_alive: missing file → not alive" \
+                    || ng "_caffeinate_alive: missing file should be not-alive"
+
+# Bogus PID — pick something unlikely to exist. PIDs > 99999 are
+# vanishingly rare on macOS in normal sessions.
+echo "999999" > "$CAFFEINATE_PID_FILE"
+! _caffeinate_alive && ok "_caffeinate_alive: stale PID → not alive" \
+                    || ng "_caffeinate_alive: PID 999999 should be not-alive"
+
+# Use our own PID — guaranteed alive while this test runs.
+echo "$$" > "$CAFFEINATE_PID_FILE"
+_caffeinate_alive && ok "_caffeinate_alive: live PID (self) → alive" \
+                  || ng "_caffeinate_alive: own PID $$ should be alive"
+
+# Empty PID file (zero bytes) is a degenerate state we should handle, not
+# crash on. A `kill -0 ""` would error noisily; the helper must treat it as
+# "not alive" cleanly.
+: > "$CAFFEINATE_PID_FILE"
+! _caffeinate_alive && ok "_caffeinate_alive: empty file → not alive" \
+                    || ng "_caffeinate_alive: empty file should be not-alive"
+
+rm -f "$CAFFEINATE_PID_FILE"
+
+# ─── _config_caffeinate: arg validation ──────────────────────────────────────
+#
+# Don't actually spawn caffeinate in the test — that would race with the
+# user's real one if they have it on. Override the start/stop helpers with
+# stubs that record what was called.
+
+CAFFEINATE_CALLS=""
+_caffeinate_start() { CAFFEINATE_CALLS+="start;"; }
+_caffeinate_stop()  { CAFFEINATE_CALLS+="stop;";  }
+
+CAFFEINATE_CALLS=""
+_config_caffeinate on >/dev/null 2>&1
+[[ "$CAFFEINATE_CALLS" == "start;" ]] \
+  && ok "_config_caffeinate on: calls _caffeinate_start" \
+  || ng "_config_caffeinate on: expected 'start;', got '$CAFFEINATE_CALLS'"
+
+CAFFEINATE_CALLS=""
+_config_caffeinate off >/dev/null 2>&1
+[[ "$CAFFEINATE_CALLS" == "stop;" ]] \
+  && ok "_config_caffeinate off: calls _caffeinate_stop" \
+  || ng "_config_caffeinate off: expected 'stop;', got '$CAFFEINATE_CALLS'"
+
+# Bad arg → non-zero exit, no spawn.
+CAFFEINATE_CALLS=""
+_config_caffeinate banana >/dev/null 2>&1 && ng "_config_caffeinate banana: should exit non-zero" \
+                                          || ok "_config_caffeinate banana: rejected"
+[[ -z "$CAFFEINATE_CALLS" ]] \
+  && ok "_config_caffeinate banana: did not spawn" \
+  || ng "_config_caffeinate banana: leaked a call ('$CAFFEINATE_CALLS')"
+
+# Missing arg → usage error, non-zero exit.
+CAFFEINATE_CALLS=""
+_config_caffeinate "" >/dev/null 2>&1 && ng "_config_caffeinate (empty): should exit non-zero" \
+                                      || ok "_config_caffeinate (empty): rejected"
+
+# ─── cmd_status: caffeinate field exposed in JSON ────────────────────────────
+#
+# Re-run cmd_status with caffeinate "alive" via stubbed PID file and confirm
+# the JSON output advertises it. Lock the schema contract so future Pager (or
+# any other UI) can rely on the field's presence.
+
+# Earlier blocks `unset -f _tmux_session_alive launchctl` to test the
+# stripped-PATH path. Re-stub the data sources cmd_status needs so it can
+# run cleanly here.
+_la_loaded()          { return 0; }
+_claude_ps_line()     { echo ""; }
+_mcp_alive()          { return 1; }
+_tmux_session_alive() { return 1; }
+_last_activity()      { echo ""; }
+
+CAFFEINATE_PID_FILE=$(mktemp)
+echo "$$" > "$CAFFEINATE_PID_FILE"
+JSON_CAFF=$(cmd_status json)
+echo "$JSON_CAFF" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+caff = data["caffeinate"]
+assert caff["alive"] is True, "alive should be True, got " + repr(caff)
+assert isinstance(caff["pid"], int), "pid should be int, got " + repr(caff["pid"])
+' \
+  && ok "cmd_status json: caffeinate.alive=true exposed" \
+  || ng "cmd_status json: caffeinate field missing or malformed"
+
+rm -f "$CAFFEINATE_PID_FILE"
+JSON_NOCAFF=$(cmd_status json)
+echo "$JSON_NOCAFF" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+caff = data["caffeinate"]
+assert caff["alive"] is False, "alive should be False, got " + repr(caff)
+assert caff["pid"] is None, "pid should be null, got " + repr(caff["pid"])
+' \
+  && ok "cmd_status json: caffeinate.alive=false when no pid file" \
+  || ng "cmd_status json: caffeinate=off state wrong"
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo

@@ -41,6 +41,7 @@ BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
 ACCESS_FILE="$HOME/.claude/channels/telegram/access.json"
 START_SCRIPT="$HOME/.local/bin/start_agents.sh"
 ENV_FILE="$HOME/.claude-telegram-agent/.env"
+CAFFEINATE_PID_FILE="$HOME/.claude-telegram-agent/caffeinate.pid"
 
 # Default emoji used by `cta config ack on`. Must be in Telegram's free-bot
 # reaction whitelist — eyes reads as "seen" and is universally available.
@@ -145,6 +146,14 @@ cmd_status() {
   local activity
   activity=$(_last_activity)
 
+  local caffeinate_pid="" caffeinate_alive
+  if _caffeinate_alive; then
+    caffeinate_alive=true
+    caffeinate_pid=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null)
+  else
+    caffeinate_alive=false
+  fi
+
   if [[ "$format" == "json" ]]; then
     local rss_mb=""
     [[ -n "$rss_kb" ]] && rss_mb=$(( rss_kb / 1024 ))
@@ -158,6 +167,7 @@ cmd_status() {
     "claude": {"name": $(_json_str_or_null "$TMUX_SESSION_CLAUDE"), "alive": $tmux_claude},
     "watchdog": {"name": $(_json_str_or_null "$TMUX_SESSION_WATCHDOG"), "alive": $tmux_watchdog}
   },
+  "caffeinate": {"alive": $caffeinate_alive, "pid": $(_json_int_or_null "$caffeinate_pid")},
   "last_activity": $(_json_str_or_null "$activity")
 }
 EOF
@@ -172,6 +182,11 @@ EOF
       "$(printf '%*s' $((10 - ${#TMUX_SESSION_CLAUDE})) '')" "$tmux_claude"
     printf 'tmux %s:%s %s\n' "$TMUX_SESSION_WATCHDOG" \
       "$(printf '%*s' $((10 - ${#TMUX_SESSION_WATCHDOG})) '')" "$tmux_watchdog"
+    if [[ "$caffeinate_alive" == "true" ]]; then
+      printf 'Caffeinate:       %s (pid %s)\n' "$caffeinate_alive" "$caffeinate_pid"
+    else
+      printf 'Caffeinate:       %s\n' "$caffeinate_alive"
+    fi
     printf 'Last activity:    %s\n' "${activity:-(none)}"
   fi
 }
@@ -250,14 +265,15 @@ cmd_config() {
   local sub="${1:-}"
   shift 2>/dev/null || true
   case "$sub" in
-    ack) _config_ack "${1:-}" ;;
+    ack)        _config_ack "${1:-}" ;;
+    caffeinate) _config_caffeinate "${1:-}" ;;
     "")
-      echo "Usage: cta config ack <on|off>" >&2
+      echo "Usage: cta config <ack|caffeinate> <on|off>" >&2
       return 1
       ;;
     *)
       echo "Unknown config subcommand: $sub" >&2
-      echo "Usage: cta config ack <on|off>" >&2
+      echo "Usage: cta config <ack|caffeinate> <on|off>" >&2
       return 1
       ;;
   esac
@@ -303,16 +319,77 @@ PY
   fi
 }
 
+# Returns 0 if the CLI-managed caffeinate process is alive. PID file exists
+# AND that PID is currently running — guards against stale pid files left by
+# `kill -9`, OS reboots, etc.
+_caffeinate_alive() {
+  [[ -f "$CAFFEINATE_PID_FILE" ]] || return 1
+  local pid
+  pid=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null) || return 1
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# Spawn `caffeinate -i` detached from this cta process so it survives the
+# command exit. `-i` blocks idle system sleep but lets the display dim — same
+# semantics as Pager's CaffeinateController. We don't mirror Pager's "AC-only"
+# mode: that needs a power-state watcher running continuously and cta is
+# one-shot. Users who want AC-conditional behavior should use Pager.
+_caffeinate_start() {
+  if _caffeinate_alive; then
+    echo "Already running (pid $(cat "$CAFFEINATE_PID_FILE"))."
+    return 0
+  fi
+  mkdir -p "$(dirname "$CAFFEINATE_PID_FILE")"
+  # nohup + & + disown: caffeinate keeps running after cta exits. setsid would
+  # be cleaner but macOS doesn't ship it.
+  nohup /usr/bin/caffeinate -i >/dev/null 2>&1 &
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+  echo "$pid" > "$CAFFEINATE_PID_FILE"
+  echo "Started caffeinate -i (pid $pid)."
+}
+
+_caffeinate_stop() {
+  if ! _caffeinate_alive; then
+    rm -f "$CAFFEINATE_PID_FILE"
+    echo "Not running."
+    return 0
+  fi
+  local pid
+  pid=$(cat "$CAFFEINATE_PID_FILE")
+  kill "$pid" 2>/dev/null || true
+  rm -f "$CAFFEINATE_PID_FILE"
+  echo "Stopped caffeinate (pid $pid)."
+}
+
+_config_caffeinate() {
+  local val="${1:-}"
+  case "$val" in
+    on)  _caffeinate_start ;;
+    off) _caffeinate_stop ;;
+    "")
+      echo "Usage: cta config caffeinate <on|off>" >&2
+      return 1
+      ;;
+    *)
+      echo "Invalid value: $val (expected 'on' or 'off')" >&2
+      return 1
+      ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 cta — claude-telegram-agent CLI
 
 Usage:
-  cta status [--json]      Show agent health (text by default, JSON for tooling)
-  cta start                Load LaunchAgent + spawn tmux sessions
-  cta stop                 Kill tmux sessions + unload LaunchAgent
-  cta config ack <on|off>  Toggle the bot's per-message ack reaction
-  cta help                 This message
+  cta status [--json]             Show agent health (text by default, JSON for tooling)
+  cta start                       Load LaunchAgent + spawn tmux sessions
+  cta stop                        Kill tmux sessions + unload LaunchAgent
+  cta config ack <on|off>         Toggle the bot's per-message ack reaction
+  cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
+  cta help                        This message
 
 Reads ~/.claude-telegram-agent/.env for configurable tmux session names.
 

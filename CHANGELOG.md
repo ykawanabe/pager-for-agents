@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 - `cta config ack <on|off>` — toggle the bot's per-message ack reaction without hand-editing access.json. `on` writes `ackReaction: "👀"` (Telegram's whitelist-friendly "seen" emoji), `off` removes the key entirely. Plugin re-reads access.json per request so the change is live on the next message (no bot restart). Default emoji kept in sync with Pager's `kDefaultAckEmoji` constant. 5 new tests in `test_cta.sh` (round-trip, allowlist preservation, key removal on off, invalid-value rejection, missing-file error).
+- `cta config caffeinate <on|off>` — keep the Mac awake (`caffeinate -i`) so the bot keeps polling Telegram. `on` spawns the process detached (`nohup … & disown`) and writes the PID to `~/.claude-telegram-agent/caffeinate.pid`; `off` reads the PID and kills it. Liveness check via `kill -0` guards against stale PID files. `cta status` (text + JSON, additive field — schema_version stays at 1) now exposes the caffeinate state for Pager / tooling. Pager's `CaffeinateController` is the richer surface (AC-only conditional, plug/unplug-driven re-evaluation); cta is the always-on counterpart for non-Pager users or scripted setups. 11 new tests cover liveness states (missing file / stale PID / live PID / empty file), arg validation (`on`/`off`/`""`/bad), and the new JSON field.
 
 ## [0.1.3] - 2026-05-12
 
