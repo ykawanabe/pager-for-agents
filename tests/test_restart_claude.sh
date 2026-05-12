@@ -119,6 +119,40 @@ flag=$(session_arg_flag "/tmp/fakehome/other-home" "$UUID")
 [[ "$flag" == "--session-id" ]] && ok "different cwd → --session-id" \
   || ng "different cwd → expected --session-id, got $flag"
 
+# ─── resolve_append_prompt: env-driven prompt selection ──────────────────────
+#
+# The bot passes claude `--append-system-prompt <text>` so its replies stop
+# emitting Markdown that Telegram renders literally. The helper picks the
+# right text given the user's .env value:
+#   ""    → default
+#   "off" → empty (no append)
+#   "..." → custom text passes through verbatim
+
+DEFAULT="default prompt text"
+
+# Unset / empty → default.
+[[ "$(resolve_append_prompt "" "$DEFAULT")" == "$DEFAULT" ]] \
+  && ok "resolve_append_prompt: empty env → default" \
+  || ng "resolve_append_prompt: empty env should yield default"
+
+# "off" → empty string (caller drops the --append-system-prompt arg entirely).
+[[ -z "$(resolve_append_prompt "off" "$DEFAULT")" ]] \
+  && ok "resolve_append_prompt: 'off' → empty (no append)" \
+  || ng "resolve_append_prompt: 'off' should yield empty"
+
+# Custom text passes through, even when it happens to be long.
+CUSTOM="be brief; no markdown"
+[[ "$(resolve_append_prompt "$CUSTOM" "$DEFAULT")" == "$CUSTOM" ]] \
+  && ok "resolve_append_prompt: custom text → custom (override)" \
+  || ng "resolve_append_prompt: custom override broken"
+
+# "off" is case-sensitive — guard against accidental "Off" treating it as
+# "use this string verbatim". (Belt-and-suspenders: makes the contract
+# explicit in tests.)
+[[ "$(resolve_append_prompt "Off" "$DEFAULT")" == "Off" ]] \
+  && ok "resolve_append_prompt: 'Off' (capital) treated as custom" \
+  || ng "resolve_append_prompt: case-sensitivity contract broken"
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo

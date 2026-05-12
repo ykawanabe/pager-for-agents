@@ -23,6 +23,18 @@ DELAY_MIN=3
 DELAY_MAX=60
 HEALTHY_RUN_SECS=30
 
+# Default Telegram-friendly system-prompt append. The official plugin sends
+# replies with parse_mode unset (`format: 'text'`, server.ts:529), so any
+# Markdown claude emits is rendered literally — `**bold**` shows as two
+# asterisks, `## header` as two hashes. Telling claude the rendering target
+# is the cheapest way to get clean replies. Scope is this bot's claude
+# process only (argv-passed, not CLAUDE.md), so the user's other claude
+# sessions are untouched.
+#
+# Override by setting BOT_APPEND_SYSTEM_PROMPT in .env. Set to "off" to
+# disable the append entirely. Empty / unset → use this default.
+DEFAULT_BOT_APPEND_SYSTEM_PROMPT='You are responding through a Telegram bot. Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.'
+
 # Given the previous delay and how long the last claude run lasted, compute
 # the next delay. Pure arithmetic, easy to unit-test.
 #   $1 = current delay (seconds)
@@ -61,6 +73,24 @@ session_arg_flag() {
   fi
 }
 
+# Return the prompt text to pass to --append-system-prompt, or empty if the
+# user has opted out via BOT_APPEND_SYSTEM_PROMPT=off. Empty / unset env var
+# means "use the baked-in default" so existing .env files don't need editing.
+#   $1 = the .env value (may be empty, "off", or a custom string)
+#   $2 = the default to fall back to
+resolve_append_prompt() {
+  local env_val="$1" default="$2"
+  if [[ "$env_val" == "off" ]]; then
+    echo ""
+    return
+  fi
+  if [[ -z "$env_val" ]]; then
+    echo "$default"
+    return
+  fi
+  echo "$env_val"
+}
+
 load_env_and_chdir() {
   local env_file="$HOME/.claude-telegram-agent/.env"
   if [[ ! -f "$env_file" ]]; then
@@ -92,6 +122,11 @@ main_loop() {
   # When MULTI_TOPIC ships, each topic owns its own session via a per-topic
   # .tg-session-id file and this global flag goes away. See roadmap.md.
   local args=(--channels "plugin:${TELEGRAM_PLUGIN}" --dangerously-skip-permissions)
+  local append_prompt
+  append_prompt=$(resolve_append_prompt "${BOT_APPEND_SYSTEM_PROMPT:-}" "$DEFAULT_BOT_APPEND_SYSTEM_PROMPT")
+  if [[ -n "$append_prompt" ]]; then
+    args+=(--append-system-prompt "$append_prompt")
+  fi
   if [[ -n "${BOT_SESSION_ID:-}" ]]; then
     local flag
     flag=$(session_arg_flag "$CLAUDE_CWD" "$BOT_SESSION_ID")
