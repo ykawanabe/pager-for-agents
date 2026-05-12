@@ -49,11 +49,16 @@ say "Detected claude: $CLAUDE_VERSION"
 
 # ---- 2. Write agent .env ----------------------------------------------------
 mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
 
 if [[ -f "$CONFIG_DIR/.env" ]]; then
   say ".env already exists at $CONFIG_DIR/.env — leaving it alone"
 else
-  cp "$REPO_DIR/.env.example" "$CONFIG_DIR/.env"
+  # umask 077 so the cp lands at 0600 — matches the plugin's .env at
+  # ~/.claude/channels/telegram/.env. The agent .env holds CLAUDE_CWD (a
+  # path that reveals project location) and BOT_SESSION_ID; not as
+  # devastating as a token leak, but no reason to ship it world-readable.
+  (umask 077 && cp "$REPO_DIR/.env.example" "$CONFIG_DIR/.env")
 
   default_cwd="$HOME/claude-home"
   printf "\nEnter the Claude Code working directory [%s]: " "$default_cwd"
@@ -77,6 +82,10 @@ if ! grep -q '^BOT_SESSION_ID=..*' "$CONFIG_DIR/.env" 2>/dev/null; then
   printf '\nBOT_SESSION_ID=%s\n' "$bot_uuid" >> "$CONFIG_DIR/.env"
   say "Generated BOT_SESSION_ID=$bot_uuid for conversation persistence"
 fi
+
+# Always clamp .env to 0600. Catches pre-existing installs that ran before
+# we tightened the cp umask, and re-asserts on every run as cheap insurance.
+chmod 600 "$CONFIG_DIR/.env" 2>/dev/null || true
 
 # ---- 3. Install scripts -----------------------------------------------------
 mkdir -p "$BIN_DIR"

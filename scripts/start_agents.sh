@@ -4,6 +4,14 @@
 # sessions are killed first.
 set -euo pipefail
 
+# Tighten umask so every file created downstream (agent.log via pipe-pane,
+# anything the plugin's bun subprocess writes under ~/.claude/channels/, log
+# rotation archives, etc.) lands at 0600/0700 instead of the system default
+# 0644/0755. agent.log mirrors the full Telegram conversation through
+# tmux pipe-pane — world-readable mode would expose chat history to any
+# other user on the Mac and to cloud-backup tooling that walks $HOME.
+umask 077
+
 # Defensive PATH augmentation: launchd-spawned callers (Pager via `cta start`,
 # the LaunchAgent itself) inherit a stripped PATH that doesn't include tmux's
 # Homebrew location. See scripts/cta for the full explanation.
@@ -30,8 +38,16 @@ LOG_ARCHIVE_RETAIN_DAYS=30
 # the pane itself. We use it so `~/agent.log` actually contains live activity
 # (claude tool calls, watchdog heartbeats, restart events) — not just the
 # boot line from this script. The Pager's "Show recent activity" tails this.
+#
+# Pre-create the log at 0600 so the file mode is locked in regardless of
+# whatever umask the redirect inside `cat >>` actually honors. tmux's
+# pipe-pane runs the shell command via /bin/sh -c with no guaranteed umask
+# inheritance, so belt-and-suspenders here. The log contains the full
+# Telegram conversation mirrored from claude's TUI — it is sensitive.
 pipe_to_log() {
   local session="$1"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
   tmux pipe-pane -t "$session" -o "cat >> $LOG_FILE" || true
 }
 
@@ -46,32 +62,42 @@ rotate_logs() {
     local size
     size=$(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
     if [[ "$size" -gt "$LOG_ROTATE_MAX_BYTES" ]]; then
-      /bin/mv -f "$LOG_FILE" "$LOG_FILE.$(date +%Y%m%d-%H%M%S)"
+      local rotated="$LOG_FILE.$(date +%Y%m%d-%H%M%S)"
+      /bin/mv -f "$LOG_FILE" "$rotated"
+      chmod 600 "$rotated" 2>/dev/null || true
     fi
   fi
   find "$LOG_DIR" -maxdepth 1 -name 'agent.log.*' -type f \
     -mtime +"$LOG_ARCHIVE_RETAIN_DAYS" -delete 2>/dev/null || true
 }
 
-rotate_logs
+main() {
+  rotate_logs
 
-# Kill any existing sessions before relaunching.
-tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
-tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
+  # Kill any existing sessions before relaunching.
+  tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
+  tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
 
-# Start the claude loop.
-tmux new-session -d -s "$TMUX_SESSION_CLAUDE" "$BIN_DIR/restart_claude.sh"
-pipe_to_log "$TMUX_SESSION_CLAUDE"
+  # Start the claude loop.
+  tmux new-session -d -s "$TMUX_SESSION_CLAUDE" "$BIN_DIR/restart_claude.sh"
+  pipe_to_log "$TMUX_SESSION_CLAUDE"
 
-# Give claude a moment to bind to the Telegram plugin before the watchdog
-# starts polling — avoids a benign "no session" race on first launch.
-sleep 3
+  # Give claude a moment to bind to the Telegram plugin before the watchdog
+  # starts polling — avoids a benign "no session" race on first launch.
+  sleep 3
 
-# Watchdog runs in its own session (not a window of $TMUX_SESSION_CLAUDE) so
-# the watchdog survives when the claude session is killed and recreated.
-tmux new-session -d -s "$TMUX_SESSION_WATCHDOG" "$BIN_DIR/watch_network.sh"
-pipe_to_log "$TMUX_SESSION_WATCHDOG"
+  # Watchdog runs in its own session (not a window of $TMUX_SESSION_CLAUDE) so
+  # the watchdog survives when the claude session is killed and recreated.
+  tmux new-session -d -s "$TMUX_SESSION_WATCHDOG" "$BIN_DIR/watch_network.sh"
+  pipe_to_log "$TMUX_SESSION_WATCHDOG"
 
-echo "Started tmux sessions: $TMUX_SESSION_CLAUDE, $TMUX_SESSION_WATCHDOG"
-echo "Attach with: tmux attach -t $TMUX_SESSION_CLAUDE"
-echo "Recent activity: tail -f $LOG_FILE"
+  echo "Started tmux sessions: $TMUX_SESSION_CLAUDE, $TMUX_SESSION_WATCHDOG"
+  echo "Attach with: tmux attach -t $TMUX_SESSION_CLAUDE"
+  echo "Recent activity: tail -f $LOG_FILE"
+}
+
+# Sourcing (tests/test_start_agents.sh) exposes the helpers without running
+# the destructive tmux dance. Direct execution still behaves identically.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main
+fi
