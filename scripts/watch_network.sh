@@ -20,6 +20,12 @@ set -uo pipefail
 # window after `claude --channels` boots.
 MCP_FAILURE_THRESHOLD=3
 
+# Startup grace period before we treat a missing claude tmux session as a
+# failure worth kicking. start_agents.sh launches both sessions with a 3s gap;
+# 60s gives plenty of slack for slow boots, MCP cold-start, and the watchdog's
+# own first loop iteration before we start enforcing "session must exist."
+WATCHDOG_STARTUP_GRACE_SECS=60
+
 load_env() {
   local env_file="$HOME/.claude-telegram-agent/.env"
   if [[ ! -f "$env_file" ]]; then
@@ -60,6 +66,17 @@ mcp_healthy() {
   pgrep -f "bun .*server\.ts" >/dev/null
 }
 
+# Has the watchdog been up long enough that a missing claude session is a real
+# problem worth kicking, vs a slow boot we should wait out? Pure arithmetic so
+# the unit test can pin specific now/started values without sleeping.
+#   $1 = now (epoch seconds)
+#   $2 = watchdog start time (epoch seconds)
+#   $3 = grace window in seconds
+past_startup_grace() {
+  local now=$1 started_at=$2 grace=$3
+  [[ $(( now - started_at )) -ge "$grace" ]]
+}
+
 main_loop() {
   load_env
   # Two probes: general internet (PING_TARGET) and Telegram itself
@@ -73,6 +90,8 @@ main_loop() {
   local WAS_OFFLINE=0
   local WAS_TG_DOWN=0
   local MCP_FAILS=0
+  local WATCHDOG_STARTED_AT
+  WATCHDOG_STARTED_AT=$(date +%s)
 
   while true; do
     local net_up=0 tg_up=0
@@ -97,6 +116,19 @@ main_loop() {
         WAS_OFFLINE=0
         WAS_TG_DOWN=0
         MCP_FAILS=0
+      elif ! tmux has-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null; then
+        # Orphan-session recovery: the claude tmux session vanished entirely
+        # (manual kill, restart_claude.sh died, OOM kill, etc.). The original
+        # mcp_healthy check returned "healthy" in this state — leaving the
+        # bot dead until reboot. Skip during the startup grace window so we
+        # don't race start_agents.sh's own session spawn.
+        if past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
+          kick_claude_session "claude tmux session missing"
+          MCP_FAILS=0
+        else
+          local uptime=$(( $(date +%s) - WATCHDOG_STARTED_AT ))
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — claude session missing (startup grace: ${uptime}/${WATCHDOG_STARTUP_GRACE_SECS}s)"
+        fi
       else
         if mcp_healthy; then
           MCP_FAILS=0

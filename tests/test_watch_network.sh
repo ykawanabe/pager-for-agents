@@ -101,6 +101,42 @@ fi
 
 unset -f tmux sleep
 
+# ─── past_startup_grace ──────────────────────────────────────────────────────
+# The orphan-session kick is gated on this helper so a slow-booting Mac doesn't
+# get its still-spawning claude session "rescued" before start_agents.sh has
+# even finished. Below the window → don't kick. At or past it → kick.
+
+GRACE=60
+
+# Just-started: 0s of uptime.
+if past_startup_grace 1000 1000 "$GRACE"; then
+  ng "past_startup_grace: 0s uptime → should NOT pass grace"
+else
+  ok "past_startup_grace: 0s uptime → don't kick yet"
+fi
+
+# Mid-grace: 30s of 60s.
+if past_startup_grace 1030 1000 "$GRACE"; then
+  ng "past_startup_grace: 30s uptime → should NOT pass grace"
+else
+  ok "past_startup_grace: 30s uptime → don't kick yet"
+fi
+
+# Exactly at boundary: 60s == 60s grace. Treat as past — bias toward recovering
+# faster, the boundary tick is functionally equivalent to "we waited."
+if past_startup_grace 1060 1000 "$GRACE"; then
+  ok "past_startup_grace: exactly at boundary → kick"
+else
+  ng "past_startup_grace: exactly at boundary → kick"
+fi
+
+# Past grace: 120s, well clear.
+if past_startup_grace 1120 1000 "$GRACE"; then
+  ok "past_startup_grace: 120s uptime → kick"
+else
+  ng "past_startup_grace: 120s uptime → kick"
+fi
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo

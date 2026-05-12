@@ -15,8 +15,19 @@ say() { printf "→ %s\n" "$*"; }
 
 BACKUP_DIR="$HOME/.claude-telegram-agent-backup-$(date +%Y%m%d%H%M%S)"
 
+# Respect any custom session names the user set in .env. Falls back to the
+# defaults from .env.example if .env is already gone (re-running uninstall).
+TMUX_SESSION_CLAUDE="claude"
+TMUX_SESSION_WATCHDOG="watchdog"
+if [[ -f "$CONFIG_DIR/.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$CONFIG_DIR/.env"
+  set +a
+fi
+
 # ---- 1. Kill tmux sessions --------------------------------------------------
-for s in claude watchdog; do
+for s in "$TMUX_SESSION_CLAUDE" "$TMUX_SESSION_WATCHDOG"; do
   if tmux has-session -t "$s" 2>/dev/null; then
     tmux kill-session -t "$s"
     say "Killed tmux session: $s"
@@ -31,7 +42,7 @@ if [[ -f "$PLIST_PATH" ]]; then
 fi
 
 # ---- 3. Remove scripts ------------------------------------------------------
-for s in restart_claude.sh watch_network.sh start_agents.sh; do
+for s in restart_claude.sh watch_network.sh start_agents.sh cta; do
   if [[ -f "$BIN_DIR/$s" ]]; then
     rm -f "$BIN_DIR/$s"
     say "Removed $BIN_DIR/$s"

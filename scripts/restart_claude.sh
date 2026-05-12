@@ -2,34 +2,89 @@
 # Restart loop for the Claude Code Telegram agent.
 # Runs claude with the Telegram channel plugin. If claude exits for any reason
 # (crash, network drop, OOM, etc.) it sleeps briefly and starts again.
-set -euo pipefail
-
-ENV_FILE="$HOME/.claude-telegram-agent/.env"
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Missing $ENV_FILE — run install.sh first." >&2
-  exit 1
-fi
-
-set -a
-# shellcheck source=/dev/null
-source "$ENV_FILE"
-set +a
-
-cd "$CLAUDE_CWD"
-
-# Build the claude argv. BOT_SESSION_ID is a stable UUID generated at install
-# time so the bot resumes the same conversation across restarts (Mac sleep,
-# network drops, MCP kicks). Without it, every restart wipes context.
 #
-# When MULTI_TOPIC ships, each topic owns its own session via a per-topic
-# .tg-session-id file and this global flag goes away. See roadmap.md.
-args=(--channels "plugin:${TELEGRAM_PLUGIN}" --dangerously-skip-permissions)
-if [[ -n "${BOT_SESSION_ID:-}" ]]; then
-  args+=(--session-id "$BOT_SESSION_ID")
-fi
+# Sourcing this script (BASH_SOURCE != $0) exposes helper functions without
+# starting the loop — the test suite uses this to unit-test compute_next_delay.
+set -uo pipefail
 
-while true; do
-  claude "${args[@]}" || true
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] claude exited — restarting in 3s..."
-  sleep 3
-done
+# Exponential backoff defaults. A healthy run that survived ≥HEALTHY_RUN_SECS
+# resets the delay to DELAY_MIN; rapid-fire crashes (config error, bad token,
+# missing plugin) grow it 3 → 6 → 12 → 24 → 48 → 60s (cap). The LaunchAgent has
+# KeepAlive=false, so the main_loop IS the recovery mechanism — never exit it.
+# The cap keeps log volume bounded without giving up: start_agents.sh only
+# rotates at boot, so a hot-loop at 3s could outpace the 10MB rotation
+# threshold before the user noticed.
+DELAY_MIN=3
+DELAY_MAX=60
+HEALTHY_RUN_SECS=30
+
+# Given the previous delay and how long the last claude run lasted, compute
+# the next delay. Pure arithmetic, easy to unit-test.
+#   $1 = current delay (seconds)
+#   $2 = ran_for (seconds the last claude invocation lasted)
+#   $3 = healthy threshold (seconds; ran_for ≥ this resets the delay)
+#   $4 = delay min (reset target)
+#   $5 = delay max (cap)
+compute_next_delay() {
+  local current=$1 ran_for=$2 healthy=$3 dmin=$4 dmax=$5
+  # Healthy run → start the next failure at the minimum delay, not from where
+  # the ladder previously climbed.
+  if [[ "$ran_for" -ge "$healthy" ]]; then
+    echo "$dmin"
+    return
+  fi
+  local next=$(( current * 2 ))
+  [[ "$next" -lt "$dmin" ]] && next=$dmin
+  [[ "$next" -gt "$dmax" ]] && next=$dmax
+  echo "$next"
+}
+
+load_env_and_chdir() {
+  local env_file="$HOME/.claude-telegram-agent/.env"
+  if [[ ! -f "$env_file" ]]; then
+    echo "Missing $env_file — run install.sh first." >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+  cd "$CLAUDE_CWD"
+}
+
+main_loop() {
+  load_env_and_chdir
+
+  # Build the claude argv. BOT_SESSION_ID is a stable UUID generated at install
+  # time so the bot resumes the same conversation across restarts (Mac sleep,
+  # network drops, MCP kicks). Without it, every restart wipes context.
+  #
+  # When MULTI_TOPIC ships, each topic owns its own session via a per-topic
+  # .tg-session-id file and this global flag goes away. See roadmap.md.
+  local args=(--channels "plugin:${TELEGRAM_PLUGIN}" --dangerously-skip-permissions)
+  if [[ -n "${BOT_SESSION_ID:-}" ]]; then
+    args+=(--session-id "$BOT_SESSION_ID")
+  fi
+
+  # Seed below MIN so the first compute_next_delay call promotes to MIN
+  # rather than to MIN*2. First crash should still recover in 3s, not 6s.
+  local delay=0
+  while true; do
+    local start_ts end_ts ran_for
+    start_ts=$(date +%s)
+    claude "${args[@]}" || true
+    end_ts=$(date +%s)
+    ran_for=$(( end_ts - start_ts ))
+
+    delay=$(compute_next_delay "$delay" "$ran_for" "$HEALTHY_RUN_SECS" "$DELAY_MIN" "$DELAY_MAX")
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] claude exited after ${ran_for}s — restarting in ${delay}s..."
+    sleep "$delay"
+  done
+}
+
+# When sourced (e.g. by tests/test_restart_claude.sh) we expose the functions
+# but skip the runtime loop. Direct execution still behaves identically.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main_loop
+fi

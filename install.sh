@@ -60,7 +60,10 @@ else
   read -r CLAUDE_CWD_INPUT
   CLAUDE_CWD_INPUT="${CLAUDE_CWD_INPUT:-$default_cwd}"
 
-  sed -i '' "s|^CLAUDE_CWD=.*|CLAUDE_CWD=${CLAUDE_CWD_INPUT}|" "$CONFIG_DIR/.env"
+  # Escape sed-replacement metacharacters in the user-supplied path so a
+  # directory containing '|', '&', or '\' doesn't corrupt the .env line.
+  esc_cwd=$(printf '%s' "$CLAUDE_CWD_INPUT" | sed -e 's/[\\&|]/\\&/g')
+  sed -i '' "s|^CLAUDE_CWD=.*|CLAUDE_CWD=${esc_cwd}|" "$CONFIG_DIR/.env"
   say "Wrote $CONFIG_DIR/.env (CLAUDE_CWD=$CLAUDE_CWD_INPUT)"
 fi
 
@@ -77,7 +80,7 @@ fi
 
 # ---- 3. Install scripts -----------------------------------------------------
 mkdir -p "$BIN_DIR"
-for s in restart_claude.sh watch_network.sh start_agents.sh; do
+for s in restart_claude.sh watch_network.sh start_agents.sh cta; do
   cp "$REPO_DIR/scripts/$s" "$BIN_DIR/$s"
   chmod +x "$BIN_DIR/$s"
   say "Installed $BIN_DIR/$s"
@@ -106,8 +109,10 @@ EOF
     chmod 600 "$TELEGRAM_ENV"
     say "Token skipped — stub written to $TELEGRAM_ENV (edit when ready)"
   else
-    # Quick sanity: Telegram tokens look like "123456:AA...".
-    if [[ ! "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+    # Sanity: Telegram bot tokens are 8-12 digits, a colon, and 35+ url-safe
+    # chars. Same shape check-no-secrets.sh enforces; keep them in sync so a
+    # typo can't slip past the installer and then trip the commit hook later.
+    if [[ ! "$TOKEN" =~ ^[0-9]{8,12}:[A-Za-z0-9_-]{35,}$ ]]; then
       printf "⚠  Token does not match expected Telegram format — saving anyway\n"
     fi
     umask 077

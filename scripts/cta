@@ -1,0 +1,228 @@
+#!/bin/bash
+# cta — claude-telegram-agent CLI.
+#
+# The single source of truth for "what is the agent doing right now?" and
+# "start / stop the agent". Pager and any future UI call this instead of
+# re-implementing process detection. As long as the JSON schema below stays
+# backward-compatible, agent-side changes (rename a tmux session, switch
+# plugin runtime, move a file) don't break the UI.
+#
+# Schema (cta status --json):
+#   {
+#     "schema_version": 1,
+#     "launch_agent": {"label": "com.claude-agent", "loaded": true|false},
+#     "claude":       {"pid": <int>|null, "rss_mb": <int>|null},
+#     "telegram_mcp": {"alive": true|false},
+#     "tmux": {
+#       "claude":   {"name": "<session>", "alive": true|false},
+#       "watchdog": {"name": "<session>", "alive": true|false}
+#     },
+#     "last_activity": "<ISO8601>" | null
+#   }
+#
+# Bumps to schema_version are reserved for breaking changes (F1+F2 multi-topic
+# will introduce schema_version=2 with a per-topic array). Additive fields
+# stay at the current version.
+set -uo pipefail
+
+PLIST_LABEL="com.claude-agent"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
+START_SCRIPT="$HOME/.local/bin/start_agents.sh"
+ENV_FILE="$HOME/.claude-telegram-agent/.env"
+
+# Load .env early so configurable session names take effect. Falls back to
+# defaults if .env doesn't exist yet (e.g., before install.sh has run).
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+  set +a
+fi
+TMUX_SESSION_CLAUDE="${TMUX_SESSION_CLAUDE:-claude}"
+TMUX_SESSION_WATCHDOG="${TMUX_SESSION_WATCHDOG:-watchdog}"
+
+# ─── helpers ─────────────────────────────────────────────────────────────────
+
+_la_loaded() {
+  launchctl list 2>/dev/null | grep -q "$PLIST_LABEL"
+}
+
+# Print "<pid> <rss_kb>" if claude is running, else empty line. Caller parses.
+_claude_ps_line() {
+  ps -Ao pid=,rss=,command= 2>/dev/null \
+    | grep "claude --channels plugin:telegram" \
+    | grep -v grep \
+    | head -1 \
+    | awk '{print $1, $2}'
+}
+
+_mcp_alive() {
+  ps -Ao command= 2>/dev/null \
+    | grep "bun" | grep "server.ts" | grep -v grep \
+    | head -1 >/dev/null
+}
+
+_tmux_session_alive() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+# Returns ISO8601 mtime of bot.pid, or empty if missing.
+_last_activity() {
+  [[ -f "$BOT_PID_FILE" ]] || return 0
+  # macOS stat differs from GNU; use BSD flags.
+  TZ=UTC stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$BOT_PID_FILE" 2>/dev/null || true
+}
+
+# Emit a JSON literal for an integer-or-null. Empty input → "null", else the
+# integer itself. No quoting (JSON numbers are bare).
+_json_int_or_null() {
+  if [[ -z "$1" ]]; then
+    printf 'null'
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# Emit a JSON literal for a string-or-null. Empty → "null", else "<escaped>".
+# Escapes the two characters that can break a JSON string literal in practice
+# here: backslash and double-quote. Newlines and control chars don't appear
+# in any of our sources (process names, label strings, ISO dates).
+_json_str_or_null() {
+  if [[ -z "$1" ]]; then
+    printf 'null'
+  else
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+  fi
+}
+
+_json_bool() {
+  if "$@"; then printf 'true'; else printf 'false'; fi
+}
+
+# ─── commands ────────────────────────────────────────────────────────────────
+
+cmd_status() {
+  local format="${1:-text}"
+
+  local la_loaded
+  if _la_loaded; then la_loaded=true; else la_loaded=false; fi
+
+  local ps_line pid="" rss_kb=""
+  ps_line=$(_claude_ps_line)
+  if [[ -n "$ps_line" ]]; then
+    pid="${ps_line%% *}"
+    rss_kb="${ps_line##* }"
+  fi
+
+  local mcp_alive
+  if _mcp_alive; then mcp_alive=true; else mcp_alive=false; fi
+
+  local tmux_claude tmux_watchdog
+  if _tmux_session_alive "$TMUX_SESSION_CLAUDE"; then tmux_claude=true; else tmux_claude=false; fi
+  if _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then tmux_watchdog=true; else tmux_watchdog=false; fi
+
+  local activity
+  activity=$(_last_activity)
+
+  if [[ "$format" == "json" ]]; then
+    local rss_mb=""
+    [[ -n "$rss_kb" ]] && rss_mb=$(( rss_kb / 1024 ))
+    cat <<EOF
+{
+  "schema_version": 1,
+  "launch_agent": {"label": $(_json_str_or_null "$PLIST_LABEL"), "loaded": $la_loaded},
+  "claude": {"pid": $(_json_int_or_null "$pid"), "rss_mb": $(_json_int_or_null "$rss_mb")},
+  "telegram_mcp": {"alive": $mcp_alive},
+  "tmux": {
+    "claude": {"name": $(_json_str_or_null "$TMUX_SESSION_CLAUDE"), "alive": $tmux_claude},
+    "watchdog": {"name": $(_json_str_or_null "$TMUX_SESSION_WATCHDOG"), "alive": $tmux_watchdog}
+  },
+  "last_activity": $(_json_str_or_null "$activity")
+}
+EOF
+  else
+    printf 'LaunchAgent (%s): %s\n' "$PLIST_LABEL" "$la_loaded"
+    printf 'claude PID:       %s\n' "${pid:-(none)}"
+    if [[ -n "$rss_kb" ]]; then
+      printf 'claude RSS:       %s MB\n' "$(( rss_kb / 1024 ))"
+    fi
+    printf 'Telegram MCP:     %s\n' "$mcp_alive"
+    printf 'tmux %s:%s   %s\n' "$TMUX_SESSION_CLAUDE" \
+      "$(printf '%*s' $((10 - ${#TMUX_SESSION_CLAUDE})) '')" "$tmux_claude"
+    printf 'tmux %s:%s %s\n' "$TMUX_SESSION_WATCHDOG" \
+      "$(printf '%*s' $((10 - ${#TMUX_SESSION_WATCHDOG})) '')" "$tmux_watchdog"
+    printf 'Last activity:    %s\n' "${activity:-(none)}"
+  fi
+}
+
+cmd_start() {
+  if [[ ! -x "$START_SCRIPT" ]]; then
+    echo "Missing $START_SCRIPT — run install.sh first." >&2
+    return 1
+  fi
+  # Ensure LaunchAgent is loaded so launchd will respawn on next login. The
+  # script itself handles tmux session creation idempotently.
+  if [[ -f "$PLIST_PATH" ]]; then
+    launchctl load "$PLIST_PATH" 2>/dev/null || true
+  fi
+  "$START_SCRIPT"
+}
+
+cmd_stop() {
+  tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
+  tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
+  if [[ -f "$PLIST_PATH" ]]; then
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  fi
+  echo "Stopped agent (tmux + LaunchAgent)."
+}
+
+cmd_help() {
+  cat <<EOF
+cta — claude-telegram-agent CLI
+
+Usage:
+  cta status [--json]   Show agent health (text by default, JSON for tooling)
+  cta start             Load LaunchAgent + spawn tmux sessions
+  cta stop              Kill tmux sessions + unload LaunchAgent
+  cta help              This message
+
+Reads ~/.claude-telegram-agent/.env for configurable tmux session names.
+
+Pager and any other UI should call \`cta status --json\` rather than greping
+\`ps\` / \`tmux ls\` / \`launchctl list\` directly. Schema is versioned; see
+the header of this script for the contract.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+  case "$cmd" in
+    status)
+      if [[ "${1:-}" == "--json" ]]; then
+        cmd_status json
+      else
+        cmd_status text
+      fi
+      ;;
+    start) cmd_start ;;
+    stop)  cmd_stop ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      cmd_help >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Only run main when executed directly. Sourcing exposes _json_* helpers and
+# command functions for the test suite without invoking anything.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

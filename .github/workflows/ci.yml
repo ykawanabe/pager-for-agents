@@ -19,6 +19,7 @@ jobs:
             install.sh \
             uninstall.sh \
             scripts/check-no-secrets.sh \
+            scripts/cta \
             scripts/restart_claude.sh \
             scripts/start_agents.sh \
             scripts/watch_network.sh
@@ -29,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: bash -n on every shell script
         run: |
-          for f in install.sh uninstall.sh scripts/*.sh tests/*.sh; do
+          for f in install.sh uninstall.sh scripts/*.sh scripts/cta tests/*.sh; do
             echo "→ $f"
             bash -n "$f"
           done
