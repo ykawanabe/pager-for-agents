@@ -199,10 +199,36 @@ cmd_start() {
 cmd_stop() {
   tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
   tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
+
+  # Clean up the bun MCP grandchildren the official telegram plugin spawned.
+  # Process tree:  claude → bun (wrapper, --cwd .../telegram ...) → bun server.ts
+  # Killing the tmux session only kills the claude. bun reparents to launchd
+  # and keeps long-polling Telegram's getUpdates. The next `cta start` spawns
+  # a fresh bun — now TWO consumers race for getUpdates, and ~half of inbound
+  # messages go to the orphan with no claude listening, getting silently
+  # dropped. Targeted by command-line match against the plugin path so we
+  # never kill unrelated `bun server.ts` processes the user might run.
+  _kill_plugin_bun
   if [[ -f "$PLIST_PATH" ]]; then
     launchctl unload "$PLIST_PATH" 2>/dev/null || true
   fi
-  echo "Stopped agent (tmux + LaunchAgent)."
+  echo "Stopped agent (tmux + plugin MCP + LaunchAgent)."
+}
+
+# Kill the telegram plugin's bun wrapper + its server.ts child, but nothing
+# else. Identifies victims by command-line match against the plugin path,
+# then prunes children via pgrep -P so we don't accidentally kill an
+# unrelated `bun server.ts` running in another project on this Mac.
+_kill_plugin_bun() {
+  local wrappers w kids k
+  wrappers=$(pgrep -f "claude-plugins-official.*telegram.*start" 2>/dev/null || true)
+  for w in $wrappers; do
+    kids=$(pgrep -P "$w" 2>/dev/null || true)
+    for k in $kids; do
+      kill "$k" 2>/dev/null || true
+    done
+    kill "$w" 2>/dev/null || true
+  done
 }
 
 cmd_help() {

@@ -163,6 +163,79 @@ fi
 rm -f "$TRIPWIRE" "$FAUX_START"
 unset -f _tmux_session_alive launchctl 2>/dev/null
 
+# ─── cmd_stop bun cleanup (regression: orphan bun → double-poller race) ─────
+# Regression: v0.1.1 — cta stop killed the tmux session but left the bun MCP
+# grandchildren that the official telegram plugin spawned. They reparented to
+# launchd and kept long-polling Telegram's getUpdates. The next cta start
+# spawned a fresh bun → two consumers raced for getUpdates → ~half of inbound
+# messages went to the orphan (no claude listening) and were silently dropped.
+# Found by /qa on 2026-05-12 when the user observed "no response" after a bot
+# restart cycle.
+#
+# Contract: cmd_stop targets ONLY the plugin's own bun processes — identified
+# by `pgrep -f "claude-plugins-official.*telegram.*start"` for the wrapper,
+# then `pgrep -P <wrapper-pid>` for the bun server.ts child. Never kills an
+# unrelated `bun server.ts` the user might run in a different project.
+
+# cmd_stop calls pgrep + kill inside `$(...)` subshells, so we can't capture
+# their args into a parent-shell array. Use tempfiles instead — every call
+# appends a line, and the parent reads the file after cmd_stop returns.
+PGREP_LOG=$(mktemp)
+KILL_LOG=$(mktemp)
+
+pgrep() {
+  echo "$*" >> "$PGREP_LOG"
+  case "$*" in
+    *"-f"*"claude-plugins-official"*) echo "1001" ;;   # wrapper PID
+    *"-P 1001"*)                       echo "1002" ;;   # bun server.ts child
+    *)                                  return 1 ;;     # nothing else matches
+  esac
+}
+kill() {
+  echo "$*" >> "$KILL_LOG"
+  return 0
+}
+tmux() { return 0; }
+launchctl() { return 0; }
+
+# Plist path doesn't exist so the launchctl-unload branch's if-guard returns
+# false. Same shape as a fresh install before install.sh has written the plist.
+PLIST_PATH="/nonexistent/com.claude-agent.plist"
+
+cmd_stop >/dev/null
+
+# Were the right kills issued? Both wrapper and child should appear.
+all_kills=$(cat "$KILL_LOG" 2>/dev/null | tr '\n' ' ')
+if [[ "$all_kills" == *"1002"* ]]; then
+  ok "cmd_stop: killed plugin bun server (PID 1002)"
+else
+  ng "cmd_stop: did NOT kill plugin bun server (got: $all_kills)"
+fi
+if [[ "$all_kills" == *"1001"* ]]; then
+  ok "cmd_stop: killed plugin wrapper (PID 1001)"
+else
+  ng "cmd_stop: did NOT kill plugin wrapper (got: $all_kills)"
+fi
+
+# Was the plugin pattern actually searched for?
+all_pgrep=$(cat "$PGREP_LOG" 2>/dev/null | tr '\n' ' ')
+if [[ "$all_pgrep" == *"claude-plugins-official"* ]]; then
+  ok "cmd_stop: pgrep'd for plugin-specific pattern"
+else
+  ng "cmd_stop: did NOT pgrep for plugin-specific pattern (got: $all_pgrep)"
+fi
+
+# Negative test: cmd_stop must NOT have searched for a generic 'bun.*server.ts'
+# pattern. That would over-match user's unrelated bun projects.
+if [[ "$all_pgrep" == *"bun.*server"* || "$all_pgrep" == *"bun .*server"* ]]; then
+  ng "cmd_stop: SHOULD NOT pgrep for generic 'bun server.ts' (got: $all_pgrep)"
+else
+  ok "cmd_stop: correctly avoided generic 'bun server.ts' pattern"
+fi
+
+rm -f "$PGREP_LOG" "$KILL_LOG"
+unset -f pgrep kill tmux launchctl 2>/dev/null
+
 # ─── PATH augmentation (regression: launchd-spawned callers) ─────────────────
 # Regression: v0.1.0 — Pager's diagnostic showed tmux=✗ even when sessions
 # were alive. Found by /qa on 2026-05-12. Root cause: launchd strips PATH

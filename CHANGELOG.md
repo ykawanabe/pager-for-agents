@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-12
+
+Hotfix. Continued live `/qa` after v0.1.1 surfaced one more bug: the Telegram bot was randomly silent after a restart cycle.
+
+### Fixed
+- **`cta stop` left an orphan `bun` MCP process behind.** Killing the tmux session killed the `claude` process, but the official telegram plugin's bun grandchildren (the wrapper `bun run --cwd …/telegram` and its `bun server.ts` child) reparented to launchd and kept long-polling Telegram's `getUpdates`. The next `cta start` spawned a fresh bun → two consumers raced for `getUpdates` → ~half of inbound messages went to the orphan, which had no claude listening and silently dropped them. Symptom: the bot replied to roughly every other message after a restart, with no log line on the dropped side. Now `cmd_stop` targets the plugin's bun tree directly: `pgrep -f "claude-plugins-official.*telegram.*start"` for the wrapper, then `pgrep -P <wrapper-pid>` for the bun server child. **Critically, it does NOT pkill any `bun server.ts` on the system** — only the children of a process matching the plugin's command line. A user running their own `bun server.ts` in another project is untouched. Four new regression tests in `test_cta.sh` pin the contract (kills wrapper, kills child, searches the plugin pattern, never searches a generic `bun.*server\.ts`).
+
 ## [0.1.1] - 2026-05-12
 
 Hotfix release. Two v0.1.0 regressions surfaced during live `/qa` verification.
