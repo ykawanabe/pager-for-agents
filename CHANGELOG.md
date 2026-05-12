@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- `cta config ack <on|off>` — toggle the bot's per-message ack reaction without hand-editing access.json. `on` writes `ackReaction: "👀"` (Telegram's whitelist-friendly "seen" emoji), `off` removes the key entirely. Plugin re-reads access.json per request so the change is live on the next message (no bot restart). Default emoji kept in sync with Pager's `kDefaultAckEmoji` constant. 5 new tests in `test_cta.sh` (round-trip, allowlist preservation, key removal on off, invalid-value rejection, missing-file error).
+
 ## [0.1.3] - 2026-05-12
 
 Hotfix. Bot stopped auto-recovering after a network reconnect: watchdog kicked the session, but `restart_claude.sh` then crashlooped indefinitely with "Session ID is already in use" and the bot never came back online.

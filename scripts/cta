@@ -38,8 +38,15 @@ export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/b
 PLIST_LABEL="com.claude-agent"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
+ACCESS_FILE="$HOME/.claude/channels/telegram/access.json"
 START_SCRIPT="$HOME/.local/bin/start_agents.sh"
 ENV_FILE="$HOME/.claude-telegram-agent/.env"
+
+# Default emoji used by `cta config ack on`. Must be in Telegram's free-bot
+# reaction whitelist — eyes reads as "seen" and is universally available.
+# Kept in sync with Pager's kDefaultAckEmoji (SettingsView.swift) so the two
+# UIs agree on what "on" means.
+DEFAULT_ACK_EMOJI="👀"
 
 # Load .env early so configurable session names take effect. Falls back to
 # defaults if .env doesn't exist yet (e.g., before install.sh has run).
@@ -231,15 +238,81 @@ _kill_plugin_bun() {
   done
 }
 
+# Toggle the bot's per-message ack reaction by mutating access.json.
+# The plugin re-reads access.json on every request (`loadAccess()` in
+# server.ts), so the change takes effect on the next inbound message —
+# no bot restart needed.
+#   cta config ack on   → write "ackReaction": "<DEFAULT_ACK_EMOJI>"
+#   cta config ack off  → remove the "ackReaction" key entirely
+# Uses python3 (ships with macOS) for JSON mutation so we don't hand-roll
+# a JSON parser in bash and don't add a jq dependency.
+cmd_config() {
+  local sub="${1:-}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    ack) _config_ack "${1:-}" ;;
+    "")
+      echo "Usage: cta config ack <on|off>" >&2
+      return 1
+      ;;
+    *)
+      echo "Unknown config subcommand: $sub" >&2
+      echo "Usage: cta config ack <on|off>" >&2
+      return 1
+      ;;
+  esac
+}
+
+_config_ack() {
+  local val="${1:-}"
+  case "$val" in
+    on|off) ;;
+    "")
+      echo "Usage: cta config ack <on|off>" >&2
+      return 1
+      ;;
+    *)
+      echo "Invalid value: $val (expected 'on' or 'off')" >&2
+      return 1
+      ;;
+  esac
+  if [[ ! -f "$ACCESS_FILE" ]]; then
+    echo "Missing $ACCESS_FILE — run install.sh first." >&2
+    return 1
+  fi
+  local emoji=""
+  [[ "$val" == "on" ]] && emoji="$DEFAULT_ACK_EMOJI"
+  python3 - "$ACCESS_FILE" "$emoji" <<'PY'
+import json, sys
+path, val = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+if val == "":
+    data.pop("ackReaction", None)
+else:
+    data["ackReaction"] = val
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+  chmod 600 "$ACCESS_FILE"
+  if [[ "$val" == "on" ]]; then
+    echo "ackReaction: $DEFAULT_ACK_EMOJI (takes effect on next message)"
+  else
+    echo "ackReaction: off"
+  fi
+}
+
 cmd_help() {
   cat <<EOF
 cta — claude-telegram-agent CLI
 
 Usage:
-  cta status [--json]   Show agent health (text by default, JSON for tooling)
-  cta start             Load LaunchAgent + spawn tmux sessions
-  cta stop              Kill tmux sessions + unload LaunchAgent
-  cta help              This message
+  cta status [--json]      Show agent health (text by default, JSON for tooling)
+  cta start                Load LaunchAgent + spawn tmux sessions
+  cta stop                 Kill tmux sessions + unload LaunchAgent
+  cta config ack <on|off>  Toggle the bot's per-message ack reaction
+  cta help                 This message
 
 Reads ~/.claude-telegram-agent/.env for configurable tmux session names.
 
@@ -262,6 +335,7 @@ main() {
       ;;
     start) cmd_start ;;
     stop)  cmd_stop ;;
+    config) cmd_config "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       echo "Unknown command: $cmd" >&2

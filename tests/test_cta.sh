@@ -274,6 +274,58 @@ else
   ng "cta provides /usr/bin:/bin fallback when PATH is unset (got: $EFFECTIVE_PATH_UNSET)"
 fi
 
+# ─── cmd_config ack: on/off round-trip ────────────────────────────────────────
+#
+# `cta config ack on` writes ackReaction=<default emoji> to access.json,
+# `off` removes the key. Plugin reads access.json per request so the change is
+# live without a bot restart. Test uses a tmp ACCESS_FILE — no risk of
+# clobbering the real config.
+
+CFG_TMP=$(mktemp -d)
+ACCESS_FILE="$CFG_TMP/access.json"
+cat > "$ACCESS_FILE" <<'EOF'
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["123"],
+  "groups": {},
+  "pending": {}
+}
+EOF
+
+# on → key present with the default emoji
+cmd_config ack on >/dev/null 2>&1
+ACK_AFTER_ON=$(python3 -c "import json; print(json.load(open('$ACCESS_FILE')).get('ackReaction',''))" 2>/dev/null)
+[[ "$ACK_AFTER_ON" == "$DEFAULT_ACK_EMOJI" ]] \
+  && ok "cmd_config ack on: writes default emoji" \
+  || ng "cmd_config ack on: expected $DEFAULT_ACK_EMOJI, got '$ACK_AFTER_ON'"
+
+# on must not touch the allowlist or dmPolicy
+KEEP_ALLOW=$(python3 -c "import json; print(','.join(json.load(open('$ACCESS_FILE'))['allowFrom']))" 2>/dev/null)
+[[ "$KEEP_ALLOW" == "123" ]] \
+  && ok "cmd_config ack on: preserves allowFrom" \
+  || ng "cmd_config ack on: lost allowFrom (got '$KEEP_ALLOW')"
+
+# off → key removed entirely (not just set to empty string)
+cmd_config ack off >/dev/null 2>&1
+HAS_KEY=$(python3 -c "import json; print('ackReaction' in json.load(open('$ACCESS_FILE')))" 2>/dev/null)
+[[ "$HAS_KEY" == "False" ]] \
+  && ok "cmd_config ack off: removes the key entirely" \
+  || ng "cmd_config ack off: key still present (got '$HAS_KEY')"
+
+# Invalid value rejected without mutating the file.
+cmd_config ack maybe >/dev/null 2>&1 && ng "cmd_config ack maybe: should exit non-zero" \
+  || ok "cmd_config ack maybe: rejected with non-zero exit"
+
+# Missing access.json → helpful error, non-zero exit, no python traceback.
+rm -f "$ACCESS_FILE"
+ERR=$(cmd_config ack on 2>&1)
+RC=$?
+[[ "$RC" -ne 0 && "$ERR" == *"Missing"* ]] \
+  && ok "cmd_config ack on: missing access.json reports cleanly" \
+  || ng "cmd_config ack on: missing-file error (rc=$RC, msg='$ERR')"
+
+rm -rf "$CFG_TMP"
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo
