@@ -4,6 +4,11 @@
 # sessions are killed first.
 set -euo pipefail
 
+# Defensive PATH augmentation: launchd-spawned callers (Pager via `cta start`,
+# the LaunchAgent itself) inherit a stripped PATH that doesn't include tmux's
+# Homebrew location. See scripts/cta for the full explanation.
+export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
+
 ENV_FILE="$HOME/.claude-telegram-agent/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing $ENV_FILE — run install.sh first." >&2

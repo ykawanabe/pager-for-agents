@@ -7,6 +7,11 @@
 # starting the loop — the test suite uses this to unit-test compute_next_delay.
 set -uo pipefail
 
+# Defensive PATH augmentation. `claude` is typically at ~/.local/bin/claude
+# (a symlink to a per-version install); under launchd's stripped PATH neither
+# the symlink dir nor /opt/homebrew/bin/bun are resolvable. See scripts/cta.
+export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
+
 # Exponential backoff defaults. A healthy run that survived ≥HEALTHY_RUN_SECS
 # resets the delay to DELAY_MIN; rapid-fire crashes (config error, bad token,
 # missing plugin) grow it 3 → 6 → 12 → 24 → 48 → 60s (cap). The LaunchAgent has

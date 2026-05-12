@@ -15,6 +15,11 @@
 # must survive transient errors.
 set -uo pipefail
 
+# Defensive PATH augmentation. tmux and pgrep live outside launchd's stripped
+# default PATH; ensure they resolve when this script is spawned by the
+# LaunchAgent or by a launchd-spawned caller. See scripts/cta for context.
+export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
+
 # Number of consecutive failed MCP checks before we kick the session. At a
 # 10s loop interval that's ~30s of grace, which covers the plugin's cold-start
 # window after `claude --channels` boots.

@@ -101,6 +101,106 @@ TEXT=$(cmd_status text)
 echo "$TEXT" | grep -q "claude PID:.*999" && ok "cmd_status text: shows pid" || ng "cmd_status text: shows pid"
 echo "$TEXT" | grep -q "MB"                && ok "cmd_status text: shows RSS in MB" || ng "cmd_status text: shows RSS in MB"
 
+# ─── cmd_start idempotency (regression: bot kill on Pager launch) ────────────
+# Regression: v0.1.0 — Pager's ensureBotRunning() calls `cta start`, which
+# called start_agents.sh, which kills both tmux sessions before respawning.
+# Result: every Pager launch took the live bot offline for ~3 seconds and
+# churned the claude PID. Found by /qa on 2026-05-12 when Pager restarted
+# during the live install and the watchdog log showed claude respawned.
+#
+# Contract: `cta start` is idempotent. When both sessions are alive, it
+# does NOT invoke start_agents.sh. Test by stubbing the session check to
+# return alive, then asserting START_SCRIPT was never called.
+
+# Override session check to report both alive.
+_tmux_session_alive() { return 0; }
+# Stub launchctl so cmd_start's "load LaunchAgent" call doesn't actually run.
+launchctl() { return 0; }
+# Capture whether start_agents.sh would have been invoked. We override the
+# variable to point at a tripwire script — if cmd_start invokes it, the
+# tripwire writes a sentinel file we can grep for.
+TRIPWIRE=$(mktemp)
+rm -f "$TRIPWIRE"   # ensure absent before test
+START_SCRIPT="/bin/bash"   # use a real executable; trick is the arg below
+# Bash invocation as "start script": writes the tripwire file. If cmd_start
+# invokes START_SCRIPT, the tripwire appears.
+cmd_start_test() {
+  # Inline replacement that records invocation. Simulates what start_agents.sh
+  # would do (the destructive thing we want to prevent when already alive).
+  touch "$TRIPWIRE"
+}
+# Redefine START_SCRIPT path to a faux executable that touches the tripwire.
+# Use a here-doc to write a tiny script.
+FAUX_START=$(mktemp)
+cat > "$FAUX_START" <<EOF
+#!/bin/bash
+touch "$TRIPWIRE"
+EOF
+chmod +x "$FAUX_START"
+START_SCRIPT="$FAUX_START"
+PLIST_PATH="/nonexistent/com.claude-agent.plist"   # avoid touching real plist
+
+cmd_start >/dev/null
+
+if [[ -f "$TRIPWIRE" ]]; then
+  ng "cmd_start (both sessions alive): MUST NOT invoke start_agents.sh"
+else
+  ok "cmd_start (both sessions alive): correctly skipped start_agents.sh"
+fi
+
+# Now invert: report sessions as DOWN. cmd_start MUST invoke start_agents.sh.
+rm -f "$TRIPWIRE"
+_tmux_session_alive() { return 1; }
+cmd_start >/dev/null
+
+if [[ -f "$TRIPWIRE" ]]; then
+  ok "cmd_start (sessions down): invoked start_agents.sh as expected"
+else
+  ng "cmd_start (sessions down): SHOULD have invoked start_agents.sh"
+fi
+
+# Cleanup tripwire + faux scripts.
+rm -f "$TRIPWIRE" "$FAUX_START"
+unset -f _tmux_session_alive launchctl 2>/dev/null
+
+# ─── PATH augmentation (regression: launchd-spawned callers) ─────────────────
+# Regression: v0.1.0 — Pager's diagnostic showed tmux=✗ even when sessions
+# were alive. Found by /qa on 2026-05-12. Root cause: launchd strips PATH
+# to /usr/bin:/bin:/usr/sbin:/sbin, and tmux lives in /opt/homebrew/bin.
+# cta's `tmux has-session` call silently failed with "command not found".
+# Fix: cta prepends $HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin and
+# appends $HOME/.local/bin so child commands resolve under stripped PATH.
+#
+# Test approach: run cta in a forked shell with the launchd-stripped PATH,
+# then check the script's effective PATH includes the homebrew locations.
+# We don't need real tmux — just need to verify cta would find it if it
+# existed in the canonical locations.
+
+EFFECTIVE_PATH=$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  bash -c "source '$SCRIPT_DIR/scripts/cta' >/dev/null 2>&1; echo \$PATH")
+
+if [[ "$EFFECTIVE_PATH" == *"/opt/homebrew/bin"* ]]; then
+  ok "cta prepends /opt/homebrew/bin under stripped launchd PATH"
+else
+  ng "cta prepends /opt/homebrew/bin under stripped launchd PATH (got: $EFFECTIVE_PATH)"
+fi
+
+if [[ "$EFFECTIVE_PATH" == *"/usr/local/bin"* ]]; then
+  ok "cta prepends /usr/local/bin under stripped launchd PATH"
+else
+  ng "cta prepends /usr/local/bin under stripped launchd PATH (got: $EFFECTIVE_PATH)"
+fi
+
+# When PATH is unset entirely (some launchd edge cases), the fallback
+# /usr/bin:/bin must kick in so basic posix tools still resolve.
+EFFECTIVE_PATH_UNSET=$(env -i HOME="$HOME" \
+  bash -c "source '$SCRIPT_DIR/scripts/cta' >/dev/null 2>&1; echo \$PATH")
+if [[ "$EFFECTIVE_PATH_UNSET" == *"/usr/bin"* && "$EFFECTIVE_PATH_UNSET" == *"/bin"* ]]; then
+  ok "cta provides /usr/bin:/bin fallback when PATH is unset"
+else
+  ng "cta provides /usr/bin:/bin fallback when PATH is unset (got: $EFFECTIVE_PATH_UNSET)"
+fi
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo

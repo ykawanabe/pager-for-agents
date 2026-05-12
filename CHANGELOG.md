@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-12
+
+Hotfix release. Two v0.1.0 regressions surfaced during live `/qa` verification.
+
+### Fixed
+- **`cta` couldn't find `tmux` under launchd's stripped PATH.** When Claude Pager (or any launchd-spawned caller) shelled out to `cta status`, the `tmux has-session` calls silently failed with "command not found" and cta reported `tmux: false` for both sessions even when they were healthy. Symptom: Pager's Diagnostics window showed `✗ tmux sessions` while the bot was fully operational. Root cause: launchd ships a stripped default PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) that doesn't include `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel). All four scripts (`cta`, `start_agents.sh`, `watch_network.sh`, `restart_claude.sh`) now prepend `$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin` and append `$HOME/.local/bin` so child commands resolve regardless of caller context. Three new regression tests in `test_cta.sh` pin the PATH augmentation under stripped-PATH conditions.
+- **`cta start` was destructive — it killed and respawned both tmux sessions even when the bot was already healthy.** `start_agents.sh` is intentionally destructive for fresh boots and recovery, but `cta start` is the "make sure it's up" command and must not drop a running conversation. Pager calls this on every launch via `ensureBotRunning()`; every Pager launch was taking the bot offline for ~3 seconds and churning the claude PID. `cta start` is now idempotent — if both sessions are alive, it logs "Already running" and returns. Two new regression tests pin this contract.
+
 ## [0.1.0] - 2026-05-12
 
 First tagged release. The bot survives crash, sleep, and network drops on macOS; companion menu-bar app ([Claude Pager](https://github.com/ykawanabe/claude-telegram-agent-bar)) now talks to the agent through `cta` instead of greping `ps`.

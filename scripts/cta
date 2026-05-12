@@ -25,6 +25,16 @@
 # stay at the current version.
 set -uo pipefail
 
+# When invoked from a launchd-spawned process (Claude Pager via CTAClient,
+# or the LaunchAgent's own restart cycle), $PATH is stripped to the macOS
+# default: /usr/bin:/bin:/usr/sbin:/sbin. tmux lives in /opt/homebrew/bin
+# (Apple Silicon) or /usr/local/bin (Intel) — neither is in the stripped
+# PATH. Without this prepend, `tmux has-session` silently fails with
+# "command not found" and cta reports tmux=false even when both sessions
+# are healthy. Prepend rather than overwrite so any caller-set PATH still
+# wins for entries we don't list.
+export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
+
 PLIST_LABEL="com.claude-agent"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
@@ -160,12 +170,26 @@ EOF
 }
 
 cmd_start() {
+  # Idempotent. If both sessions are already alive, do nothing — no destructive
+  # respawn, no claude PID churn, no conversation drop. start_agents.sh kills
+  # existing sessions before spawning new ones (intentional for a fresh boot
+  # or recovery), so it must NOT be the path for "make sure the bot is up."
+  # Pager calls this on every launch via ensureBotRunning(); without this
+  # guard, every Pager launch took the bot offline for ~3s.
+  if _tmux_session_alive "$TMUX_SESSION_CLAUDE" && _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then
+    echo "Already running (tmux $TMUX_SESSION_CLAUDE + $TMUX_SESSION_WATCHDOG alive)."
+    # Still ensure the LaunchAgent is loaded so launchd will respawn at login.
+    # This is non-destructive — launchctl load is a no-op when already loaded.
+    if [[ -f "$PLIST_PATH" ]]; then
+      launchctl load "$PLIST_PATH" 2>/dev/null || true
+    fi
+    return 0
+  fi
   if [[ ! -x "$START_SCRIPT" ]]; then
     echo "Missing $START_SCRIPT — run install.sh first." >&2
     return 1
   fi
-  # Ensure LaunchAgent is loaded so launchd will respawn on next login. The
-  # script itself handles tmux session creation idempotently.
+  # Ensure LaunchAgent is loaded so launchd will respawn on next login.
   if [[ -f "$PLIST_PATH" ]]; then
     launchctl load "$PLIST_PATH" 2>/dev/null || true
   fi
