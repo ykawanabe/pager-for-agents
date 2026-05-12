@@ -44,6 +44,23 @@ compute_next_delay() {
   echo "$next"
 }
 
+# Returns the right claude session flag for the given cwd + session-id pair:
+# `--session-id` for first launch (no jsonl yet) so claude creates the session
+# with our chosen UUID, `--resume` for every subsequent restart so it picks up
+# the existing transcript. Pure path arithmetic — easy to unit-test.
+#   $1 = absolute cwd (matches CLAUDE_CWD; becomes the projects/<encoded> dir)
+#   $2 = session UUID
+session_arg_flag() {
+  local cwd="$1" uuid="$2"
+  local encoded
+  encoded="${cwd//\//-}"
+  if [[ -f "$HOME/.claude/projects/${encoded}/${uuid}.jsonl" ]]; then
+    echo "--resume"
+  else
+    echo "--session-id"
+  fi
+}
+
 load_env_and_chdir() {
   local env_file="$HOME/.claude-telegram-agent/.env"
   if [[ ! -f "$env_file" ]]; then
@@ -64,11 +81,21 @@ main_loop() {
   # time so the bot resumes the same conversation across restarts (Mac sleep,
   # network drops, MCP kicks). Without it, every restart wipes context.
   #
+  # `--session-id <uuid>` only works for FIRST launch — once the session jsonl
+  # exists under ~/.claude/projects/<cwd>/<uuid>.jsonl, claude refuses with
+  # "Session ID is already in use" and exits in <1s. After a network kick or
+  # any restart that finds an existing jsonl, switch to `--resume <uuid>` so
+  # the conversation continues instead of crash-looping forever (we hit this
+  # at 14:37 on 2026-05-12: connectivity restored → kick → endless restart
+  # loop because --session-id couldn't reclaim its own ID).
+  #
   # When MULTI_TOPIC ships, each topic owns its own session via a per-topic
   # .tg-session-id file and this global flag goes away. See roadmap.md.
   local args=(--channels "plugin:${TELEGRAM_PLUGIN}" --dangerously-skip-permissions)
   if [[ -n "${BOT_SESSION_ID:-}" ]]; then
-    args+=(--session-id "$BOT_SESSION_ID")
+    local flag
+    flag=$(session_arg_flag "$CLAUDE_CWD" "$BOT_SESSION_ID")
+    args+=("$flag" "$BOT_SESSION_ID")
   fi
 
   # Seed below MIN so the first compute_next_delay call promotes to MIN

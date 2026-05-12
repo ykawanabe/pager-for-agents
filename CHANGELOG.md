@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-12
+
+Hotfix. Bot stopped auto-recovering after a network reconnect: watchdog kicked the session, but `restart_claude.sh` then crashlooped indefinitely with "Session ID is already in use" and the bot never came back online.
+
+### Fixed
+- **`restart_claude.sh` used `claude --session-id <uuid>` for every restart, but that flag only works on FIRST launch.** Once the session jsonl exists under `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, claude refuses with `Error: Session ID <uuid> is already in use.` and exits in <1s. Symptom: at 14:37 on 2026-05-12, `watch_network.sh` fired "Connectivity restored — restarting claude session"; the new claude immediately exited; backoff climbed 3 → 6 → 12 → 24 → 48 → 60s and stuck at the cap forever. Bot stayed dead until manual intervention. Now `restart_claude.sh` checks whether the session jsonl already exists and chooses the right flag: `--session-id` for the first launch (so claude creates the session under our chosen UUID), `--resume` for every subsequent restart (so it picks up the existing transcript instead of trying to claim an already-claimed UUID). Pure path arithmetic extracted into `session_arg_flag()` for unit testing. Four new regression tests in `test_restart_claude.sh` pin the contract (no jsonl → `--session-id`, jsonl exists → `--resume`, different UUID → `--session-id`, different cwd → `--session-id`).
+
 ## [0.1.2] - 2026-05-12
 
 Hotfix. Continued live `/qa` after v0.1.1 surfaced one more bug: the Telegram bot was randomly silent after a restart cycle.

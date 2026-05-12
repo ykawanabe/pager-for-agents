@@ -77,6 +77,48 @@ assert_delay "delay 12, run for exactly HEALTHY → MIN" \
 assert_delay "delay 12, just-short run → 24 (no reset)" \
   24 12 $((HEALTHY - 1)) "$HEALTHY" "$MIN" "$MAX"
 
+# ─── session_arg_flag: --session-id vs --resume ──────────────────────────────
+#
+# `claude --session-id <uuid>` only succeeds on first launch; once the session
+# jsonl exists, claude refuses with "Session ID is already in use" and exits
+# in <1s — restart_claude.sh then crashlooped forever (hit on 2026-05-12 after
+# a connectivity-restored kick). session_arg_flag picks the right flag based
+# on whether the jsonl already exists for this (cwd, uuid) pair.
+
+# Use a tmp HOME so we don't touch the real ~/.claude/projects.
+TMP_HOME=$(mktemp -d)
+ORIG_HOME="$HOME"
+export HOME="$TMP_HOME"
+trap 'rm -rf "$TMP_HOME"; export HOME="$ORIG_HOME"' EXIT
+
+CWD="/tmp/fakehome/agent-home"
+ENCODED_CWD="-tmp-fakehome-agent-home"
+UUID="11111111-2222-3333-4444-555555555555"
+
+# No jsonl yet → fresh start, must use --session-id so claude creates with our UUID.
+flag=$(session_arg_flag "$CWD" "$UUID")
+[[ "$flag" == "--session-id" ]] && ok "no jsonl → --session-id" \
+  || ng "no jsonl → expected --session-id, got $flag"
+
+# Create the jsonl claude would have written. Note the path-encoding (/ → -).
+mkdir -p "$HOME/.claude/projects/${ENCODED_CWD}"
+touch "$HOME/.claude/projects/${ENCODED_CWD}/${UUID}.jsonl"
+
+# jsonl exists → restart, must use --resume to pick up the existing transcript.
+flag=$(session_arg_flag "$CWD" "$UUID")
+[[ "$flag" == "--resume" ]] && ok "jsonl exists → --resume" \
+  || ng "jsonl exists → expected --resume, got $flag"
+
+# Different UUID at same cwd → first launch for THAT id.
+flag=$(session_arg_flag "$CWD" "99999999-2222-3333-4444-555555555555")
+[[ "$flag" == "--session-id" ]] && ok "different uuid → --session-id" \
+  || ng "different uuid → expected --session-id, got $flag"
+
+# Same UUID under different cwd → first launch in the new project dir.
+flag=$(session_arg_flag "/tmp/fakehome/other-home" "$UUID")
+[[ "$flag" == "--session-id" ]] && ok "different cwd → --session-id" \
+  || ng "different cwd → expected --session-id, got $flag"
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo
