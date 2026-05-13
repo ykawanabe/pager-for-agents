@@ -18,7 +18,7 @@ It also (optionally) provisions the bot token and allowlist at the canonical loc
 - `tmux`
 - `bun` (Claude Code currently requires it for plugin loading)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Your Telegram numeric user ID (DM [@userinfobot](https://t.me/userinfobot) to get it)
+- Your Telegram numeric user ID — DM [@userinfobot](https://t.me/userinfobot), or [@username_to_id_bot](https://t.me/username_to_id_bot) / [@getmyid_bot](https://t.me/getmyid_bot) if the first one's offline
 
 ## Install
 

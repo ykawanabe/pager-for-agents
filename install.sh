@@ -33,17 +33,33 @@ die() { printf "✗ %s\n" "$*" >&2; exit 1; }
 say "Checking dependencies"
 
 require() {
-  local cmd="$1" hint="$2"
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    die "Missing dependency: $cmd
-  Install: $hint"
+  local cmd="$1" hint="$2" brew_pkg="${3:-}"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    return
   fi
+
+  if [[ -n "$brew_pkg" ]] && command -v brew >/dev/null 2>&1; then
+    say "Missing dependency: $cmd"
+    printf "  Install via 'brew install %s'? [Y/n] " "$brew_pkg"
+    read -r answer
+    case "${answer:-y}" in
+      [Yy]*|"")
+        brew install "$brew_pkg" || die "brew install $brew_pkg failed. Manual install: $hint"
+        return
+        ;;
+    esac
+  fi
+
+  die "Missing dependency: $cmd
+  Install: $hint"
 }
 
+# Last arg = Homebrew formula; if present and brew is on PATH, installer offers
+# 'brew install <formula>' interactively before bailing out.
 require claude "npm install -g @anthropic-ai/claude-code  (or use bun/pnpm)"
-require tmux   "brew install tmux"
-require bun    "brew install oven-sh/bun/bun  (or curl -fsSL https://bun.sh/install | bash)"
-require jq     "brew install jq"
+require tmux   "brew install tmux"                                                            "tmux"
+require bun    "brew install oven-sh/bun/bun  (or curl -fsSL https://bun.sh/install | bash)"  "oven-sh/bun/bun"
+require jq     "brew install jq"                                                              "jq"
 
 CLAUDE_VERSION="$(claude --version 2>/dev/null || echo unknown)"
 say "Detected claude: $CLAUDE_VERSION"
