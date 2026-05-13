@@ -379,6 +379,133 @@ _config_caffeinate() {
   esac
 }
 
+# ─── Phase 2 mount management ───────────────────────────────────────────────
+# `cta mount/umount/list` write to ~/.claude-telegram-agent/mounts.json via
+# the mount-store TS lib (single source of truth for concurrency). Per-topic
+# tmux sessions are spawned/killed inline so users don't need to run
+# `cta start` again after a mount edit. The poller hot-reloads mounts.json
+# on mtime change, so message routing follows automatically.
+
+# Locate mount-store.ts. CTA_SERVICES_DIR override lets tests point at the
+# repo copy without installing.
+_mount_store_path() {
+  local d="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
+  echo "$d/mount-store/mount-store.ts"
+}
+
+_topic_wrapper_path() {
+  local d="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
+  echo "$d/topic-wrapper.sh"
+}
+
+cmd_mount() {
+  local thread_id="${1:-}" path="${2:-}" label="${3:-}"
+  if [[ -z "$thread_id" || -z "$path" ]]; then
+    echo "Usage: cta mount <thread_id|dm> <path> [label]" >&2
+    exit 1
+  fi
+  if [[ ! -d "$path" ]]; then
+    echo "cta mount: '$path' is not a directory" >&2
+    exit 1
+  fi
+  # Resolve to absolute path so the mount entry doesn't depend on $PWD.
+  local abs_path
+  abs_path=$(cd "$path" && pwd -P)
+
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta mount: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+
+  local mount_json
+  if [[ -n "$label" ]]; then
+    mount_json=$(bun run "$store" add "$thread_id" "$abs_path" "$label")
+  else
+    mount_json=$(bun run "$store" add "$thread_id" "$abs_path")
+  fi
+  local rc=$?
+  [[ "$rc" -ne 0 ]] && exit "$rc"
+
+  local tmux_session
+  tmux_session=$(echo "$mount_json" | jq -r '.tmux_session')
+
+  # If the poller is alive we want the topic immediately routable. Spawn
+  # the per-topic tmux now; topic-wrapper.sh handles UUID + claude launch.
+  if tmux has-session -t poller 2>/dev/null; then
+    tmux kill-session -t "$tmux_session" 2>/dev/null || true
+    local wrapper
+    wrapper=$(_topic_wrapper_path)
+    tmux new-session -d -s "$tmux_session" "$wrapper $thread_id $abs_path $tmux_session"
+    echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session, live)"
+  else
+    echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session — will start on next 'cta start')"
+  fi
+}
+
+cmd_umount() {
+  local thread_id="${1:-}"
+  if [[ -z "$thread_id" ]]; then
+    echo "Usage: cta umount <thread_id|dm>" >&2
+    exit 1
+  fi
+
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta umount: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+
+  local removed
+  removed=$(bun run "$store" remove "$thread_id")
+  local rc=$?
+  [[ "$rc" -ne 0 ]] && exit "$rc"
+
+  if [[ "$removed" == "null" ]]; then
+    echo "cta umount: thread $thread_id was not mounted"
+    return 0
+  fi
+
+  local tmux_session
+  tmux_session=$(echo "$removed" | jq -r '.tmux_session')
+  tmux kill-session -t "$tmux_session" 2>/dev/null && \
+    echo "Unmounted thread $thread_id (killed tmux $tmux_session)" || \
+    echo "Unmounted thread $thread_id (tmux $tmux_session was not running)"
+}
+
+cmd_list() {
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta list: mount-store not installed — rerun install.sh" >&2
+    exit 1
+  fi
+
+  if [[ "${1:-}" == "--json" ]]; then
+    bun run "$store" list
+    return
+  fi
+
+  local raw
+  raw=$(bun run "$store" list)
+  local count
+  count=$(echo "$raw" | jq '.mounts | length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "No mounts. Add one with: cta mount <thread_id> <path>"
+    return
+  fi
+
+  printf "%-10s %-15s %-50s %-12s %s\n" "THREAD" "LABEL" "PATH" "TMUX" "STATUS"
+  while IFS=$'\t' read -r thread_id label path tmux_session; do
+    local status="dead"
+    tmux has-session -t "$tmux_session" 2>/dev/null && status="alive"
+    printf "%-10s %-15s %-50s %-12s %s\n" \
+      "$thread_id" "${label:--}" "$path" "$tmux_session" "$status"
+  done < <(echo "$raw" | jq -r '.mounts[] | [.thread_id, .label // "", .path, .tmux_session] | @tsv')
+}
+
 cmd_help() {
   cat <<EOF
 cta — claude-telegram-agent CLI
@@ -387,6 +514,9 @@ Usage:
   cta status [--json]             Show agent health (text by default, JSON for tooling)
   cta start                       Load LaunchAgent + spawn tmux sessions
   cta stop                        Kill tmux sessions + unload LaunchAgent
+  cta mount <thread> <path>       Mount a project dir at a Telegram thread (or "dm")
+  cta umount <thread>             Unmount; kill the topic's tmux session
+  cta list [--json]               List current mounts
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta help                        This message
@@ -412,6 +542,9 @@ main() {
       ;;
     start) cmd_start ;;
     stop)  cmd_stop ;;
+    mount) cmd_mount "$@" ;;
+    umount) cmd_umount "$@" ;;
+    list)  cmd_list "$@" ;;
     config) cmd_config "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
