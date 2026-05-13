@@ -38,7 +38,7 @@ finishes, the last line printed is your **pairing code**:
 
 ```
 ═══════════════════════════════════════════════════════════
-  PAIRING CODE:  AB7K-9XQR
+  PAIRING CODE:  XXXX-XXXX
 ═══════════════════════════════════════════════════════════
 ```
 
@@ -67,7 +67,7 @@ If the auto-prompt doesn't appear (privacy mode quirks, bot not admin), use
 the pairing code from install.sh:
 
 ```
-/pair AB7K-9XQR
+/pair XXXX-XXXX
 ```
 
 Run `cta pair-code` on the host any time to re-display the code.
@@ -108,61 +108,6 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `/mount` says "inside a forum topic" | You sent it in the chat root, not a topic | Open a topic and resend, or use `/dm` for the DM mount |
 | Messages arrive but no claude reply | tmux session crashed / claude died | `tmux attach -t topic-<id>` to inspect; `cta start` to restart |
 | Want to start over | — | `cta stop`, delete `~/.claude-telegram-agent/paired.json`, `cta pair-code --reset`, `cta start` |
-
-### Manual config (if you prefer terminal-only setup)
-
-You can skip the pairing flow and set `MAIN_CHAT_ID` directly in
-`~/.claude-telegram-agent/.env`. The poller honors it as a fallback when
-`paired.json` is absent. See the [Manual setup](#manual-setup) section below.
-
-## Manual setup
-
-If you'd rather not run the installer:
-
-```sh
-# 1. Agent config
-mkdir -p ~/.claude-telegram-agent
-cp .env.example ~/.claude-telegram-agent/.env
-$EDITOR ~/.claude-telegram-agent/.env
-
-# 2. CLI + runtime scripts (matches install.sh's "section 3")
-mkdir -p ~/.local/bin
-cp cli/cta ~/.local/bin/
-cp agent/start_agents.sh agent/watch_network.sh agent/restart_claude.sh ~/.local/bin/
-chmod +x ~/.local/bin/cta ~/.local/bin/*.sh
-
-# 2b. MULTI_TOPIC runtime modules (matches install.sh's "section 3b")
-AGENT_DIR=~/.local/share/claude-telegram-agent/agent
-mkdir -p "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
-cp agent/poller/poller.ts agent/poller/package.json   "$AGENT_DIR/poller/"
-cp agent/mcp-telegram/server.ts agent/mcp-telegram/package.json   "$AGENT_DIR/mcp-telegram/"
-cp agent/mount-store/mount-store.ts agent/mount-store/package.json "$AGENT_DIR/mount-store/"
-cp agent/topic-wrapper.sh "$AGENT_DIR/topic-wrapper.sh"
-chmod +x "$AGENT_DIR/topic-wrapper.sh"
-( cd "$AGENT_DIR/mcp-telegram" && bun install --silent )
-
-# 3. Telegram plugin secrets (canonical location — auto-discovered by claude)
-mkdir -p ~/.claude/channels/telegram
-chmod 700 ~/.claude/channels/telegram
-printf 'TELEGRAM_BOT_TOKEN=123456:AAxxx...\n' > ~/.claude/channels/telegram/.env
-chmod 600 ~/.claude/channels/telegram/.env
-cat > ~/.claude/channels/telegram/access.json <<'EOF'
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["YOUR_TELEGRAM_USER_ID"],
-  "groups": {},
-  "pending": {}
-}
-EOF
-chmod 600 ~/.claude/channels/telegram/access.json
-
-# 4. LaunchAgent
-sed -e "s|__BIN_DIR__|$HOME/.local/bin|g" \
-    -e "s|__HOME__|$HOME|g" \
-    launchagent/com.claude-agent.plist.template \
-    > ~/Library/LaunchAgents/com.claude-agent.plist
-launchctl load ~/Library/LaunchAgents/com.claude-agent.plist
-```
 
 ## Where the secrets live
 

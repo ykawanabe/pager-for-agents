@@ -404,7 +404,7 @@ _config_caffeinate() {
 
 # ─── Phase 3 pairing (one-time bootstrap secret) ────────────────────────────
 # The bot is one-time-pairable via an 8-char code displayed at install time.
-# In Telegram, the user sends `/pair AB7K-9XQR` to the bot — the poller claims
+# In Telegram, the user sends `/pair XXXX-XXXX` to the bot — the poller claims
 # this chat as MAIN_CHAT_ID and the sender as the allowlisted user, then
 # consumes the code. After pairing, only the paired user can issue commands.
 #
