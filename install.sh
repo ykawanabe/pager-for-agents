@@ -108,7 +108,7 @@ if [[ -d "$REPO_DIR/services" ]]; then
   mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram" "$SERVICES_DIR/mount-store"
   cp "$REPO_DIR/services/poller/poller.ts" "$REPO_DIR/services/poller/package.json" "$SERVICES_DIR/poller/"
   cp "$REPO_DIR/services/mcp-telegram/server.ts" "$REPO_DIR/services/mcp-telegram/package.json" "$SERVICES_DIR/mcp-telegram/"
-  cp "$REPO_DIR/services/mount-store/mount-store.ts" "$REPO_DIR/services/mount-store/package.json" "$SERVICES_DIR/mount-store/"
+  cp "$REPO_DIR/services/mount-store/mount-store.ts" "$REPO_DIR/services/mount-store/bind-helper.ts" "$REPO_DIR/services/mount-store/package.json" "$SERVICES_DIR/mount-store/"
   cp "$REPO_DIR/services/topic-wrapper.sh" "$SERVICES_DIR/topic-wrapper.sh"
   chmod +x "$SERVICES_DIR/topic-wrapper.sh"
 
@@ -120,6 +120,22 @@ if [[ -d "$REPO_DIR/services" ]]; then
     say "Installed services under $SERVICES_DIR"
   else
     say "WARN: bun not found on PATH — F1+F2 MULTI_TOPIC mode will not start until bun is installed"
+  fi
+fi
+
+# ---- 3c. Install bind-telegram-topic skill (Phase 2) -----------------------
+# Ships a Claude Code slash command that wraps `cta bind`. Installed into the
+# user's global skills dir so it's available from any project. Don't clobber
+# user edits — `diff` and skip if changed.
+SKILLS_SRC="$REPO_DIR/skills/bind-telegram-topic"
+SKILLS_DST="$HOME/.claude/skills/bind-telegram-topic"
+if [[ -d "$SKILLS_SRC" ]]; then
+  mkdir -p "$SKILLS_DST"
+  if [[ -f "$SKILLS_DST/SKILL.md" ]] && ! cmp -s "$SKILLS_SRC/SKILL.md" "$SKILLS_DST/SKILL.md"; then
+    say "Skill bind-telegram-topic has local edits at $SKILLS_DST/SKILL.md — leaving alone"
+  else
+    cp "$SKILLS_SRC/SKILL.md" "$SKILLS_DST/SKILL.md"
+    say "Installed skill bind-telegram-topic"
   fi
 fi
 

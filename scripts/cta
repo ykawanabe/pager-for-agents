@@ -506,6 +506,68 @@ cmd_list() {
   done < <(echo "$raw" | jq -r '.mounts[] | [.thread_id, .label // "", .path, .tmux_session] | @tsv')
 }
 
+# `cta bind` — called from inside a running claude session (via the
+# bind-telegram-topic skill or directly in a tmux pane). Captures the
+# current tmux session name + pane cwd and writes a mounts.json entry so
+# the poller routes <thread_id>'s messages into this very claude.
+#
+# Hard requirement: $TMUX must be set. We can't pipe stdin into a claude
+# running in a bare terminal — same locking constraint that makes
+# --session-id collide with active sessions.
+cmd_bind() {
+  local thread_id="${1:-}"
+  local label="${2:-}"
+  if [[ -z "$thread_id" ]]; then
+    echo "Usage: cta bind <thread_id|dm> [label]" >&2
+    echo "Run this from inside the tmux session you want to bind." >&2
+    exit 1
+  fi
+  if [[ -z "${TMUX:-}" ]]; then
+    echo "cta bind: not in a tmux session (\$TMUX is unset)." >&2
+    echo "Open this claude inside tmux and re-run, or use 'cta mount <thread_id> <path>'." >&2
+    exit 1
+  fi
+
+  local current_session pane_cwd
+  current_session=$(tmux display-message -p '#S' 2>/dev/null || true)
+  pane_cwd=$(tmux display-message -p '#{pane_current_path}' 2>/dev/null || true)
+  if [[ -z "$current_session" || -z "$pane_cwd" ]]; then
+    echo "cta bind: tmux display-message returned nothing (broken tmux env?)" >&2
+    exit 1
+  fi
+  if [[ ! -d "$pane_cwd" ]]; then
+    echo "cta bind: pane cwd '$pane_cwd' is not a directory" >&2
+    exit 1
+  fi
+
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta bind: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+
+  # bind needs to PIN the *current* tmux session name (whatever the user
+  # named theirs) so the poller dispatches into the live claude — not
+  # spawn a fresh topic-<id> wrapper. mount-store's `add` always generates
+  # topic-<id>, so bind delegates to a sibling helper that calls the same
+  # locked write with the tmux name overridden.
+  local helper="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}/mount-store/bind-helper.ts"
+  if [[ ! -f "$helper" ]]; then
+    echo "cta bind: bind-helper.ts missing at $helper — rerun install.sh" >&2
+    exit 1
+  fi
+  local mount_json
+  mount_json=$(bun run "$helper" "$thread_id" "$pane_cwd" "$current_session" "${label:-}")
+  local rc=$?
+  if [[ "$rc" -ne 0 ]]; then exit "$rc"; fi
+
+  echo "Bound thread $thread_id → tmux $current_session (cwd: $pane_cwd)"
+  echo "Future messages in thread $thread_id will be sent into this pane."
+  echo "Note: this pane already has a claude running. cta does NOT respawn it;"
+  echo "      messages will land via tmux send-keys into the existing prompt."
+}
+
 cmd_help() {
   cat <<EOF
 cta — claude-telegram-agent CLI
@@ -517,6 +579,7 @@ Usage:
   cta mount <thread> <path>       Mount a project dir at a Telegram thread (or "dm")
   cta umount <thread>             Unmount; kill the topic's tmux session
   cta list [--json]               List current mounts
+  cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta help                        This message
@@ -545,6 +608,7 @@ main() {
     mount) cmd_mount "$@" ;;
     umount) cmd_umount "$@" ;;
     list)  cmd_list "$@" ;;
+    bind) cmd_bind "$@" ;;
     config) cmd_config "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
