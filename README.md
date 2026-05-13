@@ -44,33 +44,35 @@ finishes, the last line printed is your **pairing code**:
 
 ## Pair the bot from Telegram
 
-Three steps total. The middle one is one-time-only.
+After install, the bot is running but isn't connected to a chat yet. Pairing fixes that.
 
-1. **One-time setup in @BotFather.** Open [@BotFather](https://t.me/BotFather),
-   send `/setprivacy`, pick your bot, choose **Disable**. This lets the bot
-   read messages you send in groups. Without it, the bot is deaf to anything
-   except `@yourbot`-prefixed commands or replies to its own messages. DMs
-   work either way; this is just for group use.
-2. **Add the bot to a chat.** DM, group, or forum group (Topics enabled if
-   you want per-topic routing).
-3. **Tap "✓ Yes, pair me here"** when the bot asks. The bot detects you
-   added it and immediately replies with a Yes/No inline button. Only YOU
-   (the user who invited the bot) can confirm.
+### DM (easiest case)
 
-Done. Any message you send in a topic auto-routes to a claude session in
-the default project dir you set at install time. To bind a specific topic to
-a different dir, send `/mount ~/path` in that topic.
+1. Search Telegram for your bot's @username.
+2. Send `/start`. The bot replies with a "✓ Yes, pair me here" button.
+3. Tap it.
+
+Every message you DM the bot now reaches claude.
+
+### Group or forum group
+
+Groups need one extra step, because of a Telegram default:
+
+1. Open [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Otherwise, in groups, the bot only sees messages that @-mention it or reply to its own. (DMs aren't affected — this is a group-only quirk.)
+2. Invite the bot to the chat.
+3. Tap "✓ Yes, pair me here" when the bot asks. Only the person who invited it can confirm.
+
+In a forum group, every topic spawns its own claude session in whatever default project dir you picked at install. Pin a topic to a different dir with `/mount ~/path` inside it.
 
 ### Fallback: manual pairing code
 
-If the auto-prompt doesn't appear (privacy mode quirks, bot not admin), use
-the pairing code from install.sh:
+If the button never appears (privacy mode cached, bot isn't admin), use the code printed by `install.sh`:
 
 ```
 /pair XXXX-XXXX
 ```
 
-Run `cta pair-code` on the host any time to re-display the code.
+Run `cta pair-code` on your Mac to re-show it.
 
 ### Available commands
 
