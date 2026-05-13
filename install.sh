@@ -133,7 +133,7 @@ LEGACY_SERVICES_DIR="$HOME/.local/share/claude-telegram-agent/services"
 [[ -d "$LEGACY_SERVICES_DIR" ]] && rm -rf "$LEGACY_SERVICES_DIR"
 if [[ -d "$REPO_DIR/agent" ]]; then
   mkdir -p "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
-  cp "$REPO_DIR/agent/poller/poller.ts" "$REPO_DIR/agent/poller/package.json" "$AGENT_DIR/poller/"
+  cp "$REPO_DIR/agent/poller/poller.ts" "$REPO_DIR/agent/poller/typing-keepalive.ts" "$REPO_DIR/agent/poller/package.json" "$AGENT_DIR/poller/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
   cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
@@ -143,8 +143,8 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   # `bun install` is a cheap no-op there. If bun is missing, warn and skip
   # — the v0 path still works; only MULTI_TOPIC=1 needs bun-resolved deps.
   if command -v bun >/dev/null 2>&1; then
-    ( cd "$SERVICES_DIR/mcp-telegram" && bun install --silent ) || say "WARN: bun install failed in mcp-telegram"
-    say "Installed services under $SERVICES_DIR"
+    ( cd "$AGENT_DIR/mcp-telegram" && bun install --silent ) || say "WARN: bun install failed in mcp-telegram"
+    say "Installed services under $AGENT_DIR"
   else
     say "WARN: bun not found on PATH — F1+F2 MULTI_TOPIC mode will not start until bun is installed"
   fi
@@ -157,11 +157,11 @@ fi
 # wildcard mount already exists, leave it alone (user may have repointed it).
 DEFAULT_MOUNT_PATH=$(grep '^CLAUDE_CWD=' "$CONFIG_DIR/.env" 2>/dev/null \
   | head -1 | cut -d= -f2- | sed 's/^"//;s/"$//' | envsubst)
-if [[ -n "$DEFAULT_MOUNT_PATH" && -f "$SERVICES_DIR/mount-store/mount-store.ts" ]]; then
+if [[ -n "$DEFAULT_MOUNT_PATH" && -f "$AGENT_DIR/mount-store/mount-store.ts" ]]; then
   mkdir -p "$DEFAULT_MOUNT_PATH"  # create the dir if missing — otherwise mount-store rejects
-  existing_wildcard=$(bun run "$SERVICES_DIR/mount-store/mount-store.ts" get '*' 2>/dev/null || echo "null")
+  existing_wildcard=$(bun run "$AGENT_DIR/mount-store/mount-store.ts" get '*' 2>/dev/null || echo "null")
   if [[ "$existing_wildcard" == "null" || -z "$existing_wildcard" ]]; then
-    if bun run "$SERVICES_DIR/mount-store/mount-store.ts" add '*' "$DEFAULT_MOUNT_PATH" default >/dev/null 2>&1; then
+    if bun run "$AGENT_DIR/mount-store/mount-store.ts" add '*' "$DEFAULT_MOUNT_PATH" default >/dev/null 2>&1; then
       say "Wildcard mount → $DEFAULT_MOUNT_PATH (any unmounted topic auto-routes here)"
     fi
   fi

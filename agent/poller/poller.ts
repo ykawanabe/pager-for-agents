@@ -31,6 +31,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, st
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { addMount, readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
+import { markTypingActive, runTypingKeepalive } from "./typing-keepalive";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
@@ -198,9 +199,10 @@ async function reply(
 //      Toggle controlled by access.json's `ackReaction` field. Pager writes it;
 //      poller reads it. Empty / absent = no reaction.
 //   2. sendChatAction "typing" so the user sees the bot "typing..." while
-//      claude is composing the reply. Telegram auto-clears typing at 5s.
-//      We don't refresh in the v1 implementation — claude usually replies
-//      within that window. (TODO: refresh loop if claude routinely exceeds 5s.)
+//      claude is composing the reply. Telegram auto-clears typing at 5s, so
+//      a per-target keepalive loop re-fires it every ~4s. mcp-telegram clears
+//      the marker file after a successful sendMessage, which stops the loop.
+//      See typing-keepalive.ts.
 
 let ackReactionCache: string | null = null;
 let accessMtimeMs = 0;
@@ -307,6 +309,32 @@ async function sendTyping(chat_id: number, thread_id?: number): Promise<void> {
   } catch (e) {
     process.stderr.write(`poller: sendChatAction failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
+}
+
+// Tunables. Defaults: 4s between fires (Telegram clears typing at 5s, so this
+// leaves ~1s of overlap), 10 minutes hard cap so a crashed mcp-telegram can't
+// leave the loop spinning forever. Env overrides exist for tests + operator
+// tuning; production should leave them alone.
+const TYPING_INTERVAL_MS = Number(process.env.TYPING_INTERVAL_MS ?? "4000");
+const TYPING_MAX_MS = Number(process.env.TYPING_MAX_MS ?? `${10 * 60_000}`);
+
+/**
+ * Writes the per-target marker, then runs the keepalive loop. Fire-and-
+ * forget from the caller's perspective — the loop returns when the marker
+ * is cleared (by mcp-telegram on reply), replaced (by a newer dispatch
+ * taking over), or the hard cap elapses.
+ */
+async function startTypingKeepalive(chat_id: number, thread_id?: number): Promise<void> {
+  const token = markTypingActive(STATE_DIR, chat_id, thread_id);
+  await runTypingKeepalive({
+    stateDir: STATE_DIR,
+    chatId: chat_id,
+    threadId: thread_id,
+    token,
+    send: () => sendTyping(chat_id, thread_id),
+    intervalMs: TYPING_INTERVAL_MS,
+    maxMs: TYPING_MAX_MS,
+  });
 }
 
 // ─── tmux dispatch ───────────────────────────────────────────────────────────
@@ -908,7 +936,7 @@ function refreshMountsIfChanged(): void {
 function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): string | null {
   const servicesDir = process.env.MOUNT_STORE_PATH
     ? join(process.env.MOUNT_STORE_PATH, "..", "..")
-    : join(homedir(), ".local/share/claude-telegram-agent/services");
+    : join(homedir(), ".local/share/claude-telegram-agent/agent");
   const storePath = join(servicesDir, "mount-store/mount-store.ts");
   const wrapperPath = join(servicesDir, "topic-wrapper.sh");
 
@@ -956,7 +984,7 @@ function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): 
 function respawnTopicSession(mount: Mount): boolean {
   const servicesDir = process.env.MOUNT_STORE_PATH
     ? join(process.env.MOUNT_STORE_PATH, "..", "..")
-    : join(homedir(), ".local/share/claude-telegram-agent/services");
+    : join(homedir(), ".local/share/claude-telegram-agent/agent");
   const wrapperPath = join(servicesDir, "topic-wrapper.sh");
   const cmd = [wrapperPath, String(mount.thread_id), mount.path, mount.tmux_session]
     .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
@@ -1054,7 +1082,8 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
   // UX signals fired in parallel with claude composing the reply. Fire-and-
   // forget — if Telegram is slow we'd rather deliver the reply on time than
   // block on the typing/ack outbound. Errors are logged inside each helper.
-  void sendTyping(msg.chat.id, msg.message_thread_id);
+  // The typing keepalive runs until mcp-telegram clears the marker on reply.
+  void startTypingKeepalive(msg.chat.id, msg.message_thread_id);
   void reactToMessage(msg.chat.id, msg.message_id);
 }
 
@@ -1167,6 +1196,7 @@ export {
   refreshAckReactionIfChanged,
   reactToMessage,
   sendTyping,
+  startTypingKeepalive,
   effectiveChatId,
   effectiveUserId,
   type TgMessage,

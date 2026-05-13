@@ -125,10 +125,13 @@ main_multi_topic() {
     exit 1
   fi
 
-  local services_dir="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
-  local poller_path="$services_dir/poller/poller.ts"
-  local wrapper_path="$services_dir/topic-wrapper.sh"
-  local mount_store_path="$services_dir/mount-store/mount-store.ts"
+  # CTA_AGENT_DIR overrides the install location (used by tests). The legacy
+  # CTA_SERVICES_DIR env name is honored for back-compat with any operator
+  # scripts that pinned it; new code should use CTA_AGENT_DIR.
+  local agent_dir="${CTA_AGENT_DIR:-${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/agent}}"
+  local poller_path="$agent_dir/poller/poller.ts"
+  local wrapper_path="$agent_dir/topic-wrapper.sh"
+  local mount_store_path="$agent_dir/mount-store/mount-store.ts"
   for p in "$poller_path" "$wrapper_path" "$mount_store_path"; do
     if [[ ! -e "$p" ]]; then
       echo "MULTI_TOPIC: missing $p — rerun install.sh" >&2
