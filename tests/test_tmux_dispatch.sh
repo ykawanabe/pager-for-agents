@@ -104,15 +104,18 @@ fi
 
 # ─── Buffer cleanup: paste-buffer -d removes the buffer ─────────────────────
 # If -d is silently dropped, repeated dispatches would re-paste old content.
-# Verify the buffer stack is empty after a dispatch.
+# Compare buffer count delta: must be 0 after a dispatch+cleanup roundtrip.
+# Absolute count would be flaky when the live agent shares the same tmux
+# server (its dispatches drop buffers concurrently with the test).
 
+BEFORE_COUNT=$(tmux list-buffers 2>/dev/null | wc -l | tr -d ' ')
 dispatch "$SESSION" "cleanup probe"
 sleep 0.2
-BUFFER_COUNT=$(tmux list-buffers 2>&1 | wc -l | tr -d ' ')
-if [[ "$BUFFER_COUNT" == "0" ]]; then
-  ok "paste-buffer -d clears the buffer (list-buffers empty)"
+AFTER_COUNT=$(tmux list-buffers 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$AFTER_COUNT" -le "$BEFORE_COUNT" ]]; then
+  ok "paste-buffer -d clears its own buffer (no net growth)"
 else
-  ng "paste-buffer -d left buffers behind (count=$BUFFER_COUNT)"
+  ng "paste-buffer -d left buffers behind (before=$BEFORE_COUNT after=$AFTER_COUNT)"
 fi
 
 # ─── summary ─────────────────────────────────────────────────────────────────

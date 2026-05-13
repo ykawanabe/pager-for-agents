@@ -105,41 +105,44 @@ main_single_topic() {
   echo "Recent activity: tail -f $LOG_FILE"
 }
 
-# F1+F2 Phase 1 (MVP) path — one poller + one hardcoded topic wrapper.
-# Phase 2 replaces the hardcoded topic with a mounts.json walk.
+# F1+F2 Phase 2 path — one poller + one tmux session per mount entry.
 #
-# Required .env vars (in addition to the v0 ones):
-#   MAIN_CHAT_ID                 — the one chat we listen to
-#   MULTI_TOPIC_THREAD_ID        — Telegram forum topic id (Phase 1 hardcoded)
-#   MULTI_TOPIC_PROJECT_PATH     — project dir for that topic
-#   MULTI_TOPIC_TMUX_SESSION     — optional, defaults to topic-<thread_id>
+# Required .env: MAIN_CHAT_ID. Everything else (topics, project paths, tmux
+# session names) is driven by ~/.claude-telegram-agent/mounts.json, which is
+# owned by `cta mount/umount`. Mounts can be added at runtime — the poller
+# hot-reloads on mounts.json mtime; this script spawns the per-topic tmux
+# sessions on (re)start.
 #
 # Layout while running:
 #   tmux poller            — bun .../services/poller/poller.ts
-#   tmux topic-<id>        — services/topic-wrapper.sh (per-topic claude)
+#   tmux topic-<id>        — one per mounts.json entry (forum topic or "dm")
 #   tmux watchdog          — v0 watchdog for now; Phase 3 swaps in the
 #                            heartbeat-aware version.
 main_multi_topic() {
-  if [[ -z "${MAIN_CHAT_ID:-}" || -z "${MULTI_TOPIC_THREAD_ID:-}" || -z "${MULTI_TOPIC_PROJECT_PATH:-}" ]]; then
-    echo "MULTI_TOPIC=1 requires MAIN_CHAT_ID, MULTI_TOPIC_THREAD_ID, and MULTI_TOPIC_PROJECT_PATH in .env" >&2
-    exit 1
-  fi
-  local topic_session="${MULTI_TOPIC_TMUX_SESSION:-topic-${MULTI_TOPIC_THREAD_ID}}"
-
-  local poller_path="${MULTI_TOPIC_POLLER_PATH:-$HOME/.local/share/claude-telegram-agent/services/poller/poller.ts}"
-  local wrapper_path="${MULTI_TOPIC_WRAPPER_PATH:-$HOME/.local/share/claude-telegram-agent/services/topic-wrapper.sh}"
-  if [[ ! -f "$poller_path" ]]; then
-    echo "MULTI_TOPIC: poller not installed at $poller_path — rerun install.sh" >&2
-    exit 1
-  fi
-  if [[ ! -x "$wrapper_path" ]]; then
-    echo "MULTI_TOPIC: topic-wrapper not installed at $wrapper_path — rerun install.sh" >&2
+  if [[ -z "${MAIN_CHAT_ID:-}" ]]; then
+    echo "MULTI_TOPIC=1 requires MAIN_CHAT_ID in .env" >&2
     exit 1
   fi
 
+  local services_dir="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
+  local poller_path="$services_dir/poller/poller.ts"
+  local wrapper_path="$services_dir/topic-wrapper.sh"
+  local mount_store_path="$services_dir/mount-store/mount-store.ts"
+  for p in "$poller_path" "$wrapper_path" "$mount_store_path"; do
+    if [[ ! -e "$p" ]]; then
+      echo "MULTI_TOPIC: missing $p — rerun install.sh" >&2
+      exit 1
+    fi
+  done
+
+  # Tear down any prior poller / watchdog. Per-topic sessions are torn down
+  # individually in the mounts loop below so we don't blow away ones that
+  # don't appear in mounts.json yet (idempotent re-entry).
   tmux kill-session -t poller 2>/dev/null || true
-  tmux kill-session -t "$topic_session" 2>/dev/null || true
   tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
+  # v0 leftover: if a `claude` session from main_single_topic is alive when
+  # we switch to MULTI_TOPIC, two pollers race on getUpdates. Kill it.
+  tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
 
   # Pull token out of plugin .env so it lands in the poller's env.
   local plugin_env="$HOME/.claude/channels/telegram/.env"
@@ -155,24 +158,45 @@ main_multi_topic() {
   tmux new-session -d -s poller \
     -e "TELEGRAM_BOT_TOKEN=$token" \
     -e "MAIN_CHAT_ID=$MAIN_CHAT_ID" \
-    -e "HARDCODED_THREAD_ID=$MULTI_TOPIC_THREAD_ID" \
-    -e "HARDCODED_TMUX=$topic_session" \
     "bun $poller_path"
+  # Brief settle before pipe-pane — the live install showed an intermittent
+  # "can't find pane: poller" when pipe_to_log ran immediately after new-
+  # session before the pane was fully attached.
+  sleep 0.2
   pipe_to_log poller
 
   sleep 1
 
-  tmux new-session -d -s "$topic_session" \
-    "$wrapper_path $MULTI_TOPIC_THREAD_ID $MULTI_TOPIC_PROJECT_PATH $topic_session"
-  pipe_to_log "$topic_session"
+  # Walk mounts.json and spawn one tmux session per entry. `bun run … list`
+  # prints the full file as JSON; jq pulls out the fields we need on
+  # tab-separated lines for safe whitespace handling in paths.
+  local n=0
+  while IFS=$'\t' read -r thread_id project_path tmux_session; do
+    [[ -z "$thread_id" ]] && continue
+    if [[ ! -d "$project_path" ]]; then
+      echo "MULTI_TOPIC: skipping thread $thread_id — project_path '$project_path' is not a directory" >&2
+      continue
+    fi
+    tmux kill-session -t "$tmux_session" 2>/dev/null || true
+    # tmux new-session's command arg goes through /bin/sh -c; printf %q
+    # shell-escapes each arg so paths with spaces / metacharacters survive.
+    local quoted_cmd
+    quoted_cmd=$(printf '%q ' "$wrapper_path" "$thread_id" "$project_path" "$tmux_session")
+    tmux new-session -d -s "$tmux_session" "$quoted_cmd"
+    pipe_to_log "$tmux_session"
+    n=$((n + 1))
+  done < <(bun run "$mount_store_path" list \
+            | jq -r '.mounts[] | select(.thread_id != "*") | [.thread_id, .path, .tmux_session] | @tsv')
 
   sleep 3
 
   tmux new-session -d -s "$TMUX_SESSION_WATCHDOG" "$BIN_DIR/watch_network.sh"
   pipe_to_log "$TMUX_SESSION_WATCHDOG"
 
-  echo "Started tmux sessions (MULTI_TOPIC): poller, $topic_session, $TMUX_SESSION_WATCHDOG"
-  echo "Attach with: tmux attach -t $topic_session"
+  echo "Started tmux sessions (MULTI_TOPIC): poller, $n topic(s), $TMUX_SESSION_WATCHDOG"
+  if [[ "$n" -eq 0 ]]; then
+    echo "Note: mounts.json is empty. Use 'cta mount <thread_id> <path>' to mount a project."
+  fi
   echo "Watch poller: tmux attach -t poller"
   echo "Recent activity: tail -f $LOG_FILE"
 }

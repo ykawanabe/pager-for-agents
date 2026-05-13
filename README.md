@@ -29,13 +29,88 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer will prompt for:
+You'll be prompted for one thing: the Telegram bot token from
+[@BotFather](https://t.me/BotFather). Paste it (silent input). When install
+finishes, the last line printed is your **pairing code**:
 
-1. Claude Code working directory (default: `~/claude-home`)
-2. Telegram bot token (silent input — not echoed to screen)
-3. Your Telegram user ID for the allowlist (leave blank to start in `open` mode — **not recommended**)
+```
+═══════════════════════════════════════════════════════════
+  PAIRING CODE:  AB7K-9XQR
+═══════════════════════════════════════════════════════════
+```
 
-After the LaunchAgent is loaded, send a DM to your bot from Telegram. Claude should reply within a few seconds.
+## Pair the bot from Telegram
+
+Three steps total. The middle one is one-time-only.
+
+1. **One-time setup in @BotFather.** Open [@BotFather](https://t.me/BotFather),
+   send `/setprivacy`, pick your bot, choose **Disable**. This lets the bot
+   read messages you send in groups. Without it, the bot is deaf to anything
+   except `@yourbot`-prefixed commands or replies to its own messages. DMs
+   work either way; this is just for group use.
+2. **Add the bot to a chat.** DM, group, or forum group (Topics enabled if
+   you want per-topic routing).
+3. **Tap "✓ Yes, pair me here"** when the bot asks. The bot detects you
+   added it and immediately replies with a Yes/No inline button. Only YOU
+   (the user who invited the bot) can confirm.
+
+Done. Any message you send in a topic auto-routes to a claude session in
+the default project dir you set at install time. To bind a specific topic to
+a different dir, send `/mount ~/path` in that topic.
+
+### Fallback: manual pairing code
+
+If the auto-prompt doesn't appear (privacy mode quirks, bot not admin), use
+the pairing code from install.sh:
+
+```
+/pair AB7K-9XQR
+```
+
+Run `cta pair-code` on the host any time to re-display the code.
+
+### Available commands
+
+Send these inside Telegram (in the paired chat, as the paired user):
+
+| Command | Where | What |
+|---|---|---|
+| `/pair <code>` | Any chat | One-time pairing (consumed on success) |
+| `/start` | Any chat | Welcome message + pairing hint |
+| `/mount <path>` | Inside a forum topic | Bind that topic to a Mac directory |
+| `/dm <path>` | In the bot's DM | Bind the DM to a Mac directory |
+| `/unmount` | The mounted topic/DM | Remove that mount |
+| `/list` | Anywhere | Show current mounts |
+| `/help` | Anywhere | List commands |
+
+### Host-side commands (terminal)
+
+| Command | What |
+|---|---|
+| `cta status` | Health snapshot (LaunchAgent, tmux, MCP, last activity) |
+| `cta start` / `cta stop` | Restart / stop the agent |
+| `cta pair-code` | Re-display the pairing code |
+| `cta pair-code --reset` | Regenerate (invalidates the previous code) |
+| `cta list` | Same as `/list` but in your terminal |
+| `cta mount <thread> <path>` | Same as `/mount` but in your terminal |
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `/pair` is silent, no reply at all | Pairing code already consumed | `cta pair-code --reset` on host, retry with new code |
+| `/pair … did not match` | Wrong code | Run `cta pair-code` to see the current value |
+| Bot doesn't respond to anything | Token rejected by Bot API (preflight failed) | Check `~/.claude/channels/telegram/.env`, rerun `./install.sh` |
+| `/mount` says "not a directory" | Path doesn't exist on the Mac | Use full path, no relative or shell-globbed paths |
+| `/mount` says "inside a forum topic" | You sent it in the chat root, not a topic | Open a topic and resend, or use `/dm` for the DM mount |
+| Messages arrive but no claude reply | tmux session crashed / claude died | `tmux attach -t topic-<id>` to inspect; `cta start` to restart |
+| Want to start over | — | `cta stop`, delete `~/.claude-telegram-agent/paired.json`, `cta pair-code --reset`, `cta start` |
+
+### Manual config (if you prefer terminal-only setup)
+
+You can skip the pairing flow and set `MAIN_CHAT_ID` directly in
+`~/.claude-telegram-agent/.env`. The poller honors it as a fallback when
+`paired.json` is absent. See the [Manual setup](#manual-setup) section below.
 
 ## Manual setup
 

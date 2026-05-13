@@ -43,6 +43,7 @@ require() {
 require claude "npm install -g @anthropic-ai/claude-code  (or use bun/pnpm)"
 require tmux   "brew install tmux"
 require bun    "brew install oven-sh/bun/bun  (or curl -fsSL https://bun.sh/install | bash)"
+require jq     "brew install jq"
 
 CLAUDE_VERSION="$(claude --version 2>/dev/null || echo unknown)"
 say "Detected claude: $CLAUDE_VERSION"
@@ -104,9 +105,10 @@ done
 # files are missing, so install/uninstall stay symmetric.
 SERVICES_DIR="$HOME/.local/share/claude-telegram-agent/services"
 if [[ -d "$REPO_DIR/services" ]]; then
-  mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram"
+  mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram" "$SERVICES_DIR/mount-store"
   cp "$REPO_DIR/services/poller/poller.ts" "$REPO_DIR/services/poller/package.json" "$SERVICES_DIR/poller/"
   cp "$REPO_DIR/services/mcp-telegram/server.ts" "$REPO_DIR/services/mcp-telegram/package.json" "$SERVICES_DIR/mcp-telegram/"
+  cp "$REPO_DIR/services/mount-store/mount-store.ts" "$REPO_DIR/services/mount-store/package.json" "$SERVICES_DIR/mount-store/"
   cp "$REPO_DIR/services/topic-wrapper.sh" "$SERVICES_DIR/topic-wrapper.sh"
   chmod +x "$SERVICES_DIR/topic-wrapper.sh"
 
@@ -118,6 +120,61 @@ if [[ -d "$REPO_DIR/services" ]]; then
     say "Installed services under $SERVICES_DIR"
   else
     say "WARN: bun not found on PATH — F1+F2 MULTI_TOPIC mode will not start until bun is installed"
+  fi
+fi
+
+# ---- 3d. Default catch-all mount + cross-session memory (Phase 4) ----------
+# Set up the "any unmounted Telegram topic auto-spawns a claude here" template
+# so new users don't have to /mount every topic individually. Reads CLAUDE_CWD
+# from the .env we just wrote (or the user's existing one). Idempotent — if a
+# wildcard mount already exists, leave it alone (user may have repointed it).
+DEFAULT_MOUNT_PATH=$(grep '^CLAUDE_CWD=' "$CONFIG_DIR/.env" 2>/dev/null \
+  | head -1 | cut -d= -f2- | sed 's/^"//;s/"$//' | envsubst)
+if [[ -n "$DEFAULT_MOUNT_PATH" && -f "$SERVICES_DIR/mount-store/mount-store.ts" ]]; then
+  mkdir -p "$DEFAULT_MOUNT_PATH"  # create the dir if missing — otherwise mount-store rejects
+  existing_wildcard=$(bun run "$SERVICES_DIR/mount-store/mount-store.ts" get '*' 2>/dev/null || echo "null")
+  if [[ "$existing_wildcard" == "null" || -z "$existing_wildcard" ]]; then
+    if bun run "$SERVICES_DIR/mount-store/mount-store.ts" add '*' "$DEFAULT_MOUNT_PATH" default >/dev/null 2>&1; then
+      say "Wildcard mount → $DEFAULT_MOUNT_PATH (any unmounted topic auto-routes here)"
+    fi
+  fi
+fi
+
+# Cross-session shared memory file. claude reads/appends notes here so context
+# survives across topics + project switches. topic-wrapper.sh's system prompt
+# tells claude this file exists; nothing on the host writes it automatically.
+SHARED_CTX="$CONFIG_DIR/shared-context.md"
+if [[ ! -f "$SHARED_CTX" ]]; then
+  (umask 077 && cat > "$SHARED_CTX" <<'EOF'
+# Cross-session memory
+
+This file is shared across all Telegram topics and claude sessions on this
+host. The Telegram bot tells every claude session to read from and append
+to this file so durable context (user preferences, ongoing concerns,
+decisions) survives across topic switches.
+
+Add entries below. Keep them short. Avoid duplication.
+
+---
+
+EOF
+  )
+  say "Initialized $SHARED_CTX"
+fi
+
+# ---- 3c. Install bind-telegram-topic skill (Phase 2) -----------------------
+# Ships a Claude Code slash command that wraps `cta bind`. Installed into the
+# user's global skills dir so it's available from any project. Don't clobber
+# user edits — `diff` and skip if changed.
+SKILLS_SRC="$REPO_DIR/skills/bind-telegram-topic"
+SKILLS_DST="$HOME/.claude/skills/bind-telegram-topic"
+if [[ -d "$SKILLS_SRC" ]]; then
+  mkdir -p "$SKILLS_DST"
+  if [[ -f "$SKILLS_DST/SKILL.md" ]] && ! cmp -s "$SKILLS_SRC/SKILL.md" "$SKILLS_DST/SKILL.md"; then
+    say "Skill bind-telegram-topic has local edits at $SKILLS_DST/SKILL.md — leaving alone"
+  else
+    cp "$SKILLS_SRC/SKILL.md" "$SKILLS_DST/SKILL.md"
+    say "Installed skill bind-telegram-topic"
   fi
 fi
 
@@ -207,21 +264,50 @@ launchctl unload "$PLIST_PATH" 2>/dev/null || true
 launchctl load "$PLIST_PATH"
 say "Loaded LaunchAgent $PLIST_LABEL"
 
-# ---- 6. Done ----------------------------------------------------------------
-cat <<EOF
+# ---- 6. Generate pairing code (Phase 3 zero-config onboarding) -------------
+# Generate (or display existing) one-time pairing code so the user can claim
+# the bot from Telegram itself — no chat_id editing required.
+PAIRING_CODE=$("$BIN_DIR/cta" pair-code --init 2>/dev/null || echo "")
+
+# ---- 7. Done ----------------------------------------------------------------
+if [[ -n "$PAIRING_CODE" ]]; then
+  cat <<EOF
 
 ✓ Installed.
 
-Next steps:
-  1. Verify both tmux sessions are running:  tmux ls
-  2. Tail the agent log:                     tail -f $CONFIG_DIR/agent.log
-  3. Send a DM to your bot from Telegram — Claude should reply.
+To connect your bot:
 
-Telegram secrets live at $TELEGRAM_DIR (mode 700).
-The Claude Code Telegram plugin auto-discovers them when claude is launched
-with --channels plugin:telegram@claude-plugins-official (handled by the
-agent's restart loop).
+  1. (One-time) Open @BotFather in Telegram, send /setprivacy, pick your bot,
+     choose "Disable". This lets the bot read all messages in groups you add
+     it to (without it, your messages are invisible to the bot in groups).
+     DMs work either way.
+  2. Add your bot to a chat (DM, group, or forum group).
+  3. The bot will immediately reply "Should I pair with this chat?"
+     Tap "✓ Yes, pair me here". Only YOU (the inviter) can confirm.
+  4. Done. Any message you send in a topic auto-routes to a claude session.
 
-Security: this agent runs claude with --dangerously-skip-permissions.
-Make sure the allowlist is set BEFORE sending anything sensitive. See README.
+If the auto-prompt doesn't appear (rare, e.g. privacy mode quirks), fall
+back to the manual pairing code:
+
+  PAIRING CODE:  $PAIRING_CODE
+  In Telegram, send:  /pair $PAIRING_CODE
+
+Default project dir for auto-routed topics: $DEFAULT_MOUNT_PATH
+To pin a specific topic to a different dir, send inside that topic:
+  /mount ~/path/to/other-project
+
+Useful commands from the host:
+  cta status                   — agent health snapshot
+  cta pair-code                — re-display the fallback pairing code
+  cta pair-code --reset        — invalidate the printed code + regen
+  cta list                     — current mounts
+  tail -f $CONFIG_DIR/agent.log
 EOF
+else
+  cat <<EOF
+
+✓ Installed (couldn't generate pairing code automatically — run \`cta pair-code --init\` manually).
+
+Tail the agent log:  tail -f $CONFIG_DIR/agent.log
+EOF
+fi

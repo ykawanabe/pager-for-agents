@@ -60,6 +60,13 @@ fi
 TMUX_SESSION_CLAUDE="${TMUX_SESSION_CLAUDE:-claude}"
 TMUX_SESSION_WATCHDOG="${TMUX_SESSION_WATCHDOG:-watchdog}"
 
+# MULTI_TOPIC mode replaces the v0 `claude` tmux session with `poller` + N
+# `topic-<thread_id>` sessions. Status checks delegate to those instead so
+# Pager doesn't keep reporting "claude=✗" forever.
+_multi_topic_enabled() {
+  [[ "${MULTI_TOPIC:-0}" == "1" ]]
+}
+
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
 _la_loaded() {
@@ -67,14 +74,23 @@ _la_loaded() {
 }
 
 # Print "<pid> <rss_kb>" if claude is running, else empty line. Caller parses.
+# MULTI_TOPIC: any `claude --mcp-config` spawned by topic-wrapper.sh counts as
+# "claude alive" — there's no single canonical `claude --channels` process to
+# look for. Single-topic v0 keeps the old --channels grep.
 _claude_ps_line() {
+  local pat
+  if _multi_topic_enabled; then pat="claude --mcp-config"
+  else pat="claude --channels plugin:telegram"
+  fi
   ps -Ao pid=,rss=,command= 2>/dev/null \
-    | grep "claude --channels plugin:telegram" \
+    | grep "$pat" \
     | grep -v grep \
     | head -1 \
     | awk '{print $1, $2}'
 }
 
+# MULTI_TOPIC: per-topic mcp-telegram process lives at .../services/mcp-telegram/server.ts.
+# v0: the official plugin's bun server is also a server.ts; same grep matches both.
 _mcp_alive() {
   ps -Ao command= 2>/dev/null \
     | grep "bun" | grep "server.ts" | grep -v grep \
@@ -139,8 +155,15 @@ cmd_status() {
   local mcp_alive
   if _mcp_alive; then mcp_alive=true; else mcp_alive=false; fi
 
+  # In MULTI_TOPIC mode, `claude` (the v0 control session) doesn't exist —
+  # `poller` plays that role. Map the JSON's `tmux.claude.alive` field to the
+  # poller's status so existing consumers (Pager) keep working unchanged.
+  local control_session
+  if _multi_topic_enabled; then control_session="poller"
+  else control_session="$TMUX_SESSION_CLAUDE"
+  fi
   local tmux_claude tmux_watchdog
-  if _tmux_session_alive "$TMUX_SESSION_CLAUDE"; then tmux_claude=true; else tmux_claude=false; fi
+  if _tmux_session_alive "$control_session"; then tmux_claude=true; else tmux_claude=false; fi
   if _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then tmux_watchdog=true; else tmux_watchdog=false; fi
 
   local activity
@@ -164,7 +187,7 @@ cmd_status() {
   "claude": {"pid": $(_json_int_or_null "$pid"), "rss_mb": $(_json_int_or_null "$rss_mb")},
   "telegram_mcp": {"alive": $mcp_alive},
   "tmux": {
-    "claude": {"name": $(_json_str_or_null "$TMUX_SESSION_CLAUDE"), "alive": $tmux_claude},
+    "claude": {"name": $(_json_str_or_null "$control_session"), "alive": $tmux_claude},
     "watchdog": {"name": $(_json_str_or_null "$TMUX_SESSION_WATCHDOG"), "alive": $tmux_watchdog}
   },
   "caffeinate": {"alive": $caffeinate_alive, "pid": $(_json_int_or_null "$caffeinate_pid")},
@@ -379,6 +402,418 @@ _config_caffeinate() {
   esac
 }
 
+# ─── Phase 3 pairing (one-time bootstrap secret) ────────────────────────────
+# The bot is one-time-pairable via an 8-char code displayed at install time.
+# In Telegram, the user sends `/pair AB7K-9XQR` to the bot — the poller claims
+# this chat as MAIN_CHAT_ID and the sender as the allowlisted user, then
+# consumes the code. After pairing, only the paired user can issue commands.
+#
+# Threat model: anyone who can see the pairing code can claim the bot before
+# you do. Code lives at $HOME/.claude-telegram-agent/pairing-code (mode 600)
+# and is deleted on first successful pair. install.sh prints it once to stdout.
+# Lost code → `cta pair-code --reset` regenerates.
+
+PAIRING_CODE_FILE="$HOME/.claude-telegram-agent/pairing-code"
+
+# Confusion-free alphabet: drops 0/O, 1/I/L, S/5, Z/2, B/8 — so a code copied
+# from a terminal phone-photo is unambiguous. 25 chars × 8 ≈ 37 bits entropy,
+# plenty for a one-time bootstrap secret that's gone in minutes.
+_PAIRING_ALPHABET="ACDEFGHJKMNPQRTUVWXY34679"
+
+_generate_pairing_code() {
+  local bytes code="" abet="$_PAIRING_ALPHABET"
+  # openssl rand is on every macOS; od -An -tu1 prints space-separated bytes
+  bytes=$(openssl rand 16 2>/dev/null | od -An -tu1)
+  for byte in $bytes; do
+    [[ ${#code} -ge 8 ]] && break
+    code="${code}${abet:$((byte % ${#abet})):1}"
+  done
+  printf '%s-%s\n' "${code:0:4}" "${code:4:8}"
+}
+
+PAIRED_STATE_FILE="$HOME/.claude-telegram-agent/paired.json"
+
+# cta pair — host-driven pairing. Bypasses Telegram entirely. The user types
+# the chat_id (and optional user_id) they want to claim, and we write
+# paired.json directly. Useful when:
+#   - The inline-keyboard auto-pair flow doesn't fire (forum permission caches,
+#     bot kicked before tap, etc.)
+#   - The user wants deterministic setup over a magic flow
+#   - Scripted / Pager-driven setup needs to skip the Telegram round-trip
+# Discovery helper: `cta pair --auto` polls the Bot API for chats the bot
+# has been seen in recently and prints them so the user can pick a chat_id
+# without hunting through Telegram UI.
+cmd_pair() {
+  local sub="${1:-}"
+  if [[ "$sub" == "--auto" ]]; then
+    _pair_auto_discover
+    return $?
+  fi
+  if [[ "$sub" == "--help" || -z "$sub" ]]; then
+    cat <<EOF
+Usage:
+  cta pair <chat_id> [user_id]   Claim chat_id (negative for groups/supergroups).
+                                 user_id defaults to the chat owner for DMs, or
+                                 must be specified for groups (your Telegram user id).
+  cta pair --auto                Scan recent Bot API updates for chats the bot
+                                 has been added to and offer them to pick from.
+EOF
+    return 0
+  fi
+  local chat_id="$1"
+  local user_id="${2:-}"
+  if ! [[ "$chat_id" =~ ^-?[0-9]+$ ]]; then
+    echo "cta pair: chat_id must be an integer (got '$chat_id')" >&2
+    return 1
+  fi
+  if [[ -n "$user_id" ]] && ! [[ "$user_id" =~ ^[0-9]+$ ]]; then
+    echo "cta pair: user_id must be a positive integer (got '$user_id')" >&2
+    return 1
+  fi
+  # DM heuristic: positive chat_id = personal account, user_id == chat_id.
+  # Groups/supergroups have negative chat_id; user_id is the operator's
+  # personal Telegram user id (8-10 digits).
+  if [[ -z "$user_id" ]]; then
+    if [[ "$chat_id" =~ ^[0-9]+$ ]]; then
+      user_id="$chat_id"
+    else
+      echo "cta pair: user_id is required for groups/supergroups (negative chat_id)." >&2
+      echo "Hint: DM @userinfobot on Telegram to find your numeric user id." >&2
+      return 1
+    fi
+  fi
+
+  if [[ -f "$PAIRED_STATE_FILE" ]]; then
+    local cur_chat
+    cur_chat=$(jq -r '.chat_id' "$PAIRED_STATE_FILE" 2>/dev/null || echo "?")
+    echo "Already paired with chat=$cur_chat. Run 'cta unpair' first to claim a new chat." >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$PAIRED_STATE_FILE")"
+  chmod 700 "$(dirname "$PAIRED_STATE_FILE")" 2>/dev/null || true
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # umask 077 ensures the file lands at 0600 (it contains a chat_id that's
+  # routable but not secret; still, defense in depth costs nothing).
+  ( umask 077 && printf '{\n  "version": 1,\n  "chat_id": %s,\n  "user_id": %s,\n  "paired_at": "%s"\n}\n' \
+      "$chat_id" "$user_id" "$now" > "$PAIRED_STATE_FILE" )
+  echo "Paired: chat=$chat_id user=$user_id"
+
+  # Recreate the wildcard mount if CLAUDE_CWD is set and no wildcard exists.
+  # This mirrors the poller's ensureWildcardMount so host-driven pairs land
+  # the user in a working state with one command.
+  local cwd
+  cwd=$(grep '^CLAUDE_CWD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
+  if [[ -n "$cwd" && -d "$cwd" ]]; then
+    local store="$HOME/.local/share/claude-telegram-agent/services/mount-store/mount-store.ts"
+    if [[ -f "$store" ]]; then
+      local has_wildcard
+      has_wildcard=$(bun run "$store" list 2>/dev/null | jq -r '.mounts[] | select(.thread_id == "*") | .thread_id' 2>/dev/null)
+      if [[ -z "$has_wildcard" ]]; then
+        bun run "$store" add '*' "$cwd" default >/dev/null 2>&1 \
+          && echo "Wildcard mount auto-created: * → $cwd"
+      fi
+    fi
+  fi
+  echo "Tip: the poller picks up paired.json automatically (it watches mtime). No restart needed."
+}
+
+# Discover chats the bot has been added to by polling the Bot API for
+# recent updates. Prints "<chat_id>  <title>" lines so the user can pick.
+_pair_auto_discover() {
+  local token
+  token=$(grep '^TELEGRAM_BOT_TOKEN=' "$HOME/.claude/channels/telegram/.env" 2>/dev/null | cut -d= -f2- | tr -d '"')
+  if [[ -z "$token" ]]; then
+    echo "cta pair --auto: TELEGRAM_BOT_TOKEN not found in ~/.claude/channels/telegram/.env" >&2
+    return 1
+  fi
+  # offset=-50 grabs the most recent 50 updates without consuming them
+  # (Telegram only marks updates "read" when you ack a higher offset). The
+  # live poller stays untouched.
+  local resp
+  resp=$(curl -fsS "https://api.telegram.org/bot${token}/getUpdates?offset=-50&timeout=0" 2>/dev/null)
+  if [[ -z "$resp" ]] || ! echo "$resp" | jq -e '.ok' >/dev/null; then
+    echo "cta pair --auto: getUpdates failed (network, token, or no recent updates)" >&2
+    return 1
+  fi
+  echo "Recent chats the bot has seen (most-recent first):"
+  echo "$resp" | jq -r '
+    .result
+    | map(.my_chat_member // .message // .callback_query.message // empty)
+    | map({chat_id: .chat.id, title: (.chat.title // .chat.first_name // "<DM>"), type: .chat.type})
+    | unique_by(.chat_id)
+    | reverse
+    | .[]
+    | "  \(.chat_id)  [\(.type)]  \(.title)"
+  '
+  echo
+  echo "To pair, run: cta pair <chat_id> <your_user_id>"
+  echo "  (your_user_id is your numeric Telegram user id — DM @userinfobot to find it)"
+}
+
+cmd_unpair() {
+  # Release the current paired chat so a new /pair (manual or auto via invite)
+  # can claim a different one. Optional --keep-mounts leaves mounts.json
+  # intact — useful if you're re-pairing to the same chat after testing
+  # auto-pair (the mounts are still valid; only the chat_id/user_id changes).
+  local keep_mounts=0
+  if [[ "${1:-}" == "--keep-mounts" ]]; then keep_mounts=1; fi
+
+  if [[ ! -f "$PAIRED_STATE_FILE" ]]; then
+    echo "Not currently paired (paired.json absent)."
+    return 0
+  fi
+
+  local chat_id user_id
+  chat_id=$(jq -r '.chat_id' "$PAIRED_STATE_FILE" 2>/dev/null || echo "?")
+  user_id=$(jq -r '.user_id' "$PAIRED_STATE_FILE" 2>/dev/null || echo "?")
+  rm -f "$PAIRED_STATE_FILE"
+  echo "Unpaired (was: chat=$chat_id user=$user_id)."
+
+  if [[ "$keep_mounts" -eq 0 ]]; then
+    # Wipe mounts.json so the new pair starts clean. Wildcard from install
+    # is regenerated next time install.sh runs; for now, just remove all
+    # entries. User can re-mount via Telegram /mount or terminal cta mount.
+    local store="$HOME/.local/share/claude-telegram-agent/services/mount-store/mount-store.ts"
+    if [[ -f "$store" ]]; then
+      # Build a fresh empty mounts.json by removing the file (mount-store
+      # creates it on first add).
+      rm -f "$HOME/.claude-telegram-agent/mounts.json"
+      echo "Cleared mounts.json (use --keep-mounts to preserve next time)."
+    fi
+  fi
+
+  echo "Next: re-add the bot in Telegram (auto-pair prompt fires), OR send /pair <code> using \`cta pair-code\`."
+}
+
+cmd_pair_code() {
+  local mode="${1:---show}"
+  case "$mode" in
+    --init)
+      # Create if missing. Idempotent — install.sh calls this on every run.
+      if [[ -f "$PAIRING_CODE_FILE" ]]; then
+        cat "$PAIRING_CODE_FILE"
+        return 0
+      fi
+      mkdir -p "$(dirname "$PAIRING_CODE_FILE")"
+      chmod 700 "$(dirname "$PAIRING_CODE_FILE")" 2>/dev/null || true
+      ( umask 077 && _generate_pairing_code > "$PAIRING_CODE_FILE" )
+      chmod 600 "$PAIRING_CODE_FILE"
+      cat "$PAIRING_CODE_FILE"
+      ;;
+    --reset)
+      # Force-regenerate. Used after lost code or to re-pair from scratch.
+      mkdir -p "$(dirname "$PAIRING_CODE_FILE")"
+      ( umask 077 && _generate_pairing_code > "$PAIRING_CODE_FILE" )
+      chmod 600 "$PAIRING_CODE_FILE"
+      cat "$PAIRING_CODE_FILE"
+      ;;
+    --show|"")
+      if [[ -f "$PAIRING_CODE_FILE" ]]; then
+        cat "$PAIRING_CODE_FILE"
+      else
+        echo "No pairing code present. Either pairing already completed, or run 'cta pair-code --reset'." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Usage: cta pair-code [--show | --init | --reset]" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# ─── Phase 2 mount management ───────────────────────────────────────────────
+# `cta mount/umount/list` write to ~/.claude-telegram-agent/mounts.json via
+# the mount-store TS lib (single source of truth for concurrency). Per-topic
+# tmux sessions are spawned/killed inline so users don't need to run
+# `cta start` again after a mount edit. The poller hot-reloads mounts.json
+# on mtime change, so message routing follows automatically.
+
+# Locate mount-store.ts. CTA_SERVICES_DIR override lets tests point at the
+# repo copy without installing.
+_mount_store_path() {
+  local d="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
+  echo "$d/mount-store/mount-store.ts"
+}
+
+_topic_wrapper_path() {
+  local d="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
+  echo "$d/topic-wrapper.sh"
+}
+
+cmd_mount() {
+  local thread_id="${1:-}" path="${2:-}" label="${3:-}"
+  if [[ -z "$thread_id" || -z "$path" ]]; then
+    echo "Usage: cta mount <thread_id|dm> <path> [label]" >&2
+    exit 1
+  fi
+  if [[ ! -d "$path" ]]; then
+    echo "cta mount: '$path' is not a directory" >&2
+    exit 1
+  fi
+  # Resolve to absolute path so the mount entry doesn't depend on $PWD.
+  local abs_path
+  abs_path=$(cd "$path" && pwd -P)
+
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta mount: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+
+  local mount_json
+  if [[ -n "$label" ]]; then
+    mount_json=$(bun run "$store" add "$thread_id" "$abs_path" "$label")
+  else
+    mount_json=$(bun run "$store" add "$thread_id" "$abs_path")
+  fi
+  local rc=$?
+  [[ "$rc" -ne 0 ]] && exit "$rc"
+
+  local tmux_session
+  tmux_session=$(echo "$mount_json" | jq -r '.tmux_session')
+
+  # If the poller is alive we want the topic immediately routable. Spawn
+  # the per-topic tmux now; topic-wrapper.sh handles UUID + claude launch.
+  #
+  # tmux new-session's second positional arg is passed to /bin/sh -c, so
+  # paths with spaces or shell metacharacters in $abs_path or $thread_id
+  # would split across args (or execute arbitrary commands). printf %q
+  # shell-escapes each before concatenation.
+  if tmux has-session -t poller 2>/dev/null; then
+    tmux kill-session -t "$tmux_session" 2>/dev/null || true
+    local wrapper
+    wrapper=$(_topic_wrapper_path)
+    local quoted_cmd
+    quoted_cmd=$(printf '%q ' "$wrapper" "$thread_id" "$abs_path" "$tmux_session")
+    tmux new-session -d -s "$tmux_session" "$quoted_cmd"
+    echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session, live)"
+  else
+    echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session — will start on next 'cta start')"
+  fi
+}
+
+cmd_umount() {
+  local thread_id="${1:-}"
+  if [[ -z "$thread_id" ]]; then
+    echo "Usage: cta umount <thread_id|dm>" >&2
+    exit 1
+  fi
+
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta umount: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+
+  local removed
+  removed=$(bun run "$store" remove "$thread_id")
+  local rc=$?
+  [[ "$rc" -ne 0 ]] && exit "$rc"
+
+  if [[ "$removed" == "null" ]]; then
+    echo "cta umount: thread $thread_id was not mounted"
+    return 0
+  fi
+
+  local tmux_session
+  tmux_session=$(echo "$removed" | jq -r '.tmux_session')
+  tmux kill-session -t "$tmux_session" 2>/dev/null && \
+    echo "Unmounted thread $thread_id (killed tmux $tmux_session)" || \
+    echo "Unmounted thread $thread_id (tmux $tmux_session was not running)"
+}
+
+cmd_list() {
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta list: mount-store not installed — rerun install.sh" >&2
+    exit 1
+  fi
+
+  if [[ "${1:-}" == "--json" ]]; then
+    bun run "$store" list
+    return
+  fi
+
+  local raw
+  raw=$(bun run "$store" list)
+  local count
+  count=$(echo "$raw" | jq '.mounts | length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "No mounts. Add one with: cta mount <thread_id> <path>"
+    return
+  fi
+
+  printf "%-10s %-15s %-50s %-12s %s\n" "THREAD" "LABEL" "PATH" "TMUX" "STATUS"
+  while IFS=$'\t' read -r thread_id label path tmux_session; do
+    local status="dead"
+    tmux has-session -t "$tmux_session" 2>/dev/null && status="alive"
+    printf "%-10s %-15s %-50s %-12s %s\n" \
+      "$thread_id" "${label:--}" "$path" "$tmux_session" "$status"
+  done < <(echo "$raw" | jq -r '.mounts[] | [.thread_id, .label // "", .path, .tmux_session] | @tsv')
+}
+
+# `cta bind` — called from inside a running claude session (via the
+# bind-telegram-topic skill or directly in a tmux pane). Captures the
+# current tmux session name + pane cwd and writes a mounts.json entry so
+# the poller routes <thread_id>'s messages into this very claude.
+#
+# Hard requirement: $TMUX must be set. We can't pipe stdin into a claude
+# running in a bare terminal — same locking constraint that makes
+# --session-id collide with active sessions.
+cmd_bind() {
+  local thread_id="${1:-}"
+  local label="${2:-}"
+  if [[ -z "$thread_id" ]]; then
+    echo "Usage: cta bind <thread_id|dm> [label]" >&2
+    echo "Run this from inside the tmux session you want to bind." >&2
+    exit 1
+  fi
+  if [[ -z "${TMUX:-}" ]]; then
+    echo "cta bind: not in a tmux session (\$TMUX is unset)." >&2
+    echo "Open this claude inside tmux and re-run, or use 'cta mount <thread_id> <path>'." >&2
+    exit 1
+  fi
+
+  local current_session pane_cwd
+  current_session=$(tmux display-message -p '#S' 2>/dev/null || true)
+  pane_cwd=$(tmux display-message -p '#{pane_current_path}' 2>/dev/null || true)
+  if [[ -z "$current_session" || -z "$pane_cwd" ]]; then
+    echo "cta bind: tmux display-message returned nothing (broken tmux env?)" >&2
+    exit 1
+  fi
+  if [[ ! -d "$pane_cwd" ]]; then
+    echo "cta bind: pane cwd '$pane_cwd' is not a directory" >&2
+    exit 1
+  fi
+
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta bind: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+
+  # bind PINs the *current* tmux session name (whatever the user named
+  # theirs) so the poller dispatches into the live claude instead of
+  # spawning a fresh topic-<id> wrapper. mount-store's `add` accepts an
+  # optional 4th arg that overrides the default tmux_session.
+  local mount_json
+  mount_json=$(bun run "$store" add "$thread_id" "$pane_cwd" "${label:-}" "$current_session")
+  local rc=$?
+  if [[ "$rc" -ne 0 ]]; then exit "$rc"; fi
+
+  echo "Bound thread $thread_id → tmux $current_session (cwd: $pane_cwd)"
+  echo "Future messages in thread $thread_id will be sent into this pane."
+  echo "Note: this pane already has a claude running. cta does NOT respawn it;"
+  echo "      messages will land via tmux send-keys into the existing prompt."
+}
+
 cmd_help() {
   cat <<EOF
 cta — claude-telegram-agent CLI
@@ -387,6 +822,14 @@ Usage:
   cta status [--json]             Show agent health (text by default, JSON for tooling)
   cta start                       Load LaunchAgent + spawn tmux sessions
   cta stop                        Kill tmux sessions + unload LaunchAgent
+  cta mount <thread> <path>       Mount a project dir at a Telegram thread (or "dm")
+  cta umount <thread>             Unmount; kill the topic's tmux session
+  cta list [--json]               List current mounts
+  cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
+  cta pair-code [--init|--reset]  Show / generate the one-time Telegram pairing code
+  cta pair <chat_id> [user_id]    Host-driven pairing (skip the Telegram round-trip)
+  cta pair --auto                 Show chats the bot has been seen in recently
+  cta unpair [--keep-mounts]      Release the paired chat so you can pair a different one
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta help                        This message
@@ -412,6 +855,13 @@ main() {
       ;;
     start) cmd_start ;;
     stop)  cmd_stop ;;
+    mount) cmd_mount "$@" ;;
+    umount) cmd_umount "$@" ;;
+    list)  cmd_list "$@" ;;
+    bind) cmd_bind "$@" ;;
+    pair-code) cmd_pair_code "$@" ;;
+    pair) cmd_pair "$@" ;;
+    unpair) cmd_unpair "$@" ;;
     config) cmd_config "$@" ;;
     help|-h|--help) cmd_help ;;
     *)

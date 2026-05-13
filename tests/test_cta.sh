@@ -80,13 +80,24 @@ echo "$JSON" | grep -q '"last_activity": null' && ok "json (down): last_activity
 
 # ─── tmux session name comes from .env (the dual-repo bug we fixed) ──────────
 
-# Simulate a user who renamed their tmux sessions in .env.
+# Simulate a user who renamed their tmux sessions in .env. This covers single-
+# topic v0 mode; the MULTI_TOPIC override below covers Phase-1.
+MULTI_TOPIC=0
 TMUX_SESSION_CLAUDE="my-bot"
 TMUX_SESSION_WATCHDOG="my-watchdog"
 _tmux_session_alive() { return 0; }
 JSON=$(cmd_status json)
 echo "$JSON" | grep -q '"name": "my-bot"'      && ok "json: respects custom claude session name"   || ng "json: respects custom claude session name"
 echo "$JSON" | grep -q '"name": "my-watchdog"' && ok "json: respects custom watchdog session name" || ng "json: respects custom watchdog session name"
+
+# MULTI_TOPIC=1: tmux.claude.name should become 'poller' regardless of
+# TMUX_SESSION_CLAUDE, because the v0 control session doesn't exist in
+# Phase-1 mode and Pager would otherwise report claude=✗ forever.
+MULTI_TOPIC=1
+JSON=$(cmd_status json)
+echo "$JSON" | grep -q '"name": "poller"'      && ok "json (MULTI_TOPIC): tmux.claude → poller"  || ng "json (MULTI_TOPIC): tmux.claude → poller"
+echo "$JSON" | grep -q '"name": "my-watchdog"' && ok "json (MULTI_TOPIC): watchdog name preserved" || ng "json (MULTI_TOPIC): watchdog name preserved"
+MULTI_TOPIC=0
 
 # ─── cmd_status (text) — runs without error ──────────────────────────────────
 
