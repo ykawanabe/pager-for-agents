@@ -60,6 +60,13 @@ fi
 TMUX_SESSION_CLAUDE="${TMUX_SESSION_CLAUDE:-claude}"
 TMUX_SESSION_WATCHDOG="${TMUX_SESSION_WATCHDOG:-watchdog}"
 
+# MULTI_TOPIC mode replaces the v0 `claude` tmux session with `poller` + N
+# `topic-<thread_id>` sessions. Status checks delegate to those instead so
+# Pager doesn't keep reporting "claude=✗" forever.
+_multi_topic_enabled() {
+  [[ "${MULTI_TOPIC:-0}" == "1" ]]
+}
+
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
 _la_loaded() {
@@ -67,14 +74,23 @@ _la_loaded() {
 }
 
 # Print "<pid> <rss_kb>" if claude is running, else empty line. Caller parses.
+# MULTI_TOPIC: any `claude --mcp-config` spawned by topic-wrapper.sh counts as
+# "claude alive" — there's no single canonical `claude --channels` process to
+# look for. Single-topic v0 keeps the old --channels grep.
 _claude_ps_line() {
+  local pat
+  if _multi_topic_enabled; then pat="claude --mcp-config"
+  else pat="claude --channels plugin:telegram"
+  fi
   ps -Ao pid=,rss=,command= 2>/dev/null \
-    | grep "claude --channels plugin:telegram" \
+    | grep "$pat" \
     | grep -v grep \
     | head -1 \
     | awk '{print $1, $2}'
 }
 
+# MULTI_TOPIC: per-topic mcp-telegram process lives at .../services/mcp-telegram/server.ts.
+# v0: the official plugin's bun server is also a server.ts; same grep matches both.
 _mcp_alive() {
   ps -Ao command= 2>/dev/null \
     | grep "bun" | grep "server.ts" | grep -v grep \
@@ -139,8 +155,15 @@ cmd_status() {
   local mcp_alive
   if _mcp_alive; then mcp_alive=true; else mcp_alive=false; fi
 
+  # In MULTI_TOPIC mode, `claude` (the v0 control session) doesn't exist —
+  # `poller` plays that role. Map the JSON's `tmux.claude.alive` field to the
+  # poller's status so existing consumers (Pager) keep working unchanged.
+  local control_session
+  if _multi_topic_enabled; then control_session="poller"
+  else control_session="$TMUX_SESSION_CLAUDE"
+  fi
   local tmux_claude tmux_watchdog
-  if _tmux_session_alive "$TMUX_SESSION_CLAUDE"; then tmux_claude=true; else tmux_claude=false; fi
+  if _tmux_session_alive "$control_session"; then tmux_claude=true; else tmux_claude=false; fi
   if _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then tmux_watchdog=true; else tmux_watchdog=false; fi
 
   local activity
@@ -164,7 +187,7 @@ cmd_status() {
   "claude": {"pid": $(_json_int_or_null "$pid"), "rss_mb": $(_json_int_or_null "$rss_mb")},
   "telegram_mcp": {"alive": $mcp_alive},
   "tmux": {
-    "claude": {"name": $(_json_str_or_null "$TMUX_SESSION_CLAUDE"), "alive": $tmux_claude},
+    "claude": {"name": $(_json_str_or_null "$control_session"), "alive": $tmux_claude},
     "watchdog": {"name": $(_json_str_or_null "$TMUX_SESSION_WATCHDOG"), "alive": $tmux_watchdog}
   },
   "caffeinate": {"alive": $caffeinate_alive, "pid": $(_json_int_or_null "$caffeinate_pid")},

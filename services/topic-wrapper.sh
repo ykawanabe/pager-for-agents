@@ -58,8 +58,21 @@ set -a
 source "$AGENT_ENV"
 set +a
 
+# Prefer paired.json's chat_id over .env's MAIN_CHAT_ID. The .env value is
+# stamped at install time and goes stale the moment the user re-pairs (e.g.
+# DM → group). MCP outbound then sends replies to the dead chat and the user
+# sees silence. paired.json is the live source of truth; .env is a fallback
+# for unpaired / pre-Phase-3 setups.
+PAIRED_FILE="$HOME/.claude-telegram-agent/paired.json"
+if [[ -f "$PAIRED_FILE" ]]; then
+  PAIRED_CHAT_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["chat_id"])' "$PAIRED_FILE" 2>/dev/null || true)
+  if [[ -n "$PAIRED_CHAT_ID" ]]; then
+    MAIN_CHAT_ID="$PAIRED_CHAT_ID"
+  fi
+fi
+
 if [[ -z "${MAIN_CHAT_ID:-}" ]]; then
-  echo "topic-wrapper: MAIN_CHAT_ID must be set in $AGENT_ENV" >&2
+  echo "topic-wrapper: MAIN_CHAT_ID must be set in $AGENT_ENV (or pair via /pair)" >&2
   exit 1
 fi
 

@@ -748,11 +748,20 @@ function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): 
 
 function routeMessage(msg: TgMessage): string | null {
   const expectedChat = effectiveChatId();
-  if (expectedChat == null) return null; // unpaired and no env override → drop
-  if (String(msg.chat.id) !== expectedChat) return null;
+  if (expectedChat == null) {
+    process.stderr.write(`poller: drop msg from chat=${msg.chat.id} user=${msg.from?.id} thread=${msg.message_thread_id ?? "-"} text=${JSON.stringify((msg.text ?? msg.caption ?? "").slice(0,40))} reason=unpaired-no-env\n`);
+    return null;
+  }
+  if (String(msg.chat.id) !== expectedChat) {
+    process.stderr.write(`poller: drop msg from chat=${msg.chat.id} user=${msg.from?.id} thread=${msg.message_thread_id ?? "-"} text=${JSON.stringify((msg.text ?? msg.caption ?? "").slice(0,40))} reason=wrong-chat (expected ${expectedChat})\n`);
+    return null;
+  }
   // Per-user enforcement: when paired, only the paired user's messages reach claude.
   const expectedUser = effectiveUserId();
-  if (expectedUser != null && msg.from?.id !== expectedUser) return null;
+  if (expectedUser != null && msg.from?.id !== expectedUser) {
+    process.stderr.write(`poller: drop msg from chat=${msg.chat.id} user=${msg.from?.id} thread=${msg.message_thread_id ?? "-"} text=${JSON.stringify((msg.text ?? msg.caption ?? "").slice(0,40))} reason=wrong-user (expected ${expectedUser})\n`);
+    return null;
+  }
   const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
   const specific = mountsCache.get(String(key));
   if (specific) return specific.tmux_session;
