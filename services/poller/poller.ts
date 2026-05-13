@@ -294,27 +294,30 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
         "To re-pair with this chat instead:",
         "  • In the existing paired chat, send `/unpair confirm`, OR",
         "  • Run `cta unpair` on the host.",
-        "Then kick + re-add me here and I'll send the pair prompt again.",
+        "Then kick + re-add me here and send `/pair <CODE>` (get it via `cta pair-code` on the host).",
       ].join("\n"),
     );
     return;
   }
-  const inviterName = mcm.from.first_name ?? `user ${mcm.from.id}`;
-  const safeName = inviterName.replace(/[\n\r]/g, " ").slice(0, 40);
-  await sendInlineKeyboard(
-    mcm.chat.id,
-    `👋 ${safeName} just added me here.\n\nShould I pair with this chat? Only ${safeName} can confirm; other members can't claim me.`,
-    [[
-      { text: "✓ Yes, pair me here", callback_data: `pair-confirm` },
-      { text: "✗ No, cancel", callback_data: `pair-cancel` },
-    ]],
+  // Deterministic pairing flow: ask the user to send `/pair <code>` rather
+  // than the inline-keyboard callback_query dance. The callback flow depended
+  // on bot membership state being settled (callback_query delivery requires
+  // the bot to see the user's tap), which created a chicken-and-egg with
+  // privacy/admin caches in forum groups — failing pairs left the bot
+  // unpairable without a kick+re-add cycle. /pair <code> is a `/command`,
+  // which Telegram delivers even to non-admin privacy-enabled bots.
+  await reply(
+    { chat_id: mcm.chat.id },
+    [
+      `👋 Hi! I'm @${"" /* botUserId not stored as username — keep generic */}claude-telegram-agent. To finish setup:`,
+      "",
+      "1. On your Mac, run: `cta pair-code`",
+      "2. Send the code back here as: `/pair YOUR-CODE`",
+      "",
+      "Only the person who runs the host commands can pair this bot. After pairing, anyone allowed by your `access.json` policy can talk to me — by default, just you.",
+    ].join("\n"),
   );
-  pendingPair = {
-    chat_id: mcm.chat.id,
-    inviter_user_id: mcm.from.id,
-    expires_at: Date.now() + PENDING_PAIR_TTL_MS,
-  };
-  process.stdout.write(`[${new Date().toISOString()}] auto-pair prompt sent: chat=${mcm.chat.id} inviter=${mcm.from.id}\n`);
+  process.stdout.write(`[${new Date().toISOString()}] pair intro sent: chat=${mcm.chat.id} inviter=${mcm.from.id}\n`);
 }
 
 export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {

@@ -433,6 +433,125 @@ _generate_pairing_code() {
 
 PAIRED_STATE_FILE="$HOME/.claude-telegram-agent/paired.json"
 
+# cta pair — host-driven pairing. Bypasses Telegram entirely. The user types
+# the chat_id (and optional user_id) they want to claim, and we write
+# paired.json directly. Useful when:
+#   - The inline-keyboard auto-pair flow doesn't fire (forum permission caches,
+#     bot kicked before tap, etc.)
+#   - The user wants deterministic setup over a magic flow
+#   - Scripted / Pager-driven setup needs to skip the Telegram round-trip
+# Discovery helper: `cta pair --auto` polls the Bot API for chats the bot
+# has been seen in recently and prints them so the user can pick a chat_id
+# without hunting through Telegram UI.
+cmd_pair() {
+  local sub="${1:-}"
+  if [[ "$sub" == "--auto" ]]; then
+    _pair_auto_discover
+    return $?
+  fi
+  if [[ "$sub" == "--help" || -z "$sub" ]]; then
+    cat <<EOF
+Usage:
+  cta pair <chat_id> [user_id]   Claim chat_id (negative for groups/supergroups).
+                                 user_id defaults to the chat owner for DMs, or
+                                 must be specified for groups (your Telegram user id).
+  cta pair --auto                Scan recent Bot API updates for chats the bot
+                                 has been added to and offer them to pick from.
+EOF
+    return 0
+  fi
+  local chat_id="$1"
+  local user_id="${2:-}"
+  if ! [[ "$chat_id" =~ ^-?[0-9]+$ ]]; then
+    echo "cta pair: chat_id must be an integer (got '$chat_id')" >&2
+    return 1
+  fi
+  if [[ -n "$user_id" ]] && ! [[ "$user_id" =~ ^[0-9]+$ ]]; then
+    echo "cta pair: user_id must be a positive integer (got '$user_id')" >&2
+    return 1
+  fi
+  # DM heuristic: positive chat_id = personal account, user_id == chat_id.
+  # Groups/supergroups have negative chat_id; user_id is the operator's
+  # personal Telegram user id (8-10 digits).
+  if [[ -z "$user_id" ]]; then
+    if [[ "$chat_id" =~ ^[0-9]+$ ]]; then
+      user_id="$chat_id"
+    else
+      echo "cta pair: user_id is required for groups/supergroups (negative chat_id)." >&2
+      echo "Hint: DM @userinfobot on Telegram to find your numeric user id." >&2
+      return 1
+    fi
+  fi
+
+  if [[ -f "$PAIRED_STATE_FILE" ]]; then
+    local cur_chat
+    cur_chat=$(jq -r '.chat_id' "$PAIRED_STATE_FILE" 2>/dev/null || echo "?")
+    echo "Already paired with chat=$cur_chat. Run 'cta unpair' first to claim a new chat." >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$PAIRED_STATE_FILE")"
+  chmod 700 "$(dirname "$PAIRED_STATE_FILE")" 2>/dev/null || true
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # umask 077 ensures the file lands at 0600 (it contains a chat_id that's
+  # routable but not secret; still, defense in depth costs nothing).
+  ( umask 077 && printf '{\n  "version": 1,\n  "chat_id": %s,\n  "user_id": %s,\n  "paired_at": "%s"\n}\n' \
+      "$chat_id" "$user_id" "$now" > "$PAIRED_STATE_FILE" )
+  echo "Paired: chat=$chat_id user=$user_id"
+
+  # Recreate the wildcard mount if CLAUDE_CWD is set and no wildcard exists.
+  # This mirrors the poller's ensureWildcardMount so host-driven pairs land
+  # the user in a working state with one command.
+  local cwd
+  cwd=$(grep '^CLAUDE_CWD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
+  if [[ -n "$cwd" && -d "$cwd" ]]; then
+    local store="$HOME/.local/share/claude-telegram-agent/services/mount-store/mount-store.ts"
+    if [[ -f "$store" ]]; then
+      local has_wildcard
+      has_wildcard=$(bun run "$store" list 2>/dev/null | jq -r '.mounts[] | select(.thread_id == "*") | .thread_id' 2>/dev/null)
+      if [[ -z "$has_wildcard" ]]; then
+        bun run "$store" add '*' "$cwd" default >/dev/null 2>&1 \
+          && echo "Wildcard mount auto-created: * → $cwd"
+      fi
+    fi
+  fi
+  echo "Tip: the poller picks up paired.json automatically (it watches mtime). No restart needed."
+}
+
+# Discover chats the bot has been added to by polling the Bot API for
+# recent updates. Prints "<chat_id>  <title>" lines so the user can pick.
+_pair_auto_discover() {
+  local token
+  token=$(grep '^TELEGRAM_BOT_TOKEN=' "$HOME/.claude/channels/telegram/.env" 2>/dev/null | cut -d= -f2- | tr -d '"')
+  if [[ -z "$token" ]]; then
+    echo "cta pair --auto: TELEGRAM_BOT_TOKEN not found in ~/.claude/channels/telegram/.env" >&2
+    return 1
+  fi
+  # offset=-50 grabs the most recent 50 updates without consuming them
+  # (Telegram only marks updates "read" when you ack a higher offset). The
+  # live poller stays untouched.
+  local resp
+  resp=$(curl -fsS "https://api.telegram.org/bot${token}/getUpdates?offset=-50&timeout=0" 2>/dev/null)
+  if [[ -z "$resp" ]] || ! echo "$resp" | jq -e '.ok' >/dev/null; then
+    echo "cta pair --auto: getUpdates failed (network, token, or no recent updates)" >&2
+    return 1
+  fi
+  echo "Recent chats the bot has seen (most-recent first):"
+  echo "$resp" | jq -r '
+    .result
+    | map(.my_chat_member // .message // .callback_query.message // empty)
+    | map({chat_id: .chat.id, title: (.chat.title // .chat.first_name // "<DM>"), type: .chat.type})
+    | unique_by(.chat_id)
+    | reverse
+    | .[]
+    | "  \(.chat_id)  [\(.type)]  \(.title)"
+  '
+  echo
+  echo "To pair, run: cta pair <chat_id> <your_user_id>"
+  echo "  (your_user_id is your numeric Telegram user id — DM @userinfobot to find it)"
+}
+
 cmd_unpair() {
   # Release the current paired chat so a new /pair (manual or auto via invite)
   # can claim a different one. Optional --keep-mounts leaves mounts.json
@@ -708,6 +827,8 @@ Usage:
   cta list [--json]               List current mounts
   cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
   cta pair-code [--init|--reset]  Show / generate the one-time Telegram pairing code
+  cta pair <chat_id> [user_id]    Host-driven pairing (skip the Telegram round-trip)
+  cta pair --auto                 Show chats the bot has been seen in recently
   cta unpair [--keep-mounts]      Release the paired chat so you can pair a different one
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
@@ -739,6 +860,7 @@ main() {
     list)  cmd_list "$@" ;;
     bind) cmd_bind "$@" ;;
     pair-code) cmd_pair_code "$@" ;;
+    pair) cmd_pair "$@" ;;
     unpair) cmd_unpair "$@" ;;
     config) cmd_config "$@" ;;
     help|-h|--help) cmd_help ;;

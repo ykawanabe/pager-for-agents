@@ -235,11 +235,16 @@ describe("post-pair state", () => {
   });
 });
 
-describe("auto-pair via bot invite (Phase 5)", () => {
+describe("bot-added intro (/pair <code> flow)", () => {
+  // The inline-keyboard auto-pair flow was removed (2026-05-13) because it
+  // depended on callback_query delivery, which depends on bot membership
+  // state being settled — a chicken/egg in forum groups with admin/privacy
+  // caching. The bot now sends a plain text intro pointing the user to
+  // `/pair <code>`, which is a Telegram `/command` and is delivered to even
+  // non-admin privacy-enabled bots reliably.
   const BOT_ID = 99999;
   const INVITER_ID = 7;
   const CHAT_ID = -1001;
-  const STRANGER_ID = 4242;
 
   function botAddedEvent(opts?: { chat_id?: number; inviter_id?: number; status?: string }) {
     return {
@@ -250,16 +255,20 @@ describe("auto-pair via bot invite (Phase 5)", () => {
     };
   }
 
-  test("my_chat_member (bot added) sends inline-keyboard prompt and stages pending pair", async () => {
+  test("my_chat_member (bot added) sends plain text intro — no inline keyboard, no pending pair", async () => {
     await poller.handleMyChatMember(botAddedEvent());
-    expect(sent.length).toBeGreaterThanOrEqual(1);
-    expect(sent[0].text).toContain("Alice");
-    expect(sent[0].reply_markup).toBeDefined();
-    // No paired state yet — the user still has to confirm.
+    expect(sent.length).toBe(1);
+    expect(sent[0].reply_markup).toBeUndefined();
+    expect(sent[0].text).toContain("/pair");
+    expect(sent[0].text).toContain("cta pair-code");
+    // No state mutation — the user has to send /pair <code> to actually pair.
     expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
   });
 
-  test("callback pair-confirm by the inviter pairs the chat", async () => {
+  test("stale callback pair-confirm declines (no pending pair set anymore)", async () => {
+    // Even if a user somehow taps a button from a historical message, the
+    // poller no longer stages pendingPair, so the callback returns the
+    // "expired" alert and refuses to pair.
     await poller.handleMyChatMember(botAddedEvent());
     await poller.handleCallbackQuery({
       id: "cb1",
@@ -267,45 +276,11 @@ describe("auto-pair via bot invite (Phase 5)", () => {
       message: { chat: { id: CHAT_ID }, message_id: 1 },
       data: "pair-confirm",
     });
-    expect(existsSync(PAIRED_STATE_FILE)).toBe(true);
-    const state = JSON.parse(readFileSync(PAIRED_STATE_FILE, "utf8")) as poller.PairedState;
-    expect(state.chat_id).toBe(CHAT_ID);
-    expect(state.user_id).toBe(INVITER_ID);
-    expect(callbackAcks.some((a) => a.text === "Paired!")).toBe(true);
+    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
+    expect(callbackAcks.some((a) => a.show_alert === true && a.text?.includes("expired"))).toBe(true);
   });
 
-  test("callback pair-confirm by a stranger is rejected with an alert", async () => {
-    await poller.handleMyChatMember(botAddedEvent());
-    await poller.handleCallbackQuery({
-      id: "cb1",
-      from: { id: STRANGER_ID },
-      message: { chat: { id: CHAT_ID }, message_id: 1 },
-      data: "pair-confirm",
-    });
-    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
-    expect(callbackAcks.some((a) => a.show_alert === true && a.text?.includes("invited me"))).toBe(true);
-  });
-
-  test("callback pair-cancel by the inviter clears pending state", async () => {
-    await poller.handleMyChatMember(botAddedEvent());
-    await poller.handleCallbackQuery({
-      id: "cb1",
-      from: { id: INVITER_ID },
-      message: { chat: { id: CHAT_ID }, message_id: 1 },
-      data: "pair-cancel",
-    });
-    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
-    // A subsequent confirm should be rejected as expired.
-    await poller.handleCallbackQuery({
-      id: "cb2",
-      from: { id: INVITER_ID },
-      message: { chat: { id: CHAT_ID }, message_id: 1 },
-      data: "pair-confirm",
-    });
-    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
-  });
-
-  test("bot added when already paired declines (no inline prompt)", async () => {
+  test("bot added when already paired declines (still plain text, no inline)", async () => {
     // Pre-stage paired state.
     writeFileSync(PAIRED_STATE_FILE, JSON.stringify({
       version: 1, chat_id: -7777, user_id: 1, paired_at: new Date().toISOString(),
