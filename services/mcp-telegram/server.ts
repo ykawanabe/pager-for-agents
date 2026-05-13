@@ -86,7 +86,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   const body: Record<string, unknown> = { chat_id: CHAT_ID, text: args.text };
-  if (THREAD_ID) body.message_thread_id = Number(THREAD_ID);
+  // "dm" is a sentinel matching the poller's DM smoke-test mode (Phase 1).
+  // Anything that isn't a non-empty numeric string is treated as DM (no
+  // message_thread_id in the outbound body).
+  if (THREAD_ID && THREAD_ID !== "dm" && !Number.isNaN(Number(THREAD_ID))) {
+    body.message_thread_id = Number(THREAD_ID);
+  }
   if (args.parse_mode) body.parse_mode = args.parse_mode;
 
   try {

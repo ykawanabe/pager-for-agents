@@ -142,20 +142,30 @@ interface TgUpdate {
 interface TgResp { ok: boolean; result?: TgUpdate[]; description?: string; }
 
 /**
- * Phase 1 routing: hardcoded one-topic mapping. Returns the tmux session
- * name to dispatch to, or null to drop the message. Phase 2 replaces this
- * with a mounts.json lookup keyed on message_thread_id.
+ * Phase 1 routing: hardcoded one-topic OR DM mapping. Returns the tmux
+ * session name to dispatch to, or null to drop the message. Phase 2 replaces
+ * this with a mounts.json lookup.
+ *
+ * Special value `HARDCODED_THREAD_ID="dm"` accepts DMs (messages with no
+ * message_thread_id). Pulled forward from Phase 3 so users without a forum
+ * group can smoke-test Phase 1 with their existing bot DM. Phase 3 generalizes
+ * this via a real DM mount entry in mounts.json.
  */
 function routeMessage(msg: TgMessage): string | null {
   // Lock to the one chat we listen to. allowFrom is checked by the official
   // plugin in v0; here we re-implement chat-level allowlist directly.
   if (String(msg.chat.id) !== String(MAIN_CHAT_ID)) return null;
 
-  // Phase 1: only one topic, hardcoded.
-  if (msg.message_thread_id != null && String(msg.message_thread_id) === String(HARDCODED_THREAD_ID)) {
+  const isDmMode = HARDCODED_THREAD_ID === "dm";
+  const hasThread = msg.message_thread_id != null;
+
+  if (isDmMode && !hasThread) {
+    // Phase 1 DM smoke-test path: any DM in the right chat → HARDCODED_TMUX.
     return HARDCODED_TMUX;
   }
-  // DMs and other topics dropped in Phase 1.
+  if (!isDmMode && hasThread && String(msg.message_thread_id) === String(HARDCODED_THREAD_ID)) {
+    return HARDCODED_TMUX;
+  }
   return null;
 }
 
