@@ -225,13 +225,43 @@ describe("post-pair state", () => {
     expect(sent.length).toBe(0); // but no reply leaked
   });
 
-  test("/pair after paired returns 'already paired' message", async () => {
-    pair();
+  test("/pair from paired user in same chat is a no-op acknowledgement", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
     const handled = await poller.tryHandleCommand(
-      msg({ text: "/pair ANY-CODE", chat_id: -1001, from_id: 99 }),
+      msg({ text: "/pair", chat_id: -1001, from_id: 99 }),
     );
     expect(handled).toBe(true);
-    expect(sent.some((m) => m.text.includes("Already paired"))).toBe(true);
+    expect(sent.some((m) => m.text.includes("Already paired here"))).toBe(true);
+    // paired state unchanged
+    const state = JSON.parse(readFileSync(PAIRED_STATE_FILE, "utf8")) as poller.PairedState;
+    expect(state.chat_id).toBe(-1001);
+  });
+
+  test("/pair from paired user in a NEW chat switches paired.json (no code needed)", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    sent.length = 0;
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/pair", chat_id: -2002, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    // paired.json now points at the new chat — the killer "1-step switch" UX.
+    const state = JSON.parse(readFileSync(PAIRED_STATE_FILE, "utf8")) as poller.PairedState;
+    expect(state.chat_id).toBe(-2002);
+    expect(state.user_id).toBe(99);
+    expect(sent.some((m) => m.text.includes("Switched"))).toBe(true);
+  });
+
+  test("/pair from a different user when paired is silently dropped (no state change)", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    sent.length = 0;
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/pair", chat_id: -3003, from_id: 8888 }),
+    );
+    expect(handled).toBe(true); // consumed so claude doesn't see it
+    expect(sent.length).toBe(0); // no leak about the bot's pair state
+    const state = JSON.parse(readFileSync(PAIRED_STATE_FILE, "utf8")) as poller.PairedState;
+    expect(state.chat_id).toBe(-1001); // unchanged
+    expect(state.user_id).toBe(99);
   });
 });
 

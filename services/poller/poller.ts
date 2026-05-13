@@ -306,18 +306,29 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
   // privacy/admin caches in forum groups — failing pairs left the bot
   // unpairable without a kick+re-add cycle. /pair <code> is a `/command`,
   // which Telegram delivers even to non-admin privacy-enabled bots.
-  await reply(
-    { chat_id: mcm.chat.id },
-    [
-      `👋 Hi! I'm @${"" /* botUserId not stored as username — keep generic */}claude-telegram-agent. To finish setup:`,
+  // Group-vs-DM: in groups, Telegram caches the bot's "privacy mode" at
+  // invite time. If privacy was on when the bot was added, only `/commands`
+  // come through — plain text gets dropped server-side. Admin status
+  // overrides this cache. So for groups, tell the user explicitly.
+  const isGroup = mcm.chat.id < 0; // negative chat_id = group / supergroup / channel
+  const introLines = [
+    "👋 Hi! To finish setup:",
+    "",
+    "1. On your Mac, run: `cta pair-code`",
+    "2. Send the code back here as: `/pair YOUR-CODE`",
+  ];
+  if (isGroup) {
+    introLines.push(
       "",
-      "1. On your Mac, run: `cta pair-code`",
-      "2. Send the code back here as: `/pair YOUR-CODE`",
-      "",
-      "Only the person who runs the host commands can pair this bot. After pairing, anyone allowed by your `access.json` policy can talk to me — by default, just you.",
-    ].join("\n"),
+      "⚠ For me to see plain text in this group, please promote me to admin (any minimal permission works). Without admin, I only see /commands.",
+    );
+  }
+  introLines.push(
+    "",
+    "Already paired with another chat? Just send `/pair` here (no code needed) and I'll switch.",
   );
-  process.stdout.write(`[${new Date().toISOString()}] pair intro sent: chat=${mcm.chat.id} inviter=${mcm.from.id}\n`);
+  await reply({ chat_id: mcm.chat.id }, introLines.join("\n"));
+  process.stdout.write(`[${new Date().toISOString()}] pair intro sent: chat=${mcm.chat.id} inviter=${mcm.from.id}${isGroup ? " (group)" : ""}\n`);
 }
 
 export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
@@ -403,13 +414,42 @@ async function ensureWildcardMount(): Promise<void> {
 // honored; everything else falls through to normal claude dispatch.
 
 async function handlePair(msg: TgMessage, args: string): Promise<void> {
+  if (!msg.from) return; // channel post; can't pair
+
+  // Already-paired path: same operator (user_id) can re-pair anywhere with
+  // no code — they've already proven ownership. /pair in a new chat just
+  // switches the bot to that chat. /pair in the same chat is a no-op.
   if (pairedCache) {
+    if (msg.from.id !== pairedCache.user_id) {
+      // Different user trying to claim while paired. Stay silent.
+      return;
+    }
+    if (msg.chat.id === pairedCache.chat_id) {
+      await reply(
+        { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+        "✓ Already paired here. Send any message to talk to claude.",
+      );
+      return;
+    }
+    // Switch to this chat. Old topic-* sessions still have the previous
+    // chat_id pinned in their mcp-telegram env, so kill them — they'll
+    // respawn on next dispatch via auto-respawn, picking up the new
+    // paired.json's chat_id.
+    const previousChatId = pairedCache.chat_id;
+    const newState: PairedState = { ...pairedCache, chat_id: msg.chat.id, paired_at: new Date().toISOString() };
+    writePairedAtomic(newState);
+    pairedCache = newState;
+    pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs;
+    killAllTopicSessions();
+    await ensureWildcardMount();
     await reply(
       { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
-      `Already paired with chat ${pairedCache.chat_id}. To re-pair, run \`cta pair-code --reset\` on the host and rerun \`/pair <new-code>\`.`,
+      `✓ Switched to this chat (was chat ${previousChatId}). Send any message to talk to claude.`,
     );
     return;
   }
+
+  // First-time pairing: requires a matching code from `cta pair-code`.
   let storedCode = "";
   try { storedCode = readFileSync(PAIRING_CODE_FILE, "utf8").trim(); } catch { /* fall through */ }
   if (!storedCode) {
@@ -419,19 +459,9 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   }
   const supplied = args.trim().toUpperCase();
   if (supplied !== storedCode.toUpperCase()) {
-    // Wrong code. Reply with a generic error — don't leak whether bot is
-    // expecting a code at all. (If you can see the bot, you can see this reply,
-    // but at least we don't confirm "the code is right format, wrong value".)
     await reply(
       { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
-      "Pairing code did not match. If you've lost the code, run `cta pair-code --reset` on the host.",
-    );
-    return;
-  }
-  if (!msg.from) {
-    await reply(
-      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
-      "Pairing requires a from.user (channel posts can't pair).",
+      "Pairing code did not match. Lost it? Run `cta pair-code --reset` on the host.",
     );
     return;
   }
@@ -449,14 +479,23 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   await ensureWildcardMount();
   await reply(
     { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
-    [
-      `✓ Paired. This chat is now claimed; only your user_id (${msg.from.id}) can send commands.`,
-      ``,
-      `Next: send \`/mount <path-on-mac>\` inside any forum topic to bind it to a project.`,
-      `For DMs with the bot: send \`/dm <path-on-mac>\` here.`,
-      `Help: \`/help\``,
-    ].join("\n"),
+    "✓ Paired. Send any message to talk to claude. To switch chats later, just send /pair in the new chat.",
   );
+}
+
+/** Kill every tmux session named `topic-*`. Used when the paired chat
+ * changes so stale mcp-telegram env (chat_id pinned at spawn) gets dropped
+ * and the next message re-spawns with the current paired chat_id. */
+function killAllTopicSessions(): void {
+  const ls = spawnSync("tmux", ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8" });
+  if (ls.status !== 0) return; // no tmux server, nothing to kill
+  const names = ls.stdout.split("\n").filter((n) => n.startsWith("topic-"));
+  for (const name of names) {
+    spawnSync("tmux", ["kill-session", "-t", name], { encoding: "utf8" });
+  }
+  if (names.length > 0) {
+    process.stdout.write(`[${new Date().toISOString()}] killed ${names.length} topic-* session(s) on pair switch\n`);
+  }
 }
 
 async function handleMount(msg: TgMessage, args: string): Promise<void> {
