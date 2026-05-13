@@ -41,18 +41,18 @@ finishes, the last line printed is your **pairing code**:
 
 ## Pair the bot from Telegram
 
-Two steps, all in Telegram — no chat-ID lookup, no `.env` editing, no code
-copy-paste.
+Three steps total. The middle one is one-time-only.
 
-1. **Add your bot to a chat.** Three options:
-   - **DM with the bot** — open Telegram, search for your bot's username, hit Start
-   - **Group** — add the bot, make it an admin (privacy mode auto-disables there)
-   - **Forum group** — turn on Topics in the group settings, add the bot as admin,
-     grant "Manage Topics"
-2. **Tap "✓ Yes, pair me here"** when the bot asks. The bot detects that you
+1. **One-time setup in @BotFather.** Open [@BotFather](https://t.me/BotFather),
+   send `/setprivacy`, pick your bot, choose **Disable**. This lets the bot
+   read messages you send in groups. Without it, the bot is deaf to anything
+   except `@yourbot`-prefixed commands or replies to its own messages. DMs
+   work either way; this is just for group use.
+2. **Add the bot to a chat.** DM, group, or forum group (Topics enabled if
+   you want per-topic routing).
+3. **Tap "✓ Yes, pair me here"** when the bot asks. The bot detects you
    added it and immediately replies with a Yes/No inline button. Only YOU
-   (the user who invited the bot) can confirm — other group members can't
-   claim it.
+   (the user who invited the bot) can confirm.
 
 Done. Any message you send in a topic auto-routes to a claude session in
 the default project dir you set at install time. To bind a specific topic to

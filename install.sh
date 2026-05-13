@@ -277,13 +277,14 @@ if [[ -n "$PAIRING_CODE" ]]; then
 
 To connect your bot:
 
-  1. Open Telegram, find your bot, and add it to a chat.
-     • For groups: make the bot an ADMIN (read-only permission is enough).
-       Privacy mode then auto-disables for that chat.
-     • For forum groups: also grant "Manage Topics" so /mount works.
-  2. The bot will immediately reply asking "Should I pair with this chat?"
+  1. (One-time) Open @BotFather in Telegram, send /setprivacy, pick your bot,
+     choose "Disable". This lets the bot read all messages in groups you add
+     it to (without it, your messages are invisible to the bot in groups).
+     DMs work either way.
+  2. Add your bot to a chat (DM, group, or forum group).
+  3. The bot will immediately reply "Should I pair with this chat?"
      Tap "✓ Yes, pair me here". Only YOU (the inviter) can confirm.
-  3. Done. Any message you send in a topic auto-routes to a claude session.
+  4. Done. Any message you send in a topic auto-routes to a claude session.
 
 If the auto-prompt doesn't appear (rare, e.g. privacy mode quirks), fall
 back to the manual pairing code:
