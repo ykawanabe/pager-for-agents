@@ -30,7 +30,7 @@ import { spawnSync } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
+import { addMount, readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
@@ -343,6 +343,7 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
     pairedCache = state;
     try { pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs; } catch { /* ignore */ }
     pendingPair = null;
+    await ensureWildcardMount();
     await answerCallback(cb.id, "Paired!");
     if (cb.message) {
       await reply(
@@ -369,6 +370,27 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
 
 /** Test hook so unit tests can stage the bot's user id without preflight. */
 export function _setBotUserIdForTest(id: number | null): void { botUserId = id; }
+
+/**
+ * Ensure a wildcard mount (`thread_id = "*"`) exists pointing at CLAUDE_CWD.
+ * Called after auto-pair confirm and /pair success — without this, a
+ * fresh-paired chat has no mounts.json entry, so the very first message
+ * arrives, finds nothing in routeMessage, and silently drops. install.sh
+ * creates the wildcard on first install but `cta unpair` clears mounts.json
+ * (without --keep-mounts), so the next re-pair would start empty.
+ */
+async function ensureWildcardMount(): Promise<void> {
+  const cwd = process.env.CLAUDE_CWD;
+  if (!cwd) return; // nothing to default to; user must `cta mount` manually
+  const current = readMounts();
+  if (current.mounts.some((m) => m.thread_id === "*")) return;
+  try {
+    await addMount({ thread_id: "*", path: cwd, label: "default" });
+    process.stdout.write(`[${new Date().toISOString()}] wildcard mount auto-created: * → ${cwd}\n`);
+  } catch (e) {
+    process.stderr.write(`poller: wildcard mount auto-create failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
 
 // ─── in-chat commands (Phase 3) ──────────────────────────────────────────────
 // The bot listens for /pair, /mount, /unmount, /list, /help in any message.
@@ -421,6 +443,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   try { unlinkSync(PAIRING_CODE_FILE); } catch { /* already gone */ }
   pairedCache = newState;
   pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs;
+  await ensureWildcardMount();
   await reply(
     { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
     [
