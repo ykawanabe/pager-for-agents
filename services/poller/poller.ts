@@ -772,6 +772,32 @@ function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): 
   return mount.tmux_session;
 }
 
+/**
+ * Re-spawn a tmux topic session for a mount whose previous session has died
+ * (claude crashed, operator killed it, OS restarted, etc.). Distinct from
+ * autoSpawnFromWildcard because no new mount is created — we already have a
+ * persisted mount; we just need the underlying tmux session resurrected.
+ *
+ * Returns true on success.
+ */
+function respawnTopicSession(mount: Mount): boolean {
+  const servicesDir = process.env.MOUNT_STORE_PATH
+    ? join(process.env.MOUNT_STORE_PATH, "..", "..")
+    : join(homedir(), ".local/share/claude-telegram-agent/services");
+  const wrapperPath = join(servicesDir, "topic-wrapper.sh");
+  const cmd = [wrapperPath, String(mount.thread_id), mount.path, mount.tmux_session]
+    .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
+    .join(" ");
+  spawnSync("tmux", ["kill-session", "-t", mount.tmux_session], { encoding: "utf8" });
+  const r = spawnSync("tmux", ["new-session", "-d", "-s", mount.tmux_session, cmd], { encoding: "utf8" });
+  if (r.status !== 0) {
+    process.stderr.write(`poller: respawn tmux failed for ${mount.thread_id}: ${r.stderr}\n`);
+    return false;
+  }
+  process.stdout.write(`[${new Date().toISOString()}] respawned tmux session: ${mount.tmux_session} (thread ${mount.thread_id})\n`);
+  return true;
+}
+
 function routeMessage(msg: TgMessage): string | null {
   const expectedChat = effectiveChatId();
   if (expectedChat == null) {
@@ -823,7 +849,18 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
     return;
   }
 
-  const r = tmuxDispatch(target, text);
+  let r = tmuxDispatch(target, text);
+  if (!r.ok && /can't find pane|session not found|no server running/i.test(r.stderr)) {
+    // Stale mount: the tmux session named in mounts.json has died (claude
+    // crashed, operator killed it, host rebooted between mount-create and
+    // first message). Find the mount and respawn from its persisted path.
+    // One retry — if respawn fails we drop the message and surface the error.
+    const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+    const mount = mountsCache.get(String(key));
+    if (mount && respawnTopicSession(mount)) {
+      r = tmuxDispatch(target, text);
+    }
+  }
   if (!r.ok) {
     process.stderr.write(`poller: update ${u.update_id}: dispatch to ${target} failed: ${r.stderr}\n`);
   } else {
