@@ -10,7 +10,7 @@ jobs:
   shellcheck:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install shellcheck
         run: brew install shellcheck
       - name: Lint shell scripts
@@ -28,7 +28,7 @@ jobs:
   bash-syntax:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: bash -n on every shell script
         run: |
           for f in install.sh uninstall.sh cli/cta agent/*.sh scripts/*.sh tests/*.sh; do
@@ -39,7 +39,7 @@ jobs:
   tests:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Setup bun
         uses: oven-sh/setup-bun@v2
       - name: Run shell tests
