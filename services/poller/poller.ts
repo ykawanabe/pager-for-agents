@@ -288,7 +288,14 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
   if (pairedCache) {
     await reply(
       { chat_id: mcm.chat.id },
-      "I'm already paired with another chat. To re-pair, the operator must remove ~/.claude-telegram-agent/paired.json on the host.",
+      [
+        "I'm already paired with another chat — I can't claim two at once.",
+        "",
+        "To re-pair with this chat instead:",
+        "  • In the existing paired chat, send `/unpair confirm`, OR",
+        "  • Run `cta unpair` on the host.",
+        "Then kick + re-add me here and I'll send the pair prompt again.",
+      ].join("\n"),
     );
     return;
   }
@@ -545,6 +552,34 @@ async function handleStart(msg: TgMessage): Promise<void> {
   );
 }
 
+async function handleUnpair(msg: TgMessage, args: string): Promise<void> {
+  // Two-step confirmation. `/unpair confirm` actually releases; bare /unpair
+  // just explains. Prevents accidental release if someone fat-fingers the
+  // command in a busy chat.
+  if (args.trim().toLowerCase() !== "confirm") {
+    await reply(
+      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      [
+        "Unpair releases this chat so a different chat can claim the bot.",
+        "Mounts are wiped. To proceed, send: `/unpair confirm`",
+        "",
+        "Or run `cta unpair` on the host (with --keep-mounts to preserve mounts).",
+      ].join("\n"),
+    );
+    return;
+  }
+  // Release.
+  try { unlinkSync(PAIRED_STATE_FILE); } catch { /* already gone */ }
+  try { unlinkSync(MOUNTS_JSON); } catch { /* already gone */ }
+  pairedCache = null;
+  pairedMtimeMs = 0;
+  refreshMountsIfChanged();
+  await reply(
+    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    "✓ Unpaired. Re-add me to a chat for the auto-pair prompt, or send `/pair <code>` (run `cta pair-code` on the host).",
+  );
+}
+
 async function handleHelp(msg: TgMessage): Promise<void> {
   await reply(
     { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
@@ -554,6 +589,7 @@ async function handleHelp(msg: TgMessage): Promise<void> {
       "  /dm <path>      — bind your DM with the bot to a project dir",
       "  /unmount        — remove the mount for THIS topic (or DM)",
       "  /list           — show current mounts",
+      "  /unpair confirm — release this chat so another can claim me",
       "  /help           — this message",
       "",
       "Any non-command message is forwarded to the claude session for that mount.",
@@ -597,6 +633,7 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
   switch (command) {
     case "/start": await handleStart(msg); return true;
     case "/pair":  await handlePair(msg, args); return true;
+    case "/unpair": await handleUnpair(msg, args); return true;
     case "/mount": await handleMount(msg, args); return true;
     case "/dm":    await handleDm(msg, args); return true;
     case "/unmount": await handleUnmount(msg); return true;
@@ -855,6 +892,7 @@ if (import.meta.main) {
 export {
   tryHandleCommand,
   handlePair,
+  handleUnpair,
   handleMount,
   handleDm,
   handleUnmount,

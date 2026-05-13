@@ -408,6 +408,43 @@ _generate_pairing_code() {
   printf '%s-%s\n' "${code:0:4}" "${code:4:8}"
 }
 
+PAIRED_STATE_FILE="$HOME/.claude-telegram-agent/paired.json"
+
+cmd_unpair() {
+  # Release the current paired chat so a new /pair (manual or auto via invite)
+  # can claim a different one. Optional --keep-mounts leaves mounts.json
+  # intact — useful if you're re-pairing to the same chat after testing
+  # auto-pair (the mounts are still valid; only the chat_id/user_id changes).
+  local keep_mounts=0
+  if [[ "${1:-}" == "--keep-mounts" ]]; then keep_mounts=1; fi
+
+  if [[ ! -f "$PAIRED_STATE_FILE" ]]; then
+    echo "Not currently paired (paired.json absent)."
+    return 0
+  fi
+
+  local chat_id user_id
+  chat_id=$(jq -r '.chat_id' "$PAIRED_STATE_FILE" 2>/dev/null || echo "?")
+  user_id=$(jq -r '.user_id' "$PAIRED_STATE_FILE" 2>/dev/null || echo "?")
+  rm -f "$PAIRED_STATE_FILE"
+  echo "Unpaired (was: chat=$chat_id user=$user_id)."
+
+  if [[ "$keep_mounts" -eq 0 ]]; then
+    # Wipe mounts.json so the new pair starts clean. Wildcard from install
+    # is regenerated next time install.sh runs; for now, just remove all
+    # entries. User can re-mount via Telegram /mount or terminal cta mount.
+    local store="$HOME/.local/share/claude-telegram-agent/services/mount-store/mount-store.ts"
+    if [[ -f "$store" ]]; then
+      # Build a fresh empty mounts.json by removing the file (mount-store
+      # creates it on first add).
+      rm -f "$HOME/.claude-telegram-agent/mounts.json"
+      echo "Cleared mounts.json (use --keep-mounts to preserve next time)."
+    fi
+  fi
+
+  echo "Next: re-add the bot in Telegram (auto-pair prompt fires), OR send /pair <code> using \`cta pair-code\`."
+}
+
 cmd_pair_code() {
   local mode="${1:---show}"
   case "$mode" in
@@ -648,6 +685,7 @@ Usage:
   cta list [--json]               List current mounts
   cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
   cta pair-code [--init|--reset]  Show / generate the one-time Telegram pairing code
+  cta unpair [--keep-mounts]      Release the paired chat so you can pair a different one
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta help                        This message
@@ -678,6 +716,7 @@ main() {
     list)  cmd_list "$@" ;;
     bind) cmd_bind "$@" ;;
     pair-code) cmd_pair_code "$@" ;;
+    unpair) cmd_unpair "$@" ;;
     config) cmd_config "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
