@@ -50,6 +50,11 @@ const PAIRED_STATE_FILE = join(STATE_DIR, "paired.json");
 // Pager writes the ack-reaction toggle here as `ackReaction: "👀"` (or absent
 // for "off"). Single source of truth — Pager-driven config the poller reads.
 const ACCESS_JSON = process.env.ACCESS_JSON ?? join(homedir(), ".claude/channels/telegram/access.json");
+// Topic-name cache: poller writes, Pager reads. Updated when we see a
+// forum_topic_created / forum_topic_edited service message fly past. Key is
+// "<chat_id>/<message_thread_id>" so multi-chat installs don't collide on
+// numeric thread ids.
+const TOPICS_JSON = join(STATE_DIR, "topics.json");
 
 function getApiBase(): string {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -233,6 +238,60 @@ async function reactToMessage(chat_id: number, message_id: number): Promise<void
     // surface — just skip silently; the operator picks emoji via Pager UI.
   } catch (e) {
     process.stderr.write(`poller: setMessageReaction failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+// ─── topic name cache ────────────────────────────────────────────────────────
+// Bot API has no getForumTopic / getForumTopicByID, so the only way to learn
+// a forum topic's user-set name is to observe forum_topic_created or
+// forum_topic_edited service messages as they fly past. We persist what we
+// see to topics.json so the Pager UI can display "topic 42 (Plans)" instead
+// of bare "topic 42".
+//
+// Limitation surfaced in Pager UI: topics created BEFORE the bot joined the
+// group are invisible — until someone renames them (forum_topic_edited fires).
+
+interface TopicsFile {
+  version: 1;
+  topics: Record<string, { name: string; captured_at: string }>;
+}
+
+function readTopics(): TopicsFile {
+  try {
+    const raw = readFileSync(TOPICS_JSON, "utf8");
+    const parsed = JSON.parse(raw) as TopicsFile;
+    if (parsed.version === 1 && typeof parsed.topics === "object") return parsed;
+  } catch { /* missing or unparseable — start empty */ }
+  return { version: 1, topics: {} };
+}
+
+function writeTopics(data: TopicsFile): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${TOPICS_JSON}.tmp.${process.pid}`;
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(data, null, 2) + "\n");
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  renameSync(tmp, TOPICS_JSON);
+}
+
+/** Record a topic name observed from a forum_topic_{created,edited} service
+ * message. Keyed by `<chat_id>/<thread_id>` so the same numeric thread id in
+ * different chats doesn't collide. No-ops if name is empty. */
+function recordTopicName(chat_id: number, thread_id: number, name: string): void {
+  const key = `${chat_id}/${thread_id}`;
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  const data = readTopics();
+  const existing = data.topics[key];
+  if (existing?.name === trimmed) return; // no change; skip the disk write
+  data.topics[key] = { name: trimmed, captured_at: new Date().toISOString() };
+  try {
+    writeTopics(data);
+    process.stdout.write(`[${new Date().toISOString()}] topic name captured: ${key} → ${trimmed}\n`);
+  } catch (e) {
+    process.stderr.write(`poller: topics.json write failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
 }
 
@@ -778,6 +837,8 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
 
 interface TgUser { id: number; }
 interface TgChat { id: number; }
+interface TgForumTopicCreated { name: string; icon_color?: number; icon_custom_emoji_id?: string; }
+interface TgForumTopicEdited { name?: string; icon_custom_emoji_id?: string; }
 interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -785,6 +846,13 @@ interface TgMessage {
   message_thread_id?: number;
   text?: string;
   caption?: string;
+  // Service messages carrying forum topic lifecycle events. Telegram emits
+  // these inside the topic itself (message_thread_id is the new topic id) when
+  // a topic is created or renamed. There's no Bot API getForumTopic, so this
+  // is the *only* way to learn topic names — meaning we can only know about
+  // topics created / renamed *after* the bot joined the group.
+  forum_topic_created?: TgForumTopicCreated;
+  forum_topic_edited?: TgForumTopicEdited;
 }
 interface TgUpdate {
   update_id: number;
@@ -939,6 +1007,17 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
 
   const msg = u.message ?? u.edited_message;
   if (!msg) return;
+
+  // Topic-name harvest: forum service messages can pop up at any time and
+  // we want them recorded regardless of whether the chat is paired or the
+  // message is dropped downstream. The Pager UI relies on this opportunistic
+  // capture for the "topic 42 (Plans)" display.
+  if (msg.message_thread_id != null) {
+    const created = msg.forum_topic_created?.name;
+    const edited = msg.forum_topic_edited?.name;
+    const name = created ?? edited;
+    if (name) recordTopicName(msg.chat.id, msg.message_thread_id, name);
+  }
 
   // Commands run first. Pre-pair /pair messages bypass MAIN_CHAT_ID gating
   // (that's the whole point — we don't know the chat yet). Post-pair commands
