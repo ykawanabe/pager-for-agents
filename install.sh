@@ -123,6 +123,45 @@ if [[ -d "$REPO_DIR/services" ]]; then
   fi
 fi
 
+# ---- 3d. Default catch-all mount + cross-session memory (Phase 4) ----------
+# Set up the "any unmounted Telegram topic auto-spawns a claude here" template
+# so new users don't have to /mount every topic individually. Reads CLAUDE_CWD
+# from the .env we just wrote (or the user's existing one). Idempotent — if a
+# wildcard mount already exists, leave it alone (user may have repointed it).
+DEFAULT_MOUNT_PATH=$(grep '^CLAUDE_CWD=' "$CONFIG_DIR/.env" 2>/dev/null \
+  | head -1 | cut -d= -f2- | sed 's/^"//;s/"$//' | envsubst)
+if [[ -n "$DEFAULT_MOUNT_PATH" && -f "$SERVICES_DIR/mount-store/mount-store.ts" ]]; then
+  mkdir -p "$DEFAULT_MOUNT_PATH"  # create the dir if missing — otherwise mount-store rejects
+  existing_wildcard=$(bun run "$SERVICES_DIR/mount-store/mount-store.ts" get '*' 2>/dev/null || echo "null")
+  if [[ "$existing_wildcard" == "null" || -z "$existing_wildcard" ]]; then
+    if bun run "$SERVICES_DIR/mount-store/mount-store.ts" add '*' "$DEFAULT_MOUNT_PATH" default >/dev/null 2>&1; then
+      say "Wildcard mount → $DEFAULT_MOUNT_PATH (any unmounted topic auto-routes here)"
+    fi
+  fi
+fi
+
+# Cross-session shared memory file. claude reads/appends notes here so context
+# survives across topics + project switches. topic-wrapper.sh's system prompt
+# tells claude this file exists; nothing on the host writes it automatically.
+SHARED_CTX="$CONFIG_DIR/shared-context.md"
+if [[ ! -f "$SHARED_CTX" ]]; then
+  (umask 077 && cat > "$SHARED_CTX" <<'EOF'
+# Cross-session memory
+
+This file is shared across all Telegram topics and claude sessions on this
+host. The Telegram bot tells every claude session to read from and append
+to this file so durable context (user preferences, ongoing concerns,
+decisions) survives across topic switches.
+
+Add entries below. Keep them short. Avoid duplication.
+
+---
+
+EOF
+  )
+  say "Initialized $SHARED_CTX"
+fi
+
 # ---- 3c. Install bind-telegram-topic skill (Phase 2) -----------------------
 # Ships a Claude Code slash command that wraps `cta bind`. Installed into the
 # user's global skills dir so it's available from any project. Don't clobber

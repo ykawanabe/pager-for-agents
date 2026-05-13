@@ -94,6 +94,37 @@ wait
 WIN_COUNT=$(bun run "$STORE" list | jq '.mounts | length')
 [[ "$WIN_COUNT" == "1" ]] && ok "5 parallel dup adds: exactly 1 winner" || ng "5 parallel dup adds: got $WIN_COUNT winners"
 
+# ─── wildcard "*" thread_id (catch-all template) ────────────────────────────
+
+rm -rf "$STATE" && mkdir -p "$STATE"
+
+WILD=$(bun run "$STORE" add '*' /tmp default)
+[[ "$(echo "$WILD" | jq -r '.thread_id')" == "*" ]] && ok "add *: thread_id=* (string sentinel)" || ng "add *: thread_id=* (string sentinel)"
+
+# Wildcard + specific mounts coexist
+SPECIFIC=$(bun run "$STORE" add 42 /tmp specific)
+[[ "$(echo "$SPECIFIC" | jq -r '.thread_id')" == "42" ]] && ok "add 42 alongside *: both persist" || ng "add 42 alongside *: both persist"
+
+COUNT=$(bun run "$STORE" list | jq '.mounts | length')
+[[ "$COUNT" == "2" ]] && ok "list shows both * and 42" || ng "list shows both * and 42 (got $COUNT)"
+
+# get * works
+[[ "$(bun run "$STORE" get '*' | jq -r '.thread_id')" == "*" ]] && ok "get *: round-trip" || ng "get *: round-trip"
+
+# Dup * rejection
+if bun run "$STORE" add '*' /tmp dup 2>/dev/null; then
+  ng "add * twice: rejects duplicate"
+else
+  ok "add * twice: rejects duplicate"
+fi
+
+# Other invalid sentinels rejected
+if bun run "$STORE" add 'all' /tmp 2>/dev/null; then
+  ng "add with non-sentinel string ('all') rejects"
+else
+  ok "add with non-sentinel string ('all') rejects"
+fi
+
 # ─── tmux_session override (used by cta bind) ───────────────────────────────
 
 rm -rf "$STATE" && mkdir -p "$STATE"

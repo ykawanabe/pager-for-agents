@@ -125,7 +125,9 @@ PY
 
 # ─── claude argv ─────────────────────────────────────────────────────────────
 
-DEFAULT_BOT_APPEND_SYSTEM_PROMPT='You are responding through a Telegram bot. Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.'
+DEFAULT_BOT_APPEND_SYSTEM_PROMPT='You are responding through a Telegram bot. Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.
+
+You also have access to ~/.claude-telegram-agent/shared-context.md — a cross-session memory file shared with every other Telegram-bot claude session on this host. Read it when the user references prior context, or near the start of substantive conversations. Append durable notes there (user preferences, ongoing concerns, decisions, recurring patterns) so future sessions across other topics/projects benefit. Keep entries short and avoid duplication. Do not log every interaction — only durable signal.'
 
 resolve_append_prompt() {
   local env_val="$1" default="$2"

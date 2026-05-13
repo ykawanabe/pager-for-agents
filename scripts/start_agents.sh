@@ -186,7 +186,7 @@ main_multi_topic() {
     pipe_to_log "$tmux_session"
     n=$((n + 1))
   done < <(bun run "$mount_store_path" list \
-            | jq -r '.mounts[] | [.thread_id, .path, .tmux_session] | @tsv')
+            | jq -r '.mounts[] | select(.thread_id != "*") | [.thread_id, .path, .tmux_session] | @tsv')
 
   sleep 3
 

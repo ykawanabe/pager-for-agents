@@ -504,6 +504,54 @@ function refreshMountsIfChanged(): void {
  * Chat-level allowlist (MAIN_CHAT_ID) is enforced first — replaces the
  * official plugin's allowFrom semantics in v0.
  */
+/**
+ * Auto-spawn a topic tmux session for a thread_id that hit the wildcard
+ * template. Persists a real mount via mount-store, then spawns the per-
+ * topic claude wrapper. Subsequent messages route directly via the specific
+ * mount (wildcard is only consulted for unmounted threads).
+ *
+ * Returns the new tmux_session name on success, null on failure.
+ */
+function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): string | null {
+  const servicesDir = process.env.MOUNT_STORE_PATH
+    ? join(process.env.MOUNT_STORE_PATH, "..", "..")
+    : join(homedir(), ".local/share/claude-telegram-agent/services");
+  const storePath = join(servicesDir, "mount-store/mount-store.ts");
+  const wrapperPath = join(servicesDir, "topic-wrapper.sh");
+
+  // Persist the new mount so subsequent restarts pick it up.
+  const addResult = spawnSync("bun", ["run", storePath, "add", String(thread_id), templatePath, "auto"], { encoding: "utf8" });
+  if (addResult.status !== 0) {
+    process.stderr.write(`poller: wildcard auto-mount add failed for ${thread_id}: ${addResult.stderr}\n`);
+    return null;
+  }
+  let mount: { tmux_session: string };
+  try {
+    mount = JSON.parse(addResult.stdout);
+  } catch (e) {
+    process.stderr.write(`poller: wildcard auto-mount: unparseable mount-store output: ${addResult.stdout}\n`);
+    return null;
+  }
+
+  // Spawn the tmux session. The wrapper script picks up the session UUID from
+  // sessions/<thread_id> (which mount-store didn't create — we let topic-wrapper
+  // generate one on first launch). printf %q to survive paths with spaces.
+  const cmd = [wrapperPath, String(thread_id), templatePath, mount.tmux_session]
+    .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
+    .join(" ");
+  spawnSync("tmux", ["kill-session", "-t", mount.tmux_session], { encoding: "utf8" }); // no-op if absent
+  const newSession = spawnSync("tmux", ["new-session", "-d", "-s", mount.tmux_session, cmd], { encoding: "utf8" });
+  if (newSession.status !== 0) {
+    process.stderr.write(`poller: wildcard auto-spawn tmux failed for ${thread_id}: ${newSession.stderr}\n`);
+    return null;
+  }
+
+  // Refresh local cache so subsequent messages find the new mount directly.
+  refreshMountsIfChanged();
+  process.stdout.write(`[${new Date().toISOString()}] wildcard auto-mount: thread ${thread_id} → ${templatePath} (${mount.tmux_session})\n`);
+  return mount.tmux_session;
+}
+
 function routeMessage(msg: TgMessage): string | null {
   const expectedChat = effectiveChatId();
   if (expectedChat == null) return null; // unpaired and no env override → drop
@@ -511,9 +559,17 @@ function routeMessage(msg: TgMessage): string | null {
   // Per-user enforcement: when paired, only the paired user's messages reach claude.
   const expectedUser = effectiveUserId();
   if (expectedUser != null && msg.from?.id !== expectedUser) return null;
-  const key: ThreadId = msg.message_thread_id != null ? msg.message_thread_id : "dm";
-  const mount = mountsCache.get(String(key));
-  return mount?.tmux_session ?? null;
+  const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+  const specific = mountsCache.get(String(key));
+  if (specific) return specific.tmux_session;
+
+  // No specific mount — try the wildcard. Auto-spawns a real per-thread
+  // mount + tmux session using the wildcard's path as the project dir.
+  const wildcard = mountsCache.get("*");
+  if (wildcard) {
+    return autoSpawnFromWildcard(key, wildcard.path);
+  }
+  return null;
 }
 
 async function dispatchUpdate(u: TgUpdate): Promise<void> {

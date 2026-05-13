@@ -72,7 +72,17 @@ const STALE_LOCK_MS = 30_000;
 const LOCK_RETRY_MS = 50;
 const LOCK_RETRY_MAX = 200; // ~10s total
 
-export type ThreadId = number | "dm";
+/**
+ * Thread identifiers come in three flavors:
+ *   - positive integer: a real Telegram forum topic_id
+ *   - "dm": sentinel for direct messages (no message_thread_id field)
+ *   - "*": wildcard catch-all template. The poller falls back to a "*" mount
+ *     when an incoming message hits a thread that has no specific entry,
+ *     auto-spawning a real mount with the template's path. Set up at install
+ *     time so users get reply-everywhere behavior without /mount-ing each
+ *     topic. Specific /mount entries override the wildcard.
+ */
+export type ThreadId = number | "dm" | "*";
 
 export interface Mount {
   thread_id: ThreadId;
@@ -97,9 +107,10 @@ const EMPTY: MountsFile = { version: 1, mounts: [] };
  */
 export function parseThreadId(raw: string): ThreadId {
   if (raw === "dm") return "dm";
+  if (raw === "*") return "*";
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
-    throw new Error(`invalid thread_id: ${JSON.stringify(raw)} — expected "dm" or a positive integer`);
+    throw new Error(`invalid thread_id: ${JSON.stringify(raw)} — expected "dm", "*", or a positive integer`);
   }
   return n;
 }
