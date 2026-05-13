@@ -95,6 +95,32 @@ for s in restart_claude.sh watch_network.sh start_agents.sh cta; do
   say "Installed $BIN_DIR/$s"
 done
 
+# ---- 3b. Install F1+F2 services (MULTI_TOPIC mode) --------------------------
+# Layout: ~/.local/share/claude-telegram-agent/services/{poller,mcp-telegram,
+# topic-wrapper.sh}. Honors XDG-ish convention (executables in ~/.local/bin,
+# data/code in ~/.local/share). Services stay opt-in via MULTI_TOPIC=1 in
+# .env, so installing them on a v0 host is a no-op until the user flips that
+# flag. start_agents.sh's MULTI_TOPIC branch refuses to start if these
+# files are missing, so install/uninstall stay symmetric.
+SERVICES_DIR="$HOME/.local/share/claude-telegram-agent/services"
+if [[ -d "$REPO_DIR/services" ]]; then
+  mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram"
+  cp "$REPO_DIR/services/poller/poller.ts" "$REPO_DIR/services/poller/package.json" "$SERVICES_DIR/poller/"
+  cp "$REPO_DIR/services/mcp-telegram/server.ts" "$REPO_DIR/services/mcp-telegram/package.json" "$SERVICES_DIR/mcp-telegram/"
+  cp "$REPO_DIR/services/topic-wrapper.sh" "$SERVICES_DIR/topic-wrapper.sh"
+  chmod +x "$SERVICES_DIR/topic-wrapper.sh"
+
+  # Resolve mcp-telegram's runtime deps (the SDK). Poller has no deps but
+  # `bun install` is a cheap no-op there. If bun is missing, warn and skip
+  # — the v0 path still works; only MULTI_TOPIC=1 needs bun-resolved deps.
+  if command -v bun >/dev/null 2>&1; then
+    ( cd "$SERVICES_DIR/mcp-telegram" && bun install --silent ) || say "WARN: bun install failed in mcp-telegram"
+    say "Installed services under $SERVICES_DIR"
+  else
+    say "WARN: bun not found on PATH — F1+F2 MULTI_TOPIC mode will not start until bun is installed"
+  fi
+fi
+
 # ---- 4. Provision Telegram plugin secrets (optional) -----------------------
 mkdir -p "$TELEGRAM_DIR"
 chmod 700 "$TELEGRAM_DIR"
