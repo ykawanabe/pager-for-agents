@@ -62,7 +62,8 @@ rotate_logs() {
     local size
     size=$(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
     if [[ "$size" -gt "$LOG_ROTATE_MAX_BYTES" ]]; then
-      local rotated="$LOG_FILE.$(date +%Y%m%d-%H%M%S)"
+      local rotated
+      rotated="$LOG_FILE.$(date +%Y%m%d-%H%M%S)"
       /bin/mv -f "$LOG_FILE" "$rotated"
       chmod 600 "$rotated" 2>/dev/null || true
     fi

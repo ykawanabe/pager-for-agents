@@ -82,6 +82,7 @@ _claude_ps_line() {
   if _multi_topic_enabled; then pat="claude --mcp-config"
   else pat="claude --channels plugin:telegram"
   fi
+  # shellcheck disable=SC2009  # pgrep can't match multi-word patterns + we need rss
   ps -Ao pid=,rss=,command= 2>/dev/null \
     | grep "$pat" \
     | grep -v grep \
@@ -92,6 +93,7 @@ _claude_ps_line() {
 # MULTI_TOPIC: per-topic mcp-telegram process lives at .../agent/mcp-telegram/server.ts.
 # v0: the official plugin's bun server is also a server.ts; same grep matches both.
 _mcp_alive() {
+  # shellcheck disable=SC2009  # pgrep -f "bun.*server.ts" is fuzzier than this explicit chain
   ps -Ao command= 2>/dev/null \
     | grep "bun" | grep "server.ts" | grep -v grep \
     | head -1 >/dev/null

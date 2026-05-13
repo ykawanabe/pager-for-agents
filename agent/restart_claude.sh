@@ -101,7 +101,7 @@ load_env_and_chdir() {
   # shellcheck source=/dev/null
   source "$env_file"
   set +a
-  cd "$CLAUDE_CWD"
+  cd "$CLAUDE_CWD" || { echo "restart_claude: cd to CLAUDE_CWD=$CLAUDE_CWD failed" >&2; exit 1; }
 }
 
 main_loop() {

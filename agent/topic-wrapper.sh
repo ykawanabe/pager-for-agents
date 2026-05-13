@@ -108,7 +108,6 @@ SESSION_UUID=$(cat "$SESSION_FILE")
 # We use Python (always present on macOS) to escape correctly — json.dumps
 # avoids hand-quoting hell when the user's project path contains spaces or
 # special characters.
-REPO_BIN_DIR="${TOPIC_WRAPPER_REPO_BIN:-$HOME/.local/bin}"
 MCP_SERVER_PATH="${TOPIC_WRAPPER_MCP_PATH:-$HOME/.local/share/claude-telegram-agent/agent/mcp-telegram/server.ts}"
 
 if [[ ! -f "$MCP_SERVER_PATH" ]]; then
@@ -138,6 +137,7 @@ PY
 
 # ─── claude argv ─────────────────────────────────────────────────────────────
 
+# shellcheck disable=SC2016  # backticks in this prompt are literal markdown, not command subs
 DEFAULT_BOT_APPEND_SYSTEM_PROMPT='You are responding through a Telegram bot. The user is on Telegram; your terminal output is NOT visible to them. To deliver ANY reply, you MUST call the `send_telegram` MCP tool with your response text. A reply that only appears in the terminal never reaches the user.
 
 Workflow for every user message:
@@ -189,7 +189,7 @@ compute_next_delay() {
 }
 
 main_loop() {
-  cd "$PROJECT_PATH"
+  cd "$PROJECT_PATH" || { echo "topic-wrapper: cd to PROJECT_PATH=$PROJECT_PATH failed" >&2; exit 1; }
 
   local append_prompt
   append_prompt=$(resolve_append_prompt "${BOT_APPEND_SYSTEM_PROMPT:-}" "$DEFAULT_BOT_APPEND_SYSTEM_PROMPT")
