@@ -29,13 +29,75 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer will prompt for:
+You'll be prompted for one thing: the Telegram bot token from
+[@BotFather](https://t.me/BotFather). Paste it (silent input). When install
+finishes, the last line printed is your **pairing code**:
 
-1. Claude Code working directory (default: `~/claude-home`)
-2. Telegram bot token (silent input — not echoed to screen)
-3. Your Telegram user ID for the allowlist (leave blank to start in `open` mode — **not recommended**)
+```
+═══════════════════════════════════════════════════════════
+  PAIRING CODE:  AB7K-9XQR
+═══════════════════════════════════════════════════════════
+```
 
-After the LaunchAgent is loaded, send a DM to your bot from Telegram. Claude should reply within a few seconds.
+## Pair the bot from Telegram
+
+Three steps, all in Telegram — no more chat-ID lookup, no `.env` editing.
+
+1. Add your bot to a chat. Three options:
+   - **DM with the bot** — open Telegram, search for your bot's username, hit Start
+   - **Group** — add the bot to any group, give it permission to read messages
+   - **Forum group** — turn on Topics in the group settings, add the bot, give it
+     read + `Manage Topics` permission
+2. Send `/pair AB7K-9XQR` (your code) in that chat. The bot replies with `✓ Paired.`
+   Only the user who sends `/pair` can issue further commands from then on.
+3. Bind a project to a topic (or DM) so claude knows which directory to work in:
+   - In a forum topic: send `/mount ~/projects/iron-flow`
+   - In a DM: send `/dm ~/claude-home`
+
+That's it. Any non-command message you send next round-trips through claude.
+
+### Available commands
+
+Send these inside Telegram (in the paired chat, as the paired user):
+
+| Command | Where | What |
+|---|---|---|
+| `/pair <code>` | Any chat | One-time pairing (consumed on success) |
+| `/start` | Any chat | Welcome message + pairing hint |
+| `/mount <path>` | Inside a forum topic | Bind that topic to a Mac directory |
+| `/dm <path>` | In the bot's DM | Bind the DM to a Mac directory |
+| `/unmount` | The mounted topic/DM | Remove that mount |
+| `/list` | Anywhere | Show current mounts |
+| `/help` | Anywhere | List commands |
+
+### Host-side commands (terminal)
+
+| Command | What |
+|---|---|
+| `cta status` | Health snapshot (LaunchAgent, tmux, MCP, last activity) |
+| `cta start` / `cta stop` | Restart / stop the agent |
+| `cta pair-code` | Re-display the pairing code |
+| `cta pair-code --reset` | Regenerate (invalidates the previous code) |
+| `cta list` | Same as `/list` but in your terminal |
+| `cta mount <thread> <path>` | Same as `/mount` but in your terminal |
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `/pair` is silent, no reply at all | Pairing code already consumed | `cta pair-code --reset` on host, retry with new code |
+| `/pair … did not match` | Wrong code | Run `cta pair-code` to see the current value |
+| Bot doesn't respond to anything | Token rejected by Bot API (preflight failed) | Check `~/.claude/channels/telegram/.env`, rerun `./install.sh` |
+| `/mount` says "not a directory" | Path doesn't exist on the Mac | Use full path, no relative or shell-globbed paths |
+| `/mount` says "inside a forum topic" | You sent it in the chat root, not a topic | Open a topic and resend, or use `/dm` for the DM mount |
+| Messages arrive but no claude reply | tmux session crashed / claude died | `tmux attach -t topic-<id>` to inspect; `cta start` to restart |
+| Want to start over | — | `cta stop`, delete `~/.claude-telegram-agent/paired.json`, `cta pair-code --reset`, `cta start` |
+
+### Manual config (if you prefer terminal-only setup)
+
+You can skip the pairing flow and set `MAIN_CHAT_ID` directly in
+`~/.claude-telegram-agent/.env`. The poller honors it as a fallback when
+`paired.json` is absent. See the [Manual setup](#manual-setup) section below.
 
 ## Manual setup
 

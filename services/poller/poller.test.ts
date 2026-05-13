@@ -122,6 +122,18 @@ describe("pre-pair state", () => {
     expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
   });
 
+  test("/start (Telegram's first-touch convention) tells the user how to pair", async () => {
+    // No paired.json, no pairing-code file — a totally fresh bot getting its
+    // first Telegram message ever. Telegram clients auto-send /start.
+    poller.refreshPairedIfChanged();
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/start", chat_id: -1001, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.some((m) => m.text.includes("waiting to be paired"))).toBe(true);
+    expect(sent.some((m) => m.text.includes("/pair"))).toBe(true);
+  });
+
   test("non-/pair commands fall through pre-pair", async () => {
     // /mount, /list etc. pre-pair → return false (not handled), so the caller
     // can drop them silently (no MAIN_CHAT_ID set yet → routeMessage returns

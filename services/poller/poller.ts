@@ -363,6 +363,33 @@ async function handleList(msg: TgMessage): Promise<void> {
   await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, `Current mounts:\n${lines.join("\n")}`);
 }
 
+// Telegram-convention: every bot's first-touch UX is /start. Telegram clients
+// auto-send /start when a user opens a new bot chat. Without a handler the
+// bot looks dead to a first-time user.
+async function handleStart(msg: TgMessage): Promise<void> {
+  if (pairedCache) {
+    if (msg.from?.id === pairedCache.user_id) {
+      // Paired owner came back. Just remind them of available commands.
+      return handleHelp(msg);
+    }
+    // Random user opened the paired bot. Stay silent — don't leak that
+    // anything exists.
+    return;
+  }
+  // Unpaired. Tell them how to claim it.
+  await reply(
+    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    [
+      "👋 Hi. I'm a claude-code Telegram proxy waiting to be paired.",
+      "",
+      "If you installed me, your host should have shown an 8-char pairing code.",
+      "Send `/pair YOUR-CODE` here to claim me.",
+      "",
+      "Lost the code? Run `cta pair-code --reset` on the host and try again.",
+    ].join("\n"),
+  );
+}
+
 async function handleHelp(msg: TgMessage): Promise<void> {
   await reply(
     { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
@@ -398,13 +425,12 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
   const command = head.split("@")[0].toLowerCase();
   const args = firstSpace < 0 ? "" : text.slice(firstSpace + 1);
 
-  // Pre-pair: only /pair is meaningful.
+  // Pre-pair: only /start and /pair are meaningful. Everything else falls
+  // through (which then drops because there's no MAIN_CHAT_ID yet).
   if (!pairedCache && !ENV_MAIN_CHAT_ID) {
-    if (command === "/pair") {
-      await handlePair(msg, args);
-      return true;
-    }
-    return false; // drop everything else
+    if (command === "/pair") { await handlePair(msg, args); return true; }
+    if (command === "/start") { await handleStart(msg); return true; }
+    return false;
   }
 
   // Post-pair authorization: paired user_id only.
@@ -414,6 +440,7 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
   }
 
   switch (command) {
+    case "/start": await handleStart(msg); return true;
     case "/pair":  await handlePair(msg, args); return true;
     case "/mount": await handleMount(msg, args); return true;
     case "/dm":    await handleDm(msg, args); return true;
@@ -527,12 +554,36 @@ async function getUpdates(offset: number): Promise<TgUpdate[]> {
   return json.result ?? [];
 }
 
+/**
+ * Verify the bot token works before entering the long-poll loop. Without this
+ * preflight, a bad token causes getUpdates to 401-loop silently in the
+ * 5-second retry — the user sees "Waiting for /pair..." that never resolves
+ * because the bot can't actually fetch messages. Surface the failure once,
+ * with a remediation hint, then exit and let launchd respawn.
+ */
+async function preflightBotToken(): Promise<void> {
+  try {
+    const resp = await fetch(`${getApiBase()}/getMe`);
+    const json = (await resp.json()) as { ok: boolean; result?: { username?: string }; description?: string };
+    if (!json.ok) {
+      process.stderr.write(`poller: bot token rejected by Bot API: ${json.description ?? "(no description)"}\n`);
+      process.stderr.write(`poller: edit $HOME/.claude/channels/telegram/.env and rerun ./install.sh\n`);
+      process.exit(1);
+    }
+    process.stdout.write(`[${new Date().toISOString()}] preflight ok: @${json.result?.username ?? "?"}\n`);
+  } catch (e) {
+    // Network failure → don't exit (transient). Just warn.
+    process.stderr.write(`poller: getMe preflight failed (will retry in main loop): ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
 export async function main(): Promise<void> {
   if (!process.env.TELEGRAM_BOT_TOKEN) {
     process.stderr.write("poller: TELEGRAM_BOT_TOKEN must be set\n");
     process.exit(1);
   }
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  await preflightBotToken();
   let offset = readOffset();
   refreshMountsIfChanged();
   refreshPairedIfChanged();
