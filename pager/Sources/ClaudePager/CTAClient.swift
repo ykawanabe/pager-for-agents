@@ -1,0 +1,333 @@
+import Foundation
+
+/// Thin wrapper around the companion agent's `cta` CLI.
+///
+/// Pager used to re-implement process detection (greping `ps`, `tmux ls`,
+/// `launchctl list`) which silently broke any time the agent renamed a
+/// session, switched runtime, or moved a file. With `cta` providing a
+/// versioned JSON status, the agent owns the contract — Pager just renders
+/// what cta reports. As long as `schema_version` stays 1, agent-side changes
+/// are invisible to Pager.
+///
+/// If `cta` isn't installed yet (older agent install, or agent never
+/// installed), every call here surfaces a typed error so the UI can show
+/// a meaningful "agent not installed" state instead of a generic red.
+enum CTAClient {
+    /// Version of the JSON contract this client speaks. Agent's `cta` script
+    /// emits `schema_version` in every status payload; we only parse v1.
+    /// Mismatch is reported as `.unsupportedSchema` so the UI can prompt for
+    /// an agent upgrade rather than silently rendering stale data.
+    static let supportedSchemaVersion = 1
+
+    /// Mirrors `cta status --json` schema_version=1. Field-by-field Codable
+    /// shape — easier to evolve than free-form JSONSerialization parsing.
+    struct AgentStatusJSON: Decodable, Equatable {
+        let schemaVersion: Int
+        let launchAgent: LaunchAgent
+        let claude: Claude
+        let telegramMcp: TelegramMcp
+        let tmux: Tmux
+        // Optional so older `cta` builds (pre-caffeinate) still decode. New
+        // Pager + old agent: field absent → caffeinate nil → UI shows "Off".
+        let caffeinate: Caffeinate?
+        let lastActivity: String?
+
+        struct LaunchAgent: Decodable, Equatable {
+            let label: String
+            let loaded: Bool
+        }
+        struct Claude: Decodable, Equatable {
+            let pid: Int?
+            let rssMb: Int?
+            enum CodingKeys: String, CodingKey { case pid; case rssMb = "rss_mb" }
+        }
+        struct TelegramMcp: Decodable, Equatable {
+            let alive: Bool
+        }
+        struct Tmux: Decodable, Equatable {
+            let claude: Session
+            let watchdog: Session
+            struct Session: Decodable, Equatable {
+                let name: String
+                let alive: Bool
+            }
+        }
+        struct Caffeinate: Decodable, Equatable {
+            let alive: Bool
+            let pid: Int?
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case launchAgent = "launch_agent"
+            case claude
+            case telegramMcp = "telegram_mcp"
+            case tmux
+            case caffeinate
+            case lastActivity = "last_activity"
+        }
+    }
+
+    enum CTAError: Error, Equatable {
+        /// `cta` not found on any candidate path. Agent likely not installed,
+        /// or installed pre-v0.1.0.
+        case notInstalled
+        /// `cta status --json` ran but exited non-zero. Carries stderr for
+        /// surfacing in Diagnostics.
+        case nonZeroExit(code: Int32, stderr: String)
+        /// JSON parse failed — usually a `cta` newer than this Pager build
+        /// (schema_version bumped) or a corrupted output.
+        case parseFailed(message: String)
+        /// `schema_version` doesn't match `supportedSchemaVersion`. Agent
+        /// is newer than Pager (or vice versa); user should upgrade the lagger.
+        case unsupportedSchema(got: Int, expected: Int)
+    }
+
+    /// Where to look for `cta`. Order matters: install.sh places it at
+    /// `~/.local/bin/cta`, so we check user-bin first. Homebrew paths are
+    /// included for hypothetical future package installs.
+    private static let ctaCandidates: [String] = {
+        let home = NSHomeDirectory()
+        return [
+            "\(home)/.local/bin/cta",
+            "/opt/homebrew/bin/cta",
+            "/usr/local/bin/cta",
+        ]
+    }()
+
+    /// Resolved absolute path to `cta`, or nil if not found. Cached because
+    /// PATH lookups happen on every poll (5s) and the install location
+    /// doesn't move at runtime — if the user installs `cta` while Pager is
+    /// running, they need to relaunch Pager (already documented elsewhere).
+    private static let resolvedPath: String? = {
+        ctaCandidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
+
+    /// Returns true if `cta` is installed and executable. Cheap — no shell-out.
+    static var isInstalled: Bool { resolvedPath != nil }
+
+    /// Run `cta status --json`. Blocking. Caller should be off the main thread.
+    static func status() throws -> AgentStatusJSON {
+        let raw = try run(args: ["status", "--json"])
+        let decoder = JSONDecoder()
+        let decoded: AgentStatusJSON
+        do {
+            decoded = try decoder.decode(AgentStatusJSON.self, from: raw)
+        } catch {
+            throw CTAError.parseFailed(message: String(describing: error))
+        }
+        if decoded.schemaVersion != supportedSchemaVersion {
+            throw CTAError.unsupportedSchema(
+                got: decoded.schemaVersion,
+                expected: supportedSchemaVersion
+            )
+        }
+        return decoded
+    }
+
+    /// Start the agent: load LaunchAgent + spawn tmux sessions. Idempotent —
+    /// `cta start` itself is safe to call when already running.
+    @discardableResult
+    static func start() throws -> String {
+        let data = try run(args: ["start"])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Stop the agent: kill tmux sessions + unload LaunchAgent. Idempotent.
+    @discardableResult
+    static func stop() throws -> String {
+        let data = try run(args: ["stop"])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Toggle `caffeinate -i` via the agent — `cta config caffeinate <on|off>`.
+    /// The agent owns the subprocess + PID file; Pager only decides whether
+    /// it should be running based on user toggle + AC-only policy + power
+    /// state. Idempotent (cta returns "Already running" / "Not running"
+    /// cleanly when the state already matches).
+    @discardableResult
+    static func setCaffeinate(on: Bool) throws -> String {
+        let data = try run(args: ["config", "caffeinate", on ? "on" : "off"])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    // MARK: - Mounts (Phase 2: per-topic project bindings)
+
+    /// Mirrors a single entry in `cta list --json` → `.mounts[]`. thread_id
+    /// can be a number (forum topic id), "dm" (DM root / group root), or "*"
+    /// (the wildcard catch-all). label and session_id are agent-internal but
+    /// useful in the UI for "auto-created vs. user-mounted" distinction.
+    struct MountJSON: Decodable, Equatable, Identifiable {
+        let threadId: ThreadIdValue
+        let path: String
+        let label: String?
+        let sessionId: String?
+        let tmuxSession: String
+        let createdAt: String
+
+        var id: String { threadId.stringValue }
+
+        /// Telegram thread_id is heterogeneously typed in mounts.json: number
+        /// for forum topics, "dm" for chat root, "*" for wildcard. Custom enum
+        /// keeps SwiftUI .id stable across renders.
+        enum ThreadIdValue: Decodable, Equatable {
+            case number(Int)
+            case string(String)
+            var stringValue: String {
+                switch self {
+                case .number(let n): return String(n)
+                case .string(let s): return s
+                }
+            }
+            init(from decoder: Decoder) throws {
+                let c = try decoder.singleValueContainer()
+                if let n = try? c.decode(Int.self) { self = .number(n) }
+                else { self = .string(try c.decode(String.self)) }
+            }
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case threadId = "thread_id"
+            case path
+            case label
+            case sessionId = "session_id"
+            case tmuxSession = "tmux_session"
+            case createdAt = "created_at"
+        }
+    }
+
+    struct MountsListJSON: Decodable {
+        let version: Int
+        let mounts: [MountJSON]
+    }
+
+    /// `cta list --json` — never throws on "empty mounts" (returns {mounts: []}).
+    /// Caller should run off the main thread.
+    static func listMounts() throws -> [MountJSON] {
+        let raw = try run(args: ["list", "--json"])
+        let decoded = try JSONDecoder().decode(MountsListJSON.self, from: raw)
+        return decoded.mounts
+    }
+
+    /// `cta mount <thread> <path> [label]`. thread is "dm", "*", or a numeric
+    /// forum topic id as a string (we don't bother making it an enum here —
+    /// cta validates).
+    @discardableResult
+    static func addMount(thread: String, path: String, label: String? = nil) throws -> String {
+        var args = ["mount", thread, path]
+        if let l = label, !l.isEmpty { args.append(l) }
+        let data = try run(args: args)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    @discardableResult
+    static func removeMount(thread: String) throws -> String {
+        let data = try run(args: ["umount", thread])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    // MARK: - Pairing
+
+    /// `cta pair-code [--reset]` — returns the current code or a freshly
+    /// generated one. Single-line stdout (trimmed). Surfaced in Pager so the
+    /// user can copy it without dropping to the terminal.
+    static func pairCode(reset: Bool = false) throws -> String {
+        let data = try run(args: ["pair-code", reset ? "--reset" : "--show"])
+        return (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @discardableResult
+    static func unpair(keepMounts: Bool = false) throws -> String {
+        var args = ["unpair"]
+        if keepMounts { args.append("--keep-mounts") }
+        let data = try run(args: args)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Mirrors paired.json schema. Read directly from disk because cta status
+    /// doesn't surface paired details (and Pager doesn't need a roundtrip just
+    /// to display two integers).
+    struct PairedStateJSON: Decodable, Equatable {
+        let chatId: Int
+        let userId: Int
+        let pairedAt: String
+
+        enum CodingKeys: String, CodingKey {
+            case chatId = "chat_id"
+            case userId = "user_id"
+            case pairedAt = "paired_at"
+        }
+    }
+
+    static func pairedState() -> PairedStateJSON? {
+        let path = ("~/.claude-telegram-agent/paired.json" as NSString).expandingTildeInPath
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        return try? JSONDecoder().decode(PairedStateJSON.self, from: data)
+    }
+
+    // MARK: - Topic names (best-effort harvest)
+
+    /// Mirrors topics.json which the poller writes when it sees a
+    /// forum_topic_created or forum_topic_edited service message. Bot API has
+    /// no getForumTopic, so this cache is the only way to learn topic names.
+    /// Topics created before the bot joined the group are absent — that's a
+    /// Telegram limitation we surface to the user in the Mounts tab UI.
+    struct TopicEntryJSON: Decodable, Equatable {
+        let name: String
+        let capturedAt: String
+        enum CodingKeys: String, CodingKey {
+            case name
+            case capturedAt = "captured_at"
+        }
+    }
+
+    struct TopicsFileJSON: Decodable {
+        let version: Int
+        let topics: [String: TopicEntryJSON]
+    }
+
+    /// Returns topic name → displayable string for a given chat + thread, or
+    /// nil if unknown. Keyed by "<chat_id>/<thread_id>" — same format the
+    /// poller writes.
+    static func topicName(chatId: Int, threadId: Int) -> String? {
+        let path = ("~/.claude-telegram-agent/topics.json" as NSString).expandingTildeInPath
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let decoded = try? JSONDecoder().decode(TopicsFileJSON.self, from: data)
+        else { return nil }
+        return decoded.topics["\(chatId)/\(threadId)"]?.name
+    }
+
+    // MARK: - Internals
+
+    /// Invoke `cta` with args and capture stdout. Reads pipes before
+    /// `waitUntilExit` to avoid the ~64KB pipe-buffer deadlock — `cta status`
+    /// is small but `cta` is a public CLI and future subcommands may be chatty.
+    private static func run(args: [String]) throws -> Data {
+        guard let path = resolvedPath else {
+            throw CTAError.notInstalled
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let out = Pipe()
+        let err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+
+        do {
+            try p.run()
+        } catch {
+            throw CTAError.nonZeroExit(code: -1, stderr: "\(error)")
+        }
+
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+
+        if p.terminationStatus != 0 {
+            let errStr = String(data: errData, encoding: .utf8) ?? "(no stderr)"
+            throw CTAError.nonZeroExit(code: p.terminationStatus, stderr: errStr)
+        }
+        return outData
+    }
+}

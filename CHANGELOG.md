@@ -6,6 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+- **Merged the Pager (`claude-telegram-agent-bar`) repo into this one** as the
+  `pager/` subdirectory. Pager and the agent ship together, share `cta` as the
+  contract, and follow the same release cadence — splitting them was useful
+  when they were independent ideas, but caused friction (two install scripts,
+  two READMEs, divergent CI) once they became one product. `install.sh` now
+  offers to chain `pager/install.sh` (interactive, with `--with-pager` /
+  `--no-pager` flags). Existing standalone Pager installs continue to work
+  via `pager/install.sh` directly.
+
+### Added
+- `docs/index.html` + `docs/site.css` — minimal static landing page for
+  GitHub Pages. Inspired by codexbar.app's layout (aurora gradient, hero with
+  copy-button install, feature grid, detail blocks). No framework — pure HTML
+  + CSS so it survives without a build step.
+- `docs/test-plan.md` — failure-mode matrix mapping every regression hit
+  this session to the test (or gap) covering it. Living contract: when a
+  bug bites us again, add a row.
+- `tests/test_send_telegram_e2e.sh` + `tests/mock-bot-api.ts` — opt-in
+  end-to-end test that proves claude actually calls the `send_telegram` MCP
+  tool given our system prompt. Catches behavior unit tests can't.
+- Forum topic name harvest: poller captures `forum_topic_created` /
+  `forum_topic_edited` service messages into
+  `~/.claude-telegram-agent/topics.json` so Pager displays "Plans (#42)"
+  instead of bare "topic 42" in Mounts. Bot API has no `getForumTopic` so
+  we can only learn names going forward.
+- `cta pair <chat_id> [user_id]` + `cta pair --auto` — host-driven pairing
+  flow. `--auto` scans recent Bot API updates for chats the bot has been
+  seen in.
+- Typing indicator + ack reaction wired end-to-end. Poller fires
+  `sendChatAction "typing"` on dispatch and `setMessageReaction` with the
+  emoji configured in `access.json` (Pager-managed toggle).
+- Poller auto-respawns dead `topic-*` tmux sessions on dispatch failure.
+- `/pair` (no args) from the already-paired user is a 1-step chat switch:
+  writes the new paired chat_id, kills stale topic-* sessions with the old
+  chat_id pinned in their MCP env, and ensures the wildcard mount exists.
+
+### Fixed
+- `topic-wrapper.sh` reads `paired.json` and prefers its `chat_id` over
+  `.env`'s `MAIN_CHAT_ID`. After re-pairing, the stale env value used to
+  leave claude's MCP outbound pointing at the dead chat — replies vanished.
+- `services/mcp-telegram/server.ts` honors `TELEGRAM_API_BASE`. Was
+  hardcoded to `api.telegram.org`, so the E2E test couldn't intercept
+  sendMessage at a mock. Prod path unchanged when env isn't set.
+- `cta status` MULTI_TOPIC-aware — `tmux.claude.name` now maps to `poller`
+  in MULTI_TOPIC mode so Pager stops reporting `claude=✗` forever.
+
 ### Security
 - **`start_agents.sh` now sets `umask 077` at entry + `pipe_to_log` `touch`/`chmod 600`s the log file before wiring `tmux pipe-pane`.** Previously, `agent.log` was created at the default 0644 — world-readable. The log mirrors the full claude TUI through `tmux pipe-pane`, including every Telegram message and reply. Any other macOS account on the same Mac (or any backup tool walking `$HOME` with its own ACLs) could read the full conversation history. `rotate_logs` also re-asserts 0600 on the archive after rename so a pre-existing 0644 active log can't carry that mode forward into archives. 3 new tests in `test_start_agents.sh` pin the umask + pipe_to_log + rotate_logs perm contracts.
 - **`install.sh`: `~/.claude-telegram-agent/.env` is now created under `umask 077` and `chmod 600`'d after write** (matches the plugin's `.env` at `~/.claude/channels/telegram/.env`). The agent `.env` holds `CLAUDE_CWD` (path leaks project location) and `BOT_SESSION_ID`. Also clamps `$CONFIG_DIR` itself to 0700.

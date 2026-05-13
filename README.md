@@ -26,7 +26,10 @@ It also (optionally) provisions the bot token and allowlist at the canonical loc
 git clone https://github.com/ykawanabe/claude-telegram-agent.git
 cd claude-telegram-agent
 chmod +x install.sh
-./install.sh
+./install.sh                  # interactive: also offers to install Pager
+# or:
+./install.sh --with-pager     # always install both
+./install.sh --no-pager       # CLI-only, headless setups
 ```
 
 You'll be prompted for one thing: the Telegram bot token from
@@ -205,6 +208,27 @@ Covers `mcp_healthy`, `kick_claude_session`, and the `check-no-secrets` pre-comm
 ```
 
 Both modes back up `.env` files into `~/.claude-telegram-agent-backup-<timestamp>/` first.
+
+## Project layout
+
+```
+.
+├── install.sh / uninstall.sh        Top-level installers (chains pager/ optionally)
+├── scripts/                         cta CLI + watch_network + restart loop
+├── services/                        poller, mount-store, mcp-telegram, topic-wrapper
+├── launchagent/                     com.claude-agent.plist template
+├── tests/                           bun + shell test suite
+├── docs/                            test-plan, troubleshooting, landing page
+│   ├── index.html / site.css        GitHub Pages landing
+│   └── test-plan.md                 failure-mode matrix
+└── pager/                           Companion macOS menu bar app (Claude Pager)
+    ├── Sources/ClaudePager/         SwiftUI app
+    ├── Package.swift
+    └── install.sh                   Builds + signs + installs as a LaunchAgent
+```
+
+Pager was its own repo (`claude-telegram-agent-bar`) until 2026-05-13;
+merged in because they ship together and share `cta` as the contract.
 
 ## Acknowledgements
 

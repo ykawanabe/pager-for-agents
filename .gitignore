@@ -1,5 +1,17 @@
-# Based on github/gitignore (macOS + Bash + common editor/tooling)
+# Based on github/gitignore (macOS + Bash + Swift + common editor/tooling)
 # https://github.com/github/gitignore
+
+# ────────────────────────────────────────────────────────────────────────────
+# Swift / SwiftPM build artifacts — pager/ subdir hosts the companion Mac app.
+# Mirrors github.com/github/gitignore/blob/main/Swift.gitignore.
+# ────────────────────────────────────────────────────────────────────────────
+pager/.build/
+pager/.swiftpm/
+pager/Packages/
+pager/Package.resolved
+pager/build/
+pager/DerivedData/
+pager/*.xcodeproj/
 
 # ────────────────────────────────────────────────────────────────────────────
 # Project secrets and runtime state (most important — never commit these)

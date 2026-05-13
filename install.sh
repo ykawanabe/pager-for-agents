@@ -311,3 +311,43 @@ else
 Tail the agent log:  tail -f $CONFIG_DIR/agent.log
 EOF
 fi
+
+# Optional: chain-install the companion Claude Pager menu bar app. The Pager
+# lives at pager/ inside this repo (merged from the old claude-telegram-agent-bar
+# repo). Build requires `swift`, so default to "ask" when it's available and
+# skip silently when it isn't (e.g. headless installs on machines without
+# Xcode Command Line Tools).
+WITH_PAGER="${WITH_PAGER:-ask}"
+for arg in "$@"; do
+  case "$arg" in
+    --with-pager) WITH_PAGER=yes ;;
+    --no-pager)   WITH_PAGER=no  ;;
+  esac
+done
+
+if [[ -d "$REPO_DIR/pager" && -f "$REPO_DIR/pager/install.sh" ]]; then
+  install_pager=0
+  case "$WITH_PAGER" in
+    yes) install_pager=1 ;;
+    no)  install_pager=0 ;;
+    ask)
+      if command -v swift >/dev/null 2>&1; then
+        printf "\nInstall the Claude Pager menu bar app too? [Y/n] "
+        read -r ans
+        case "${ans:-y}" in [Nn]*) install_pager=0 ;; *) install_pager=1 ;; esac
+      else
+        echo
+        echo "→ Skipping Claude Pager — swift not on PATH (install Xcode Command Line Tools and re-run with --with-pager)."
+      fi
+      ;;
+  esac
+  if [[ "$install_pager" == "1" ]]; then
+    if ! command -v swift >/dev/null 2>&1; then
+      echo "✗ Pager build requires swift. Install Xcode Command Line Tools and re-run with --with-pager." >&2
+    else
+      echo
+      echo "→ Building + installing Claude Pager from $REPO_DIR/pager"
+      "$REPO_DIR/pager/install.sh"
+    fi
+  fi
+fi
