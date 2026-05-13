@@ -27,31 +27,32 @@
  * iteration so the watchdog can detect a hung poller.
  */
 import { spawnSync } from "node:child_process";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const MAIN_CHAT_ID = process.env.MAIN_CHAT_ID; // the one chat we listen to
+// Env reads happen lazily so importing this module for tests doesn't require
+// a real bot token. Tests override CTA_STATE_DIR to redirect state files
+// and TELEGRAM_API_BASE to route outbound calls at a mock server.
+
+const ENV_MAIN_CHAT_ID = process.env.MAIN_CHAT_ID; // optional Phase 2 override
 const POLL_TIMEOUT_SEC = Number(process.env.POLL_TIMEOUT_SEC ?? "25");
 
-if (!TOKEN || !MAIN_CHAT_ID) {
-  process.stderr.write(
-    "poller: TELEGRAM_BOT_TOKEN and MAIN_CHAT_ID must be set\n"
-  );
-  process.exit(1);
-}
-
-const STATE_DIR = join(homedir(), ".claude-telegram-agent");
+const STATE_DIR = process.env.CTA_STATE_DIR ?? join(homedir(), ".claude-telegram-agent");
 const OFFSET_FILE = join(STATE_DIR, "poller-offset");
 const HEARTBEAT_FILE = join(STATE_DIR, "heartbeat-poller");
 const MOUNTS_JSON = join(STATE_DIR, "mounts.json");
-const API_BASE = `https://api.telegram.org/bot${TOKEN}`;
+const PAIRING_CODE_FILE = join(STATE_DIR, "pairing-code");
+const PAIRED_STATE_FILE = join(STATE_DIR, "paired.json");
 
-mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+function getApiBase(): string {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN must be set");
+  return process.env.TELEGRAM_API_BASE ?? `https://api.telegram.org/bot${token}`;
+}
 
 // ─── offset persistence ──────────────────────────────────────────────────────
 
@@ -98,6 +99,91 @@ function touchHeartbeat(): void {
   utimesSync(HEARTBEAT_FILE, now, now);
 }
 
+// ─── paired state ────────────────────────────────────────────────────────────
+// Phase 3 zero-config onboarding: instead of MAIN_CHAT_ID in .env, the user
+// pairs the bot in-chat by sending `/pair <code>`. The poller writes the
+// resulting chat_id + user_id to paired.json. MAIN_CHAT_ID env (Phase 2
+// holdover) is honored as a fallback for users upgrading from the manual
+// flow — paired.json wins if both exist.
+
+interface PairedState {
+  version: 1;
+  chat_id: number;
+  user_id: number;
+  paired_at: string;
+  chat_title?: string;
+}
+
+let pairedCache: PairedState | null = null;
+let pairedMtimeMs = 0;
+
+function refreshPairedIfChanged(): void {
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs; } catch { /* missing */ }
+  if (mtimeMs === pairedMtimeMs) return;
+  try {
+    if (mtimeMs === 0) {
+      pairedCache = null;
+    } else {
+      const raw = readFileSync(PAIRED_STATE_FILE, "utf8");
+      const parsed = JSON.parse(raw) as PairedState;
+      if (parsed.version !== 1) throw new Error("paired.json: unknown version");
+      pairedCache = parsed;
+    }
+    pairedMtimeMs = mtimeMs;
+    process.stdout.write(`[${new Date().toISOString()}] paired state reloaded (${pairedCache ? `chat=${pairedCache.chat_id} user=${pairedCache.user_id}` : "unpaired"})\n`);
+  } catch (e) {
+    process.stderr.write(`poller: paired.json reload failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+function writePairedAtomic(state: PairedState): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${PAIRED_STATE_FILE}.tmp.${process.pid}`;
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  renameSync(tmp, PAIRED_STATE_FILE);
+}
+
+function effectiveChatId(): string | null {
+  if (pairedCache) return String(pairedCache.chat_id);
+  if (ENV_MAIN_CHAT_ID) return ENV_MAIN_CHAT_ID;
+  return null;
+}
+
+function effectiveUserId(): number | null {
+  return pairedCache?.user_id ?? null;
+}
+
+// ─── outbound reply ──────────────────────────────────────────────────────────
+// Direct Bot API call for command replies. Separate from mcp-telegram, which
+// is per-topic and only reachable from claude. The poller needs its own
+// outbound for `/pair`/`/mount` confirmations — no claude in the loop.
+
+async function reply(
+  target: { chat_id: number | string; thread_id?: number },
+  text: string,
+): Promise<void> {
+  const body: Record<string, unknown> = { chat_id: target.chat_id, text };
+  if (target.thread_id != null) body.message_thread_id = target.thread_id;
+  try {
+    const resp = await fetch(`${getApiBase()}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = (await resp.json()) as { ok: boolean; description?: string };
+    if (!json.ok) {
+      process.stderr.write(`poller: reply failed: ${json.description ?? "(no description)"}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`poller: reply fetch failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
 // ─── tmux dispatch ───────────────────────────────────────────────────────────
 
 /**
@@ -120,6 +206,222 @@ function tmuxDispatch(session: string, text: string): { ok: boolean; stderr: str
   if (enter.status !== 0) return { ok: false, stderr: `send-keys Enter: ${enter.stderr}` };
 
   return { ok: true, stderr: "" };
+}
+
+// ─── in-chat commands (Phase 3) ──────────────────────────────────────────────
+// The bot listens for /pair, /mount, /unmount, /list, /help in any message.
+// Pre-pair state: only /pair <code> accepted, from any chat — once it matches
+// the pairing code, we claim that chat as MAIN_CHAT_ID and that user as the
+// allowlisted operator. Post-pair: only commands from the paired user are
+// honored; everything else falls through to normal claude dispatch.
+
+async function handlePair(msg: TgMessage, args: string): Promise<void> {
+  if (pairedCache) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      `Already paired with chat ${pairedCache.chat_id}. To re-pair, run \`cta pair-code --reset\` on the host and rerun \`/pair <new-code>\`.`,
+    );
+    return;
+  }
+  let storedCode = "";
+  try { storedCode = readFileSync(PAIRING_CODE_FILE, "utf8").trim(); } catch { /* fall through */ }
+  if (!storedCode) {
+    // No code on disk → either pairing already happened (and code was consumed)
+    // or install hasn't run pair-code --init. Don't reveal which: stay silent.
+    return;
+  }
+  const supplied = args.trim().toUpperCase();
+  if (supplied !== storedCode.toUpperCase()) {
+    // Wrong code. Reply with a generic error — don't leak whether bot is
+    // expecting a code at all. (If you can see the bot, you can see this reply,
+    // but at least we don't confirm "the code is right format, wrong value".)
+    await reply(
+      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      "Pairing code did not match. If you've lost the code, run `cta pair-code --reset` on the host.",
+    );
+    return;
+  }
+  if (!msg.from) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      "Pairing requires a from.user (channel posts can't pair).",
+    );
+    return;
+  }
+  // Match. Claim this chat + user, persist, delete the consumed code.
+  const newState: PairedState = {
+    version: 1,
+    chat_id: msg.chat.id,
+    user_id: msg.from.id,
+    paired_at: new Date().toISOString(),
+  };
+  writePairedAtomic(newState);
+  try { unlinkSync(PAIRING_CODE_FILE); } catch { /* already gone */ }
+  pairedCache = newState;
+  pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs;
+  await reply(
+    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    [
+      `✓ Paired. This chat is now claimed; only your user_id (${msg.from.id}) can send commands.`,
+      ``,
+      `Next: send \`/mount <path-on-mac>\` inside any forum topic to bind it to a project.`,
+      `For DMs with the bot: send \`/dm <path-on-mac>\` here.`,
+      `Help: \`/help\``,
+    ].join("\n"),
+  );
+}
+
+async function handleMount(msg: TgMessage, args: string): Promise<void> {
+  const path = args.trim().replace(/^~/, homedir());
+  if (!path) {
+    await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, "Usage: `/mount <path>` — e.g. `/mount ~/projects/iron-flow`");
+    return;
+  }
+  if (!existsSync(path) || !statSync(path).isDirectory()) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      `Path \`${path}\` is not a directory on the Mac. Check spelling and that it exists locally.`,
+    );
+    return;
+  }
+  const thread_id = msg.message_thread_id ?? null;
+  if (thread_id == null) {
+    await reply(
+      { chat_id: msg.chat.id },
+      "Send `/mount` inside a forum topic, or use `/dm <path>` here in DM.",
+    );
+    return;
+  }
+  // Reuse the mount-store CLI via subprocess — keeps the locking single-sourced.
+  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/services/mount-store/mount-store.ts");
+  const r = spawnSync("bun", ["run", storePath, "add", String(thread_id), path], { encoding: "utf8" });
+  if (r.status !== 0) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id },
+      `Mount failed: ${(r.stderr ?? "").trim() || "(no error)"}`,
+    );
+    return;
+  }
+  await reply(
+    { chat_id: msg.chat.id, thread_id },
+    [
+      `✓ Mounted thread ${thread_id} → ${path}`,
+      ``,
+      `Send any message in this topic to start the claude session. \`cta start\` may be needed on the host if no poller is live yet (this one is, so you should be good).`,
+    ].join("\n"),
+  );
+  // Trigger an immediate mounts.json reload (mtime-based; poller will pick
+  // it up on next iter anyway, but explicit refresh shortens the window).
+  refreshMountsIfChanged();
+}
+
+async function handleDm(msg: TgMessage, args: string): Promise<void> {
+  // Equivalent to /mount but pins thread_id="dm" sentinel.
+  const path = args.trim().replace(/^~/, homedir());
+  if (!path) {
+    await reply({ chat_id: msg.chat.id }, "Usage: `/dm <path>` — sets the DM mount to the given Mac path.");
+    return;
+  }
+  if (!existsSync(path) || !statSync(path).isDirectory()) {
+    await reply({ chat_id: msg.chat.id }, `Path \`${path}\` is not a directory on the Mac.`);
+    return;
+  }
+  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/services/mount-store/mount-store.ts");
+  const r = spawnSync("bun", ["run", storePath, "add", "dm", path], { encoding: "utf8" });
+  if (r.status !== 0) {
+    await reply({ chat_id: msg.chat.id }, `DM mount failed: ${(r.stderr ?? "").trim()}`);
+    return;
+  }
+  await reply({ chat_id: msg.chat.id }, `✓ DM mount → ${path}. Send any message here to start the claude session.`);
+  refreshMountsIfChanged();
+}
+
+async function handleUnmount(msg: TgMessage): Promise<void> {
+  const thread_id = msg.message_thread_id;
+  const key = thread_id != null ? String(thread_id) : "dm";
+  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/services/mount-store/mount-store.ts");
+  const r = spawnSync("bun", ["run", storePath, "remove", key], { encoding: "utf8" });
+  if (r.status !== 0) {
+    await reply({ chat_id: msg.chat.id, thread_id }, `Unmount failed: ${(r.stderr ?? "").trim()}`);
+    return;
+  }
+  if ((r.stdout ?? "").trim() === "null") {
+    await reply({ chat_id: msg.chat.id, thread_id }, `Thread ${key} was not mounted.`);
+    return;
+  }
+  await reply({ chat_id: msg.chat.id, thread_id }, `✓ Unmounted thread ${key}.`);
+  refreshMountsIfChanged();
+}
+
+async function handleList(msg: TgMessage): Promise<void> {
+  const data = readMounts();
+  if (data.mounts.length === 0) {
+    await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, "No mounts yet. Send `/mount <path>` in a topic to add one.");
+    return;
+  }
+  const lines = data.mounts.map((m) => `• thread ${m.thread_id} → ${m.path}${m.label ? ` (${m.label})` : ""}`);
+  await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, `Current mounts:\n${lines.join("\n")}`);
+}
+
+async function handleHelp(msg: TgMessage): Promise<void> {
+  await reply(
+    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    [
+      "Commands:",
+      "  /mount <path>   — bind THIS forum topic to a project dir on the Mac",
+      "  /dm <path>      — bind your DM with the bot to a project dir",
+      "  /unmount        — remove the mount for THIS topic (or DM)",
+      "  /list           — show current mounts",
+      "  /help           — this message",
+      "",
+      "Any non-command message is forwarded to the claude session for that mount.",
+    ].join("\n"),
+  );
+}
+
+/**
+ * Attempt to handle a message as an in-chat command. Returns true if the
+ * message was consumed by command handling (so normal tmux dispatch should
+ * be skipped). Returns false to fall through to normal routing.
+ *
+ * Pre-pair: only /pair is accepted from any chat. Everything else returns
+ * false (which then drops because there's no MAIN_CHAT_ID yet).
+ * Post-pair: only the paired user_id gets commands honored; others fall
+ * through. Unknown /commands also fall through (claude can handle them).
+ */
+async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
+  const text = msg.text ?? "";
+  if (!text.startsWith("/")) return false;
+  // `/pair@MyBot AB7K-...` → strip @-suffix from command word
+  const firstSpace = text.indexOf(" ");
+  const head = firstSpace < 0 ? text : text.slice(0, firstSpace);
+  const command = head.split("@")[0].toLowerCase();
+  const args = firstSpace < 0 ? "" : text.slice(firstSpace + 1);
+
+  // Pre-pair: only /pair is meaningful.
+  if (!pairedCache && !ENV_MAIN_CHAT_ID) {
+    if (command === "/pair") {
+      await handlePair(msg, args);
+      return true;
+    }
+    return false; // drop everything else
+  }
+
+  // Post-pair authorization: paired user_id only.
+  if (pairedCache && msg.from?.id !== pairedCache.user_id) {
+    // Silently drop — don't reveal command surface to unauthorized users.
+    return command.startsWith("/"); // claim handled to suppress claude dispatch
+  }
+
+  switch (command) {
+    case "/pair":  await handlePair(msg, args); return true;
+    case "/mount": await handleMount(msg, args); return true;
+    case "/dm":    await handleDm(msg, args); return true;
+    case "/unmount": await handleUnmount(msg); return true;
+    case "/list":  await handleList(msg); return true;
+    case "/help":  await handleHelp(msg); return true;
+    default: return false; // unknown /x → let claude see it
+  }
 }
 
 // ─── update routing ──────────────────────────────────────────────────────────
@@ -176,15 +478,26 @@ function refreshMountsIfChanged(): void {
  * official plugin's allowFrom semantics in v0.
  */
 function routeMessage(msg: TgMessage): string | null {
-  if (String(msg.chat.id) !== String(MAIN_CHAT_ID)) return null;
+  const expectedChat = effectiveChatId();
+  if (expectedChat == null) return null; // unpaired and no env override → drop
+  if (String(msg.chat.id) !== expectedChat) return null;
+  // Per-user enforcement: when paired, only the paired user's messages reach claude.
+  const expectedUser = effectiveUserId();
+  if (expectedUser != null && msg.from?.id !== expectedUser) return null;
   const key: ThreadId = msg.message_thread_id != null ? msg.message_thread_id : "dm";
   const mount = mountsCache.get(String(key));
   return mount?.tmux_session ?? null;
 }
 
-function dispatchUpdate(u: TgUpdate): void {
+async function dispatchUpdate(u: TgUpdate): Promise<void> {
   const msg = u.message ?? u.edited_message;
   if (!msg) return;
+
+  // Commands run first. Pre-pair /pair messages bypass MAIN_CHAT_ID gating
+  // (that's the whole point — we don't know the chat yet). Post-pair commands
+  // are gated by paired user_id inside tryHandleCommand.
+  if (await tryHandleCommand(msg)) return;
+
   const target = routeMessage(msg);
   if (!target) return;
 
@@ -205,7 +518,7 @@ function dispatchUpdate(u: TgUpdate): void {
 // ─── main loop ───────────────────────────────────────────────────────────────
 
 async function getUpdates(offset: number): Promise<TgUpdate[]> {
-  const url = `${API_BASE}/getUpdates?timeout=${POLL_TIMEOUT_SEC}&offset=${offset}`;
+  const url = `${getApiBase()}/getUpdates?timeout=${POLL_TIMEOUT_SEC}&offset=${offset}`;
   const resp = await fetch(url);
   const json = (await resp.json()) as TgResp;
   if (!json.ok) {
@@ -214,14 +527,22 @@ async function getUpdates(offset: number): Promise<TgUpdate[]> {
   return json.result ?? [];
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
+  if (!process.env.TELEGRAM_BOT_TOKEN) {
+    process.stderr.write("poller: TELEGRAM_BOT_TOKEN must be set\n");
+    process.exit(1);
+  }
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   let offset = readOffset();
   refreshMountsIfChanged();
-  process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${MAIN_CHAT_ID}, mounts=${mountsCache.size}\n`);
+  refreshPairedIfChanged();
+  const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
+  process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
 
   for (;;) {
     touchHeartbeat();
     refreshMountsIfChanged();
+    refreshPairedIfChanged();
     let updates: TgUpdate[];
     try {
       updates = await getUpdates(offset);
@@ -239,12 +560,34 @@ async function main(): Promise<void> {
     offset = maxId + 1;
 
     for (const u of updates) {
-      dispatchUpdate(u);
+      await dispatchUpdate(u);
     }
   }
 }
 
-main().catch((e) => {
-  process.stderr.write(`poller: fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`);
-  process.exit(1);
-});
+// Tests import this module to drive command handlers directly. Only run the
+// main loop when executed via `bun run …/poller.ts`, not on import.
+if (import.meta.main) {
+  main().catch((e) => {
+    process.stderr.write(`poller: fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`);
+    process.exit(1);
+  });
+}
+
+// Test surface: handlers + state-refresh exported so tests can drive the
+// command pipeline without spinning up getUpdates. Keep export list narrow.
+export {
+  tryHandleCommand,
+  handlePair,
+  handleMount,
+  handleDm,
+  handleUnmount,
+  handleList,
+  handleHelp,
+  refreshPairedIfChanged,
+  refreshMountsIfChanged,
+  effectiveChatId,
+  effectiveUserId,
+  type TgMessage,
+  type PairedState,
+};

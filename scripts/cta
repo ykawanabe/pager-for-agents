@@ -379,6 +379,72 @@ _config_caffeinate() {
   esac
 }
 
+# ─── Phase 3 pairing (one-time bootstrap secret) ────────────────────────────
+# The bot is one-time-pairable via an 8-char code displayed at install time.
+# In Telegram, the user sends `/pair AB7K-9XQR` to the bot — the poller claims
+# this chat as MAIN_CHAT_ID and the sender as the allowlisted user, then
+# consumes the code. After pairing, only the paired user can issue commands.
+#
+# Threat model: anyone who can see the pairing code can claim the bot before
+# you do. Code lives at $HOME/.claude-telegram-agent/pairing-code (mode 600)
+# and is deleted on first successful pair. install.sh prints it once to stdout.
+# Lost code → `cta pair-code --reset` regenerates.
+
+PAIRING_CODE_FILE="$HOME/.claude-telegram-agent/pairing-code"
+
+# Confusion-free alphabet: drops 0/O, 1/I/L, S/5, Z/2, B/8 — so a code copied
+# from a terminal phone-photo is unambiguous. 25 chars × 8 ≈ 37 bits entropy,
+# plenty for a one-time bootstrap secret that's gone in minutes.
+_PAIRING_ALPHABET="ACDEFGHJKMNPQRTUVWXY34679"
+
+_generate_pairing_code() {
+  local bytes code="" abet="$_PAIRING_ALPHABET"
+  # openssl rand is on every macOS; od -An -tu1 prints space-separated bytes
+  bytes=$(openssl rand 16 2>/dev/null | od -An -tu1)
+  for byte in $bytes; do
+    [[ ${#code} -ge 8 ]] && break
+    code="${code}${abet:$((byte % ${#abet})):1}"
+  done
+  printf '%s-%s\n' "${code:0:4}" "${code:4:8}"
+}
+
+cmd_pair_code() {
+  local mode="${1:---show}"
+  case "$mode" in
+    --init)
+      # Create if missing. Idempotent — install.sh calls this on every run.
+      if [[ -f "$PAIRING_CODE_FILE" ]]; then
+        cat "$PAIRING_CODE_FILE"
+        return 0
+      fi
+      mkdir -p "$(dirname "$PAIRING_CODE_FILE")"
+      chmod 700 "$(dirname "$PAIRING_CODE_FILE")" 2>/dev/null || true
+      ( umask 077 && _generate_pairing_code > "$PAIRING_CODE_FILE" )
+      chmod 600 "$PAIRING_CODE_FILE"
+      cat "$PAIRING_CODE_FILE"
+      ;;
+    --reset)
+      # Force-regenerate. Used after lost code or to re-pair from scratch.
+      mkdir -p "$(dirname "$PAIRING_CODE_FILE")"
+      ( umask 077 && _generate_pairing_code > "$PAIRING_CODE_FILE" )
+      chmod 600 "$PAIRING_CODE_FILE"
+      cat "$PAIRING_CODE_FILE"
+      ;;
+    --show|"")
+      if [[ -f "$PAIRING_CODE_FILE" ]]; then
+        cat "$PAIRING_CODE_FILE"
+      else
+        echo "No pairing code present. Either pairing already completed, or run 'cta pair-code --reset'." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Usage: cta pair-code [--show | --init | --reset]" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # ─── Phase 2 mount management ───────────────────────────────────────────────
 # `cta mount/umount/list` write to ~/.claude-telegram-agent/mounts.json via
 # the mount-store TS lib (single source of truth for concurrency). Per-topic
@@ -581,6 +647,7 @@ Usage:
   cta umount <thread>             Unmount; kill the topic's tmux session
   cta list [--json]               List current mounts
   cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
+  cta pair-code [--init|--reset]  Show / generate the one-time Telegram pairing code
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta help                        This message
@@ -610,6 +677,7 @@ main() {
     umount) cmd_umount "$@" ;;
     list)  cmd_list "$@" ;;
     bind) cmd_bind "$@" ;;
+    pair-code) cmd_pair_code "$@" ;;
     config) cmd_config "$@" ;;
     help|-h|--help) cmd_help ;;
     *)

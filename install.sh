@@ -225,21 +225,49 @@ launchctl unload "$PLIST_PATH" 2>/dev/null || true
 launchctl load "$PLIST_PATH"
 say "Loaded LaunchAgent $PLIST_LABEL"
 
-# ---- 6. Done ----------------------------------------------------------------
-cat <<EOF
+# ---- 6. Generate pairing code (Phase 3 zero-config onboarding) -------------
+# Generate (or display existing) one-time pairing code so the user can claim
+# the bot from Telegram itself — no chat_id editing required.
+PAIRING_CODE=$("$BIN_DIR/cta" pair-code --init 2>/dev/null || echo "")
+
+# ---- 7. Done ----------------------------------------------------------------
+if [[ -n "$PAIRING_CODE" ]]; then
+  cat <<EOF
 
 ✓ Installed.
 
-Next steps:
-  1. Verify both tmux sessions are running:  tmux ls
-  2. Tail the agent log:                     tail -f $CONFIG_DIR/agent.log
-  3. Send a DM to your bot from Telegram — Claude should reply.
+═══════════════════════════════════════════════════════════
+  PAIRING CODE:  $PAIRING_CODE
+═══════════════════════════════════════════════════════════
+
+To connect your bot:
+
+  1. Open Telegram and add your bot to a chat (DM, group, or forum group)
+  2. Send in any chat:  /pair $PAIRING_CODE
+  3. The bot will confirm; that chat is now claimed.
+
+  4. To bind a project to a forum topic, send inside that topic:
+        /mount ~/path/to/your/project
+
+  4'. For DMs with the bot (no forum), send in the DM:
+        /dm ~/path/to/your/project
+
+Useful commands from the host:
+  cta status                   — show agent health
+  cta pair-code                — re-display this code
+  cta pair-code --reset        — regenerate (invalidates the printed code)
+  cta list                     — show current mounts
+  tail -f $CONFIG_DIR/agent.log
 
 Telegram secrets live at $TELEGRAM_DIR (mode 700).
-The Claude Code Telegram plugin auto-discovers them when claude is launched
-with --channels plugin:telegram@claude-plugins-official (handled by the
-agent's restart loop).
-
-Security: this agent runs claude with --dangerously-skip-permissions.
-Make sure the allowlist is set BEFORE sending anything sensitive. See README.
+This agent runs claude with --dangerously-skip-permissions.
+Only the user who sends /pair will be allowed to issue further commands.
 EOF
+else
+  cat <<EOF
+
+✓ Installed (couldn't generate pairing code automatically — run \`cta pair-code --init\` manually).
+
+Tail the agent log:  tail -f $CONFIG_DIR/agent.log
+EOF
+fi
