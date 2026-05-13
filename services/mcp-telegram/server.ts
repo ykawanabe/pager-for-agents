@@ -40,7 +40,10 @@ if (!TOKEN || !CHAT_ID) {
   process.exit(1);
 }
 
-const API_BASE = `https://api.telegram.org/bot${TOKEN}`;
+// TELEGRAM_API_BASE override lets E2E tests redirect outbound calls at a
+// local mock server (tests/mock-bot-api.ts). Without it, every test would
+// either hit real Telegram or silently no-op when the mock isn't reached.
+const API_BASE = process.env.TELEGRAM_API_BASE ?? `https://api.telegram.org/bot${TOKEN}`;
 
 type ParseMode = "MarkdownV2" | "HTML";
 
