@@ -208,6 +208,161 @@ function tmuxDispatch(session: string, text: string): { ok: boolean; stderr: str
   return { ok: true, stderr: "" };
 }
 
+// ─── auto-pair via bot invite (Phase 5) ──────────────────────────────────────
+// Replaces "user must type /pair <code>" with "bot detects when it's added
+// to a chat, sends an inline-keyboard prompt asking the inviter to confirm".
+// The user never copies a code — Telegram already tells us who invited the
+// bot, we just ask them to tap a button.
+
+let botUserId: number | null = null; // captured from preflight (getMe)
+let pendingPair: { chat_id: number; inviter_user_id: number; expires_at: number } | null = null;
+const PENDING_PAIR_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+interface TgChatMemberUpdated {
+  chat: { id: number; title?: string };
+  from: { id: number; first_name?: string; username?: string };
+  new_chat_member: { user: { id: number; is_bot: boolean }; status: string };
+  old_chat_member: { user: { id: number; is_bot: boolean }; status: string };
+}
+
+interface TgCallbackQuery {
+  id: string;
+  from: { id: number; first_name?: string };
+  message?: { chat: { id: number }; message_id: number };
+  data?: string;
+}
+
+async function sendInlineKeyboard(
+  chat_id: number,
+  text: string,
+  buttons: Array<Array<{ text: string; callback_data: string }>>,
+): Promise<{ message_id: number } | null> {
+  try {
+    const resp = await fetch(`${getApiBase()}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id, text, reply_markup: { inline_keyboard: buttons } }),
+    });
+    const json = (await resp.json()) as { ok: boolean; result?: { message_id: number }; description?: string };
+    if (!json.ok) {
+      process.stderr.write(`poller: sendInlineKeyboard failed: ${json.description}\n`);
+      return null;
+    }
+    return json.result ?? null;
+  } catch (e) {
+    process.stderr.write(`poller: sendInlineKeyboard fetch failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
+  }
+}
+
+async function answerCallback(callback_query_id: string, text?: string, alert?: boolean): Promise<void> {
+  try {
+    await fetch(`${getApiBase()}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id, text, show_alert: alert ?? false }),
+    });
+  } catch (e) {
+    process.stderr.write(`poller: answerCallback failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+/**
+ * Telegram fires this when the bot's status in a chat changes. We care about
+ * the case where the bot was just added (old status ∈ {left,kicked} →
+ * new status ∈ {member,administrator}) AND we don't have a paired chat yet.
+ */
+export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void> {
+  if (mcm.new_chat_member.user.id !== botUserId) return; // not us
+  const oldS = mcm.old_chat_member.status;
+  const newS = mcm.new_chat_member.status;
+  const justAdded = (oldS === "left" || oldS === "kicked") &&
+                    (newS === "member" || newS === "administrator");
+  if (!justAdded) {
+    // Other transitions: log if interesting (kicked from paired chat etc).
+    if ((newS === "kicked" || newS === "banned") && pairedCache?.chat_id === mcm.chat.id) {
+      process.stderr.write(`poller: WARNING bot was ${newS} from paired chat ${mcm.chat.id}. Operator should investigate.\n`);
+    }
+    return;
+  }
+  if (pairedCache) {
+    await reply(
+      { chat_id: mcm.chat.id },
+      "I'm already paired with another chat. To re-pair, the operator must remove ~/.claude-telegram-agent/paired.json on the host.",
+    );
+    return;
+  }
+  const inviterName = mcm.from.first_name ?? `user ${mcm.from.id}`;
+  const safeName = inviterName.replace(/[\n\r]/g, " ").slice(0, 40);
+  await sendInlineKeyboard(
+    mcm.chat.id,
+    `👋 ${safeName} just added me here.\n\nShould I pair with this chat? Only ${safeName} can confirm; other members can't claim me.`,
+    [[
+      { text: "✓ Yes, pair me here", callback_data: `pair-confirm` },
+      { text: "✗ No, cancel", callback_data: `pair-cancel` },
+    ]],
+  );
+  pendingPair = {
+    chat_id: mcm.chat.id,
+    inviter_user_id: mcm.from.id,
+    expires_at: Date.now() + PENDING_PAIR_TTL_MS,
+  };
+  process.stdout.write(`[${new Date().toISOString()}] auto-pair prompt sent: chat=${mcm.chat.id} inviter=${mcm.from.id}\n`);
+}
+
+export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
+  if (!cb.data) { await answerCallback(cb.id); return; }
+
+  // Pending pair expired or never set → tell the user and ack the callback.
+  if (!pendingPair || pendingPair.expires_at < Date.now()) {
+    pendingPair = null;
+    await answerCallback(cb.id, "That prompt has expired. Remove and re-add me to try again.", true);
+    return;
+  }
+  // Only the original inviter can answer.
+  if (cb.from.id !== pendingPair.inviter_user_id) {
+    await answerCallback(cb.id, "Only the user who invited me can confirm.", true);
+    return;
+  }
+
+  if (cb.data === "pair-confirm") {
+    const state: PairedState = {
+      version: 1,
+      chat_id: pendingPair.chat_id,
+      user_id: pendingPair.inviter_user_id,
+      paired_at: new Date().toISOString(),
+    };
+    writePairedAtomic(state);
+    pairedCache = state;
+    try { pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs; } catch { /* ignore */ }
+    pendingPair = null;
+    await answerCallback(cb.id, "Paired!");
+    if (cb.message) {
+      await reply(
+        { chat_id: cb.message.chat.id },
+        [
+          "✓ Paired with this chat. Only you can issue commands from now on.",
+          "",
+          "Any message you send in a topic auto-routes to claude. To bind a topic to a specific Mac directory, send `/mount ~/path` in that topic.",
+        ].join("\n"),
+      );
+    }
+    process.stdout.write(`[${new Date().toISOString()}] auto-pair confirmed: chat=${state.chat_id} user=${state.user_id}\n`);
+  } else if (cb.data === "pair-cancel") {
+    pendingPair = null;
+    await answerCallback(cb.id, "Pairing cancelled.");
+    if (cb.message) {
+      await reply(
+        { chat_id: cb.message.chat.id },
+        "Pairing cancelled. Remove me and re-add when you're ready, or use `/pair <code>` (run `cta pair-code` on the host to see it).",
+      );
+    }
+  }
+}
+
+/** Test hook so unit tests can stage the bot's user id without preflight. */
+export function _setBotUserIdForTest(id: number | null): void { botUserId = id; }
+
 // ─── in-chat commands (Phase 3) ──────────────────────────────────────────────
 // The bot listens for /pair, /mount, /unmount, /list, /help in any message.
 // Pre-pair state: only /pair <code> accepted, from any chat — once it matches
@@ -467,6 +622,8 @@ interface TgUpdate {
   update_id: number;
   message?: TgMessage;
   edited_message?: TgMessage;
+  my_chat_member?: TgChatMemberUpdated;
+  callback_query?: TgCallbackQuery;
 }
 interface TgResp { ok: boolean; result?: TgUpdate[]; description?: string; }
 
@@ -573,6 +730,10 @@ function routeMessage(msg: TgMessage): string | null {
 }
 
 async function dispatchUpdate(u: TgUpdate): Promise<void> {
+  // Auto-pair flow events first — neither requires a paired chat to exist.
+  if (u.my_chat_member) { await handleMyChatMember(u.my_chat_member); return; }
+  if (u.callback_query) { await handleCallbackQuery(u.callback_query); return; }
+
   const msg = u.message ?? u.edited_message;
   if (!msg) return;
 
@@ -601,7 +762,14 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
 // ─── main loop ───────────────────────────────────────────────────────────────
 
 async function getUpdates(offset: number): Promise<TgUpdate[]> {
-  const url = `${getApiBase()}/getUpdates?timeout=${POLL_TIMEOUT_SEC}&offset=${offset}`;
+  // Default getUpdates does NOT include my_chat_member or callback_query.
+  // Pass allowed_updates explicitly so the auto-pair flow can fire. Telegram
+  // remembers the last allowed_updates per-bot, but we pass it every call so
+  // a fresh deploy works correctly without any server-side state assumption.
+  const allowed = encodeURIComponent(JSON.stringify([
+    "message", "edited_message", "my_chat_member", "callback_query",
+  ]));
+  const url = `${getApiBase()}/getUpdates?timeout=${POLL_TIMEOUT_SEC}&offset=${offset}&allowed_updates=${allowed}`;
   const resp = await fetch(url);
   const json = (await resp.json()) as TgResp;
   if (!json.ok) {
@@ -620,13 +788,14 @@ async function getUpdates(offset: number): Promise<TgUpdate[]> {
 async function preflightBotToken(): Promise<void> {
   try {
     const resp = await fetch(`${getApiBase()}/getMe`);
-    const json = (await resp.json()) as { ok: boolean; result?: { username?: string }; description?: string };
+    const json = (await resp.json()) as { ok: boolean; result?: { id?: number; username?: string }; description?: string };
     if (!json.ok) {
       process.stderr.write(`poller: bot token rejected by Bot API: ${json.description ?? "(no description)"}\n`);
       process.stderr.write(`poller: edit $HOME/.claude/channels/telegram/.env and rerun ./install.sh\n`);
       process.exit(1);
     }
-    process.stdout.write(`[${new Date().toISOString()}] preflight ok: @${json.result?.username ?? "?"}\n`);
+    botUserId = json.result?.id ?? null; // captured for my_chat_member filtering
+    process.stdout.write(`[${new Date().toISOString()}] preflight ok: @${json.result?.username ?? "?"} (id=${botUserId})\n`);
   } catch (e) {
     // Network failure → don't exit (transient). Just warn.
     process.stderr.write(`poller: getMe preflight failed (will retry in main loop): ${e instanceof Error ? e.message : String(e)}\n`);

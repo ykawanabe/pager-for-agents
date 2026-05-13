@@ -41,20 +41,33 @@ finishes, the last line printed is your **pairing code**:
 
 ## Pair the bot from Telegram
 
-Three steps, all in Telegram — no more chat-ID lookup, no `.env` editing.
+Two steps, all in Telegram — no chat-ID lookup, no `.env` editing, no code
+copy-paste.
 
-1. Add your bot to a chat. Three options:
+1. **Add your bot to a chat.** Three options:
    - **DM with the bot** — open Telegram, search for your bot's username, hit Start
-   - **Group** — add the bot to any group, give it permission to read messages
-   - **Forum group** — turn on Topics in the group settings, add the bot, give it
-     read + `Manage Topics` permission
-2. Send `/pair AB7K-9XQR` (your code) in that chat. The bot replies with `✓ Paired.`
-   Only the user who sends `/pair` can issue further commands from then on.
-3. Bind a project to a topic (or DM) so claude knows which directory to work in:
-   - In a forum topic: send `/mount ~/projects/iron-flow`
-   - In a DM: send `/dm ~/claude-home`
+   - **Group** — add the bot, make it an admin (privacy mode auto-disables there)
+   - **Forum group** — turn on Topics in the group settings, add the bot as admin,
+     grant "Manage Topics"
+2. **Tap "✓ Yes, pair me here"** when the bot asks. The bot detects that you
+   added it and immediately replies with a Yes/No inline button. Only YOU
+   (the user who invited the bot) can confirm — other group members can't
+   claim it.
 
-That's it. Any non-command message you send next round-trips through claude.
+Done. Any message you send in a topic auto-routes to a claude session in
+the default project dir you set at install time. To bind a specific topic to
+a different dir, send `/mount ~/path` in that topic.
+
+### Fallback: manual pairing code
+
+If the auto-prompt doesn't appear (privacy mode quirks, bot not admin), use
+the pairing code from install.sh:
+
+```
+/pair AB7K-9XQR
+```
+
+Run `cta pair-code` on the host any time to re-display the code.
 
 ### Available commands
 

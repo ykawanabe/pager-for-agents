@@ -275,32 +275,32 @@ if [[ -n "$PAIRING_CODE" ]]; then
 
 ✓ Installed.
 
-═══════════════════════════════════════════════════════════
-  PAIRING CODE:  $PAIRING_CODE
-═══════════════════════════════════════════════════════════
-
 To connect your bot:
 
-  1. Open Telegram and add your bot to a chat (DM, group, or forum group)
-  2. Send in any chat:  /pair $PAIRING_CODE
-  3. The bot will confirm; that chat is now claimed.
+  1. Open Telegram, find your bot, and add it to a chat.
+     • For groups: make the bot an ADMIN (read-only permission is enough).
+       Privacy mode then auto-disables for that chat.
+     • For forum groups: also grant "Manage Topics" so /mount works.
+  2. The bot will immediately reply asking "Should I pair with this chat?"
+     Tap "✓ Yes, pair me here". Only YOU (the inviter) can confirm.
+  3. Done. Any message you send in a topic auto-routes to a claude session.
 
-  4. To bind a project to a forum topic, send inside that topic:
-        /mount ~/path/to/your/project
+If the auto-prompt doesn't appear (rare, e.g. privacy mode quirks), fall
+back to the manual pairing code:
 
-  4'. For DMs with the bot (no forum), send in the DM:
-        /dm ~/path/to/your/project
+  PAIRING CODE:  $PAIRING_CODE
+  In Telegram, send:  /pair $PAIRING_CODE
+
+Default project dir for auto-routed topics: $DEFAULT_MOUNT_PATH
+To pin a specific topic to a different dir, send inside that topic:
+  /mount ~/path/to/other-project
 
 Useful commands from the host:
-  cta status                   — show agent health
-  cta pair-code                — re-display this code
-  cta pair-code --reset        — regenerate (invalidates the printed code)
-  cta list                     — show current mounts
+  cta status                   — agent health snapshot
+  cta pair-code                — re-display the fallback pairing code
+  cta pair-code --reset        — invalidate the printed code + regen
+  cta list                     — current mounts
   tail -f $CONFIG_DIR/agent.log
-
-Telegram secrets live at $TELEGRAM_DIR (mode 700).
-This agent runs claude with --dangerously-skip-permissions.
-Only the user who sends /pair will be allowed to issue further commands.
 EOF
 else
   cat <<EOF

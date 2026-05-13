@@ -16,8 +16,15 @@ import { tmpdir } from "node:os";
 
 // Spin up a fake Telegram Bot API server. Records sendMessage calls so each
 // test can introspect what the poller tried to send.
-type SentMessage = { chat_id: number | string; message_thread_id?: number; text: string };
+type SentMessage = {
+  chat_id: number | string;
+  message_thread_id?: number;
+  text: string;
+  reply_markup?: { inline_keyboard: unknown };
+};
+type CallbackAck = { callback_query_id: string; text?: string; show_alert?: boolean };
 const sent: SentMessage[] = [];
+const callbackAcks: CallbackAck[] = [];
 
 const server = Bun.serve({
   port: 0,
@@ -27,6 +34,13 @@ const server = Bun.serve({
       const body = (await req.json()) as SentMessage;
       sent.push(body);
       return new Response(JSON.stringify({ ok: true, result: { message_id: sent.length } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.pathname.endsWith("/answerCallbackQuery")) {
+      const body = (await req.json()) as CallbackAck;
+      callbackAcks.push(body);
+      return new Response(JSON.stringify({ ok: true, result: true }), {
         headers: { "Content-Type": "application/json" },
       });
     }
@@ -52,10 +66,12 @@ const MOUNTS_JSON = join(STATE, "mounts.json");
 
 function resetState(): void {
   sent.length = 0;
+  callbackAcks.length = 0;
   rmSync(STATE, { recursive: true, force: true });
   mkdirSync(STATE, { recursive: true, mode: 0o700 });
   poller.refreshPairedIfChanged();
   poller.refreshMountsIfChanged();
+  poller._setBotUserIdForTest(99999); // pretend bot id; tests use distinct user ids
 }
 
 beforeEach(() => resetState());
@@ -216,6 +232,100 @@ describe("post-pair state", () => {
     );
     expect(handled).toBe(true);
     expect(sent.some((m) => m.text.includes("Already paired"))).toBe(true);
+  });
+});
+
+describe("auto-pair via bot invite (Phase 5)", () => {
+  const BOT_ID = 99999;
+  const INVITER_ID = 7;
+  const CHAT_ID = -1001;
+  const STRANGER_ID = 4242;
+
+  function botAddedEvent(opts?: { chat_id?: number; inviter_id?: number; status?: string }) {
+    return {
+      chat: { id: opts?.chat_id ?? CHAT_ID },
+      from: { id: opts?.inviter_id ?? INVITER_ID, first_name: "Alice" },
+      new_chat_member: { user: { id: BOT_ID, is_bot: true }, status: opts?.status ?? "administrator" },
+      old_chat_member: { user: { id: BOT_ID, is_bot: true }, status: "left" },
+    };
+  }
+
+  test("my_chat_member (bot added) sends inline-keyboard prompt and stages pending pair", async () => {
+    await poller.handleMyChatMember(botAddedEvent());
+    expect(sent.length).toBeGreaterThanOrEqual(1);
+    expect(sent[0].text).toContain("Alice");
+    expect(sent[0].reply_markup).toBeDefined();
+    // No paired state yet — the user still has to confirm.
+    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
+  });
+
+  test("callback pair-confirm by the inviter pairs the chat", async () => {
+    await poller.handleMyChatMember(botAddedEvent());
+    await poller.handleCallbackQuery({
+      id: "cb1",
+      from: { id: INVITER_ID },
+      message: { chat: { id: CHAT_ID }, message_id: 1 },
+      data: "pair-confirm",
+    });
+    expect(existsSync(PAIRED_STATE_FILE)).toBe(true);
+    const state = JSON.parse(readFileSync(PAIRED_STATE_FILE, "utf8")) as poller.PairedState;
+    expect(state.chat_id).toBe(CHAT_ID);
+    expect(state.user_id).toBe(INVITER_ID);
+    expect(callbackAcks.some((a) => a.text === "Paired!")).toBe(true);
+  });
+
+  test("callback pair-confirm by a stranger is rejected with an alert", async () => {
+    await poller.handleMyChatMember(botAddedEvent());
+    await poller.handleCallbackQuery({
+      id: "cb1",
+      from: { id: STRANGER_ID },
+      message: { chat: { id: CHAT_ID }, message_id: 1 },
+      data: "pair-confirm",
+    });
+    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
+    expect(callbackAcks.some((a) => a.show_alert === true && a.text?.includes("invited me"))).toBe(true);
+  });
+
+  test("callback pair-cancel by the inviter clears pending state", async () => {
+    await poller.handleMyChatMember(botAddedEvent());
+    await poller.handleCallbackQuery({
+      id: "cb1",
+      from: { id: INVITER_ID },
+      message: { chat: { id: CHAT_ID }, message_id: 1 },
+      data: "pair-cancel",
+    });
+    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
+    // A subsequent confirm should be rejected as expired.
+    await poller.handleCallbackQuery({
+      id: "cb2",
+      from: { id: INVITER_ID },
+      message: { chat: { id: CHAT_ID }, message_id: 1 },
+      data: "pair-confirm",
+    });
+    expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
+  });
+
+  test("bot added when already paired declines (no inline prompt)", async () => {
+    // Pre-stage paired state.
+    writeFileSync(PAIRED_STATE_FILE, JSON.stringify({
+      version: 1, chat_id: -7777, user_id: 1, paired_at: new Date().toISOString(),
+    }));
+    poller.refreshPairedIfChanged();
+    sent.length = 0;
+
+    await poller.handleMyChatMember(botAddedEvent({ chat_id: CHAT_ID }));
+
+    // Should reply with "already paired" — single plain reply, no inline keyboard.
+    expect(sent.length).toBe(1);
+    expect(sent[0].text).toContain("already paired");
+    expect(sent[0].reply_markup).toBeUndefined();
+  });
+
+  test("my_chat_member for a non-bot user is ignored", async () => {
+    const evt = botAddedEvent();
+    evt.new_chat_member.user.id = 12345; // not the bot
+    await poller.handleMyChatMember(evt);
+    expect(sent.length).toBe(0);
   });
 });
 
