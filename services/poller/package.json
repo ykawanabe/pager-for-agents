@@ -1,0 +1,7 @@
+{
+  "name": "poller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Single-instance long-poll loop for Telegram getUpdates. Routes inbound messages to per-topic tmux sessions via send-keys."
+}
