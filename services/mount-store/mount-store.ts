@@ -25,10 +25,19 @@
  *         "session_id": "uuid-pinned",
  *         "tmux_session": "topic-42",
  *         "created_at": "2026-05-13T03:14:00.000Z"
+ *       },
+ *       {
+ *         "thread_id": "dm",
+ *         "path": "~/claude-home",
+ *         ...
  *       }
- *     ],
- *     "dm_mount_path": "~/claude-home"
+ *     ]
  *   }
+ *
+ * `thread_id` is either a positive integer (forum topic_id) or the string
+ * "dm" — DMs are treated as just another mount, no separate `dm_mount_path`
+ * field. tmux session name is always `topic-<thread_id>` (so DM lives in
+ * `topic-dm`). Keeps poller and cta routing uniform.
  *
  * Concurrency: every mutating op runs inside `withLock` which O_EXCL-opens
  * MOUNTS_JSON.lock. Readers don't lock — the file is replaced atomically
@@ -63,8 +72,10 @@ const STALE_LOCK_MS = 30_000;
 const LOCK_RETRY_MS = 50;
 const LOCK_RETRY_MAX = 200; // ~10s total
 
+export type ThreadId = number | "dm";
+
 export interface Mount {
-  thread_id: number;
+  thread_id: ThreadId;
   path: string;
   label?: string;
   session_id: string;
@@ -75,10 +86,27 @@ export interface Mount {
 export interface MountsFile {
   version: 1;
   mounts: Mount[];
-  dm_mount_path?: string;
 }
 
 const EMPTY: MountsFile = { version: 1, mounts: [] };
+
+/**
+ * Parse a CLI-supplied thread_id into our internal ThreadId type. Accepts
+ * the literal string "dm" or any positive integer string. Anything else
+ * throws — callers should let the error propagate to stderr.
+ */
+export function parseThreadId(raw: string): ThreadId {
+  if (raw === "dm") return "dm";
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
+    throw new Error(`invalid thread_id: ${JSON.stringify(raw)} — expected "dm" or a positive integer`);
+  }
+  return n;
+}
+
+function threadIdsEqual(a: ThreadId, b: ThreadId): boolean {
+  return String(a) === String(b);
+}
 
 // ─── locking ────────────────────────────────────────────────────────────────
 
@@ -133,7 +161,6 @@ export function readMounts(): MountsFile {
     return {
       version: 1,
       mounts: parsed.mounts as Mount[],
-      dm_mount_path: parsed.dm_mount_path,
     };
   } catch (e) {
     throw new Error(`mounts.json: ${e instanceof Error ? e.message : String(e)}`);
@@ -156,13 +183,13 @@ function writeMountsAtomic(data: MountsFile): void {
 // ─── mutations ──────────────────────────────────────────────────────────────
 
 export async function addMount(args: {
-  thread_id: number;
+  thread_id: ThreadId;
   path: string;
   label?: string;
 }): Promise<Mount> {
   return withLock(() => {
     const data = readMounts();
-    if (data.mounts.some((m) => m.thread_id === args.thread_id)) {
+    if (data.mounts.some((m) => threadIdsEqual(m.thread_id, args.thread_id))) {
       throw new Error(`thread_id ${args.thread_id} is already mounted`);
     }
     const mount: Mount = {
@@ -179,10 +206,10 @@ export async function addMount(args: {
   });
 }
 
-export async function removeMount(thread_id: number): Promise<Mount | null> {
+export async function removeMount(thread_id: ThreadId): Promise<Mount | null> {
   return withLock(() => {
     const data = readMounts();
-    const idx = data.mounts.findIndex((m) => m.thread_id === thread_id);
+    const idx = data.mounts.findIndex((m) => threadIdsEqual(m.thread_id, thread_id));
     if (idx < 0) return null;
     const [removed] = data.mounts.splice(idx, 1);
     writeMountsAtomic(data);
@@ -190,17 +217,8 @@ export async function removeMount(thread_id: number): Promise<Mount | null> {
   });
 }
 
-export async function setDmPath(path: string | null): Promise<void> {
-  return withLock(() => {
-    const data = readMounts();
-    if (path === null) delete data.dm_mount_path;
-    else data.dm_mount_path = path;
-    writeMountsAtomic(data);
-  });
-}
-
-export function findMountByThreadId(thread_id: number): Mount | null {
-  return readMounts().mounts.find((m) => m.thread_id === thread_id) ?? null;
+export function findMountByThreadId(thread_id: ThreadId): Mount | null {
+  return readMounts().mounts.find((m) => threadIdsEqual(m.thread_id, thread_id)) ?? null;
 }
 
 // ─── CLI entry point ────────────────────────────────────────────────────────
@@ -220,19 +238,20 @@ async function main(): Promise<void> {
       return;
     }
     case "get": {
-      const id = Number(rest[0]);
-      if (!Number.isFinite(id)) bail("get: thread_id must be a number");
-      const m = findMountByThreadId(id);
-      process.stdout.write(`${JSON.stringify(m)}\n`);
+      try {
+        const id = parseThreadId(rest[0] ?? "");
+        process.stdout.write(`${JSON.stringify(findMountByThreadId(id))}\n`);
+      } catch (e) {
+        bail(e instanceof Error ? e.message : String(e));
+      }
       return;
     }
     case "add": {
-      const id = Number(rest[0]);
       const path = rest[1];
       const label = rest[2];
-      if (!Number.isFinite(id)) bail("add: thread_id must be a number");
       if (!path) bail("add: path is required");
       try {
+        const id = parseThreadId(rest[0] ?? "");
         const m = await addMount({ thread_id: id, path, label });
         process.stdout.write(`${JSON.stringify(m)}\n`);
       } catch (e) {
@@ -241,30 +260,17 @@ async function main(): Promise<void> {
       return;
     }
     case "remove": {
-      const id = Number(rest[0]);
-      if (!Number.isFinite(id)) bail("remove: thread_id must be a number");
-      const m = await removeMount(id);
-      process.stdout.write(`${JSON.stringify(m)}\n`);
-      return;
-    }
-    case "dm-set": {
-      const path = rest[0];
-      if (!path) bail("dm-set: path is required (use dm-clear to remove)");
-      await setDmPath(path);
-      process.stdout.write("ok\n");
-      return;
-    }
-    case "dm-clear": {
-      await setDmPath(null);
-      process.stdout.write("ok\n");
-      return;
-    }
-    case "dm-get": {
-      process.stdout.write(`${readMounts().dm_mount_path ?? ""}\n`);
+      try {
+        const id = parseThreadId(rest[0] ?? "");
+        const m = await removeMount(id);
+        process.stdout.write(`${JSON.stringify(m)}\n`);
+      } catch (e) {
+        bail(e instanceof Error ? e.message : String(e));
+      }
       return;
     }
     default:
-      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, remove, dm-set, dm-clear, dm-get`);
+      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, remove`);
   }
 }
 

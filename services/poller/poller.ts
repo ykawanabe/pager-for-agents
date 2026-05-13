@@ -27,21 +27,20 @@
  * iteration so the watchdog can detect a hung poller.
  */
 import { spawnSync } from "node:child_process";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, utimesSync, writeFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
+import { readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MAIN_CHAT_ID = process.env.MAIN_CHAT_ID; // the one chat we listen to
-const HARDCODED_THREAD_ID = process.env.HARDCODED_THREAD_ID; // Phase 1 only
-const HARDCODED_TMUX = process.env.HARDCODED_TMUX ?? "topic-1";
 const POLL_TIMEOUT_SEC = Number(process.env.POLL_TIMEOUT_SEC ?? "25");
 
-if (!TOKEN || !MAIN_CHAT_ID || !HARDCODED_THREAD_ID) {
+if (!TOKEN || !MAIN_CHAT_ID) {
   process.stderr.write(
-    "poller: TELEGRAM_BOT_TOKEN, MAIN_CHAT_ID, HARDCODED_THREAD_ID must all be set\n"
+    "poller: TELEGRAM_BOT_TOKEN and MAIN_CHAT_ID must be set\n"
   );
   process.exit(1);
 }
@@ -49,6 +48,7 @@ if (!TOKEN || !MAIN_CHAT_ID || !HARDCODED_THREAD_ID) {
 const STATE_DIR = join(homedir(), ".claude-telegram-agent");
 const OFFSET_FILE = join(STATE_DIR, "poller-offset");
 const HEARTBEAT_FILE = join(STATE_DIR, "heartbeat-poller");
+const MOUNTS_JSON = join(STATE_DIR, "mounts.json");
 const API_BASE = `https://api.telegram.org/bot${TOKEN}`;
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -141,32 +141,45 @@ interface TgUpdate {
 }
 interface TgResp { ok: boolean; result?: TgUpdate[]; description?: string; }
 
+// ─── mounts cache ────────────────────────────────────────────────────────────
+// Hot-reload on mtime change so `cta mount/umount` is picked up without
+// restarting the poller. Each iteration of the main loop calls
+// refreshMountsIfChanged() — bounded work (one stat per loop), no inotify
+// dependency, no polling thread.
+
+let mountsCache: Map<string, Mount> = new Map();
+let mountsMtimeMs = 0;
+
+function refreshMountsIfChanged(): void {
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(MOUNTS_JSON).mtimeMs; } catch { /* missing file → mtime stays 0 */ }
+  if (mtimeMs === mountsMtimeMs) return;
+  try {
+    const data = readMounts();
+    const next = new Map<string, Mount>();
+    for (const m of data.mounts) next.set(String(m.thread_id), m);
+    mountsCache = next;
+    mountsMtimeMs = mtimeMs;
+    process.stdout.write(`[${new Date().toISOString()}] mounts reloaded (${next.size} entries)\n`);
+  } catch (e) {
+    process.stderr.write(`poller: mounts.json reload failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
 /**
- * Phase 1 routing: hardcoded one-topic OR DM mapping. Returns the tmux
- * session name to dispatch to, or null to drop the message. Phase 2 replaces
- * this with a mounts.json lookup.
+ * Look up the tmux session for an incoming message, or null to drop. Routing
+ * keys:
+ *   - forum topic → mount with thread_id == msg.message_thread_id
+ *   - DM (no thread_id) → mount with thread_id == "dm"
  *
- * Special value `HARDCODED_THREAD_ID="dm"` accepts DMs (messages with no
- * message_thread_id). Pulled forward from Phase 3 so users without a forum
- * group can smoke-test Phase 1 with their existing bot DM. Phase 3 generalizes
- * this via a real DM mount entry in mounts.json.
+ * Chat-level allowlist (MAIN_CHAT_ID) is enforced first — replaces the
+ * official plugin's allowFrom semantics in v0.
  */
 function routeMessage(msg: TgMessage): string | null {
-  // Lock to the one chat we listen to. allowFrom is checked by the official
-  // plugin in v0; here we re-implement chat-level allowlist directly.
   if (String(msg.chat.id) !== String(MAIN_CHAT_ID)) return null;
-
-  const isDmMode = HARDCODED_THREAD_ID === "dm";
-  const hasThread = msg.message_thread_id != null;
-
-  if (isDmMode && !hasThread) {
-    // Phase 1 DM smoke-test path: any DM in the right chat → HARDCODED_TMUX.
-    return HARDCODED_TMUX;
-  }
-  if (!isDmMode && hasThread && String(msg.message_thread_id) === String(HARDCODED_THREAD_ID)) {
-    return HARDCODED_TMUX;
-  }
-  return null;
+  const key: ThreadId = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+  const mount = mountsCache.get(String(key));
+  return mount?.tmux_session ?? null;
 }
 
 function dispatchUpdate(u: TgUpdate): void {
@@ -203,10 +216,12 @@ async function getUpdates(offset: number): Promise<TgUpdate[]> {
 
 async function main(): Promise<void> {
   let offset = readOffset();
-  process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${MAIN_CHAT_ID}, thread=${HARDCODED_THREAD_ID} → ${HARDCODED_TMUX}\n`);
+  refreshMountsIfChanged();
+  process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${MAIN_CHAT_ID}, mounts=${mountsCache.size}\n`);
 
   for (;;) {
     touchHeartbeat();
+    refreshMountsIfChanged();
     let updates: TgUpdate[];
     try {
       updates = await getUpdates(offset);
