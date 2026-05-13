@@ -25,8 +25,8 @@ This is the GUI half of a pair. The CLI half — the actual launchd-managed bot 
 ## Install
 
 ```sh
-git clone https://github.com/ykawanabe/claude-telegram-agent-bar.git
-cd claude-telegram-agent-bar
+git clone https://github.com/ykawanabe/claude-telegram-agent.git
+cd claude-telegram-agent/pager
 ./install.sh
 ```
 
@@ -94,7 +94,7 @@ Removes the binary, plist, and unloads the agent. Logs at `~/Library/Logs/claude
 
 ## Distribution
 
-Pre-built binaries are signed and notarized for distribution. Download the latest `.dmg` from [Releases](https://github.com/ykawanabe/claude-telegram-agent-bar/releases).
+Pre-built binaries are ad-hoc signed for distribution. Download the latest `.zip` from [Releases](https://github.com/ykawanabe/claude-telegram-agent/releases/latest). On first launch, right-click the app → Open to bypass Gatekeeper once.
 
 If you run an unsigned dev build (via `swift run` or unsigned `./install.sh`), Gatekeeper may complain on first launch. Right-click the binary → Open → Confirm.
 

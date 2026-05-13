@@ -661,7 +661,7 @@ private struct AboutTab: View {
     private var buildNumber: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
     }
-    private let repoURL = URL(string: "https://github.com/ykawanabe/claude-telegram-agent-bar")!
+    private let repoURL = URL(string: "https://github.com/ykawanabe/claude-telegram-agent/tree/main/pager")!
     private let agentURL = URL(string: "https://github.com/ykawanabe/claude-telegram-agent")!
 
     var body: some View {
