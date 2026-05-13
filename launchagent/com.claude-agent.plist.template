@@ -13,8 +13,15 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Respawn only on unsuccessful exit (crash). A clean `cta stop`
+         (launchctl unload) is treated as intentional and the agent stays
+         dead until the next login or explicit `cta start`. Matches the
+         Pager LaunchAgent's policy. -->
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>EnvironmentVariables</key>
     <dict>
