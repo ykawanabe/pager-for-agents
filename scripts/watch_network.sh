@@ -121,12 +121,25 @@ main_loop() {
         WAS_OFFLINE=0
         WAS_TG_DOWN=0
         MCP_FAILS=0
+      elif [[ "${MULTI_TOPIC:-0}" == "1" ]]; then
+        # MULTI_TOPIC mode owns its own per-topic restart loops via
+        # topic-wrapper.sh. The v0 `claude` tmux session does not exist and
+        # should not be recreated — recreating it spawns the official plugin's
+        # own getUpdates poller, which fights ours and silently drops messages
+        # (409 Conflict). Just ping the poller's heartbeat; if it's dead,
+        # launchd respawns start_agents.sh via the LaunchAgent's KeepAlive.
+        if [[ -f "$HOME/.claude-telegram-agent/heartbeat-poller" ]]; then
+          local hb_age=$(( $(date +%s) - $(stat -f %m "$HOME/.claude-telegram-agent/heartbeat-poller" 2>/dev/null || echo 0) ))
+          if [[ "$hb_age" -gt 120 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat stale (${hb_age}s)"
+          else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online (MULTI_TOPIC)"
+          fi
+        else
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat absent (MULTI_TOPIC)"
+        fi
       elif ! tmux has-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null; then
-        # Orphan-session recovery: the claude tmux session vanished entirely
-        # (manual kill, restart_claude.sh died, OOM kill, etc.). The original
-        # mcp_healthy check returned "healthy" in this state — leaving the
-        # bot dead until reboot. Skip during the startup grace window so we
-        # don't race start_agents.sh's own session spawn.
+        # v0 orphan-session recovery (single-topic mode only).
         if past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
           kick_claude_session "claude tmux session missing"
           MCP_FAILS=0
