@@ -125,10 +125,21 @@ mkdir -p ~/.claude-telegram-agent
 cp .env.example ~/.claude-telegram-agent/.env
 $EDITOR ~/.claude-telegram-agent/.env
 
-# 2. Scripts
+# 2. CLI + runtime scripts (matches install.sh's "section 3")
 mkdir -p ~/.local/bin
-cp scripts/*.sh ~/.local/bin/
-chmod +x ~/.local/bin/*.sh
+cp cli/cta ~/.local/bin/
+cp agent/start_agents.sh agent/watch_network.sh agent/restart_claude.sh ~/.local/bin/
+chmod +x ~/.local/bin/cta ~/.local/bin/*.sh
+
+# 2b. MULTI_TOPIC runtime modules (matches install.sh's "section 3b")
+AGENT_DIR=~/.local/share/claude-telegram-agent/agent
+mkdir -p "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
+cp agent/poller/poller.ts agent/poller/package.json   "$AGENT_DIR/poller/"
+cp agent/mcp-telegram/server.ts agent/mcp-telegram/package.json   "$AGENT_DIR/mcp-telegram/"
+cp agent/mount-store/mount-store.ts agent/mount-store/package.json "$AGENT_DIR/mount-store/"
+cp agent/topic-wrapper.sh "$AGENT_DIR/topic-wrapper.sh"
+chmod +x "$AGENT_DIR/topic-wrapper.sh"
+( cd "$AGENT_DIR/mcp-telegram" && bun install --silent )
 
 # 3. Telegram plugin secrets (canonical location — auto-discovered by claude)
 mkdir -p ~/.claude/channels/telegram
@@ -214,21 +225,31 @@ Both modes back up `.env` files into `~/.claude-telegram-agent-backup-<timestamp
 ```
 .
 ├── install.sh / uninstall.sh        Top-level installers (chains pager/ optionally)
-├── scripts/                         cta CLI + watch_network + restart loop
-├── services/                        poller, mount-store, mcp-telegram, topic-wrapper
+├── cli/cta                          User-facing CLI (status, mount, pair, …)
+├── agent/                           Runtime
+│   ├── start_agents.sh              LaunchAgent entry — spawns tmux sessions
+│   ├── watch_network.sh             Watchdog (network + MCP plugin health)
+│   ├── restart_claude.sh            Single-topic v0 claude restart loop
+│   ├── topic-wrapper.sh             Per-topic claude launcher (MULTI_TOPIC)
+│   ├── poller/                      Telegram long-poll → tmux dispatch
+│   ├── mcp-telegram/                MCP outbound server (one per topic)
+│   └── mount-store/                 mounts.json read/write with O_EXCL lock
 ├── launchagent/                     com.claude-agent.plist template
 ├── tests/                           bun + shell test suite
-├── docs/                            test-plan, troubleshooting, landing page
-│   ├── index.html / site.css        GitHub Pages landing
-│   └── test-plan.md                 failure-mode matrix
+├── docs/                            Prose docs + (currently un-published) landing
+│   ├── test-plan.md                 Failure-mode matrix
+│   └── troubleshooting.md
+├── scripts/                         Dev tooling (check-no-secrets pre-commit)
+├── skills/                          Claude Code skills
 └── pager/                           Companion macOS menu bar app (Claude Pager)
     ├── Sources/ClaudePager/         SwiftUI app
     ├── Package.swift
     └── install.sh                   Builds + signs + installs as a LaunchAgent
 ```
 
-Pager was its own repo (`claude-telegram-agent-bar`) until 2026-05-13;
-merged in because they ship together and share `cta` as the contract.
+Pager was its own repo (`claude-telegram-agent-bar`, archived) until
+2026-05-13; merged in because they ship together and share `cta` as the
+contract.
 
 ## Acknowledgements
 
