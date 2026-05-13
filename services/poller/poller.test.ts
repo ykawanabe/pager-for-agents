@@ -23,8 +23,12 @@ type SentMessage = {
   reply_markup?: { inline_keyboard: unknown };
 };
 type CallbackAck = { callback_query_id: string; text?: string; show_alert?: boolean };
+type ChatAction = { chat_id: number | string; action: string; message_thread_id?: number };
+type Reaction = { chat_id: number | string; message_id: number; reaction: Array<{ type: string; emoji: string }> };
 const sent: SentMessage[] = [];
 const callbackAcks: CallbackAck[] = [];
+const chatActions: ChatAction[] = [];
+const reactions: Reaction[] = [];
 
 const server = Bun.serve({
   port: 0,
@@ -44,6 +48,20 @@ const server = Bun.serve({
         headers: { "Content-Type": "application/json" },
       });
     }
+    if (url.pathname.endsWith("/sendChatAction")) {
+      const body = (await req.json()) as ChatAction;
+      chatActions.push(body);
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.pathname.endsWith("/setMessageReaction")) {
+      const body = (await req.json()) as Reaction;
+      reactions.push(body);
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     return new Response(JSON.stringify({ ok: false, description: "not mocked" }), { status: 404 });
   },
 });
@@ -52,25 +70,33 @@ afterAll(() => server.stop());
 
 // Per-test tmpdir for state.
 const STATE = join(tmpdir(), `poller-test-${process.pid}-${Date.now()}`);
+const PAIRING_CODE_FILE = join(STATE, "pairing-code");
+const PAIRED_STATE_FILE = join(STATE, "paired.json");
+const MOUNTS_JSON = join(STATE, "mounts.json");
+const ACCESS_JSON = join(STATE, "access.json");
 process.env.CTA_STATE_DIR = STATE;
 process.env.TELEGRAM_BOT_TOKEN = "fake";
 process.env.TELEGRAM_API_BASE = FAKE_API;
+// ACCESS_JSON MUST be set BEFORE the import — the poller pins it as a
+// module-level const at import time. Without this, the cache reloads from
+// the real ~/.claude/channels/telegram/access.json and tests get polluted
+// by whatever the operator has configured locally.
+process.env.ACCESS_JSON = ACCESS_JSON;
 delete process.env.MAIN_CHAT_ID; // make sure pre-pair tests start unpaired
 
 // Import after env is set so the module-level constants pick up our overrides.
 const poller = await import("./poller");
 
-const PAIRING_CODE_FILE = join(STATE, "pairing-code");
-const PAIRED_STATE_FILE = join(STATE, "paired.json");
-const MOUNTS_JSON = join(STATE, "mounts.json");
-
 function resetState(): void {
   sent.length = 0;
   callbackAcks.length = 0;
+  chatActions.length = 0;
+  reactions.length = 0;
   rmSync(STATE, { recursive: true, force: true });
   mkdirSync(STATE, { recursive: true, mode: 0o700 });
   poller.refreshPairedIfChanged();
   poller.refreshMountsIfChanged();
+  poller.refreshAckReactionIfChanged();
   poller._setBotUserIdForTest(99999); // pretend bot id; tests use distinct user ids
 }
 
@@ -352,5 +378,65 @@ describe("plain text (non-command) handling", () => {
       msg({ text: "/something-not-ours arg", chat_id: -1001, from_id: 99 }),
     );
     expect(handled).toBe(false); // pass through to claude
+  });
+});
+
+describe("typing + ack reaction (UX signals)", () => {
+  test("sendTyping fires sendChatAction with 'typing' action", async () => {
+    await poller.sendTyping(-1001, 42);
+    expect(chatActions.length).toBe(1);
+    expect(chatActions[0].action).toBe("typing");
+    expect(chatActions[0].chat_id).toBe(-1001);
+    expect(chatActions[0].message_thread_id).toBe(42);
+  });
+
+  test("sendTyping omits thread_id when absent (DM case)", async () => {
+    await poller.sendTyping(8357221620);
+    expect(chatActions.length).toBe(1);
+    expect(chatActions[0].chat_id).toBe(8357221620);
+    expect(chatActions[0].message_thread_id).toBeUndefined();
+  });
+
+  test("reactToMessage no-ops when ackReaction not configured", async () => {
+    // Explicit access.json with empty config — mtime changes from any prior
+    // test's write, forces refresh to clear the cache. (Module-level cache
+    // doesn't reset across tests unless an mtime change triggers reload.)
+    writeFileSync(ACCESS_JSON, JSON.stringify({}));
+    poller.refreshAckReactionIfChanged();
+    await poller.reactToMessage(-1001, 50);
+    expect(reactions.length).toBe(0);
+  });
+
+  test("reactToMessage fires setMessageReaction when ackReaction is set", async () => {
+    // Each test needs a fresh mtime so the cache reloads.
+    await new Promise((r) => setTimeout(r, 10));
+    writeFileSync(ACCESS_JSON, JSON.stringify({ ackReaction: "👀" }));
+    poller.refreshAckReactionIfChanged();
+    await poller.reactToMessage(-1001, 50);
+    expect(reactions.length).toBe(1);
+    expect(reactions[0].chat_id).toBe(-1001);
+    expect(reactions[0].message_id).toBe(50);
+    expect(reactions[0].reaction[0]).toEqual({ type: "emoji", emoji: "👀" });
+  });
+
+  test("ackReaction reloads when access.json mtime changes", async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    writeFileSync(ACCESS_JSON, JSON.stringify({ ackReaction: "👀" }));
+    poller.refreshAckReactionIfChanged();
+    await poller.reactToMessage(-1001, 1);
+    expect(reactions.length).toBe(1);
+
+    // Toggle off — remove the field. Mtime changes so cache invalidates.
+    await new Promise((r) => setTimeout(r, 10));
+    writeFileSync(ACCESS_JSON, JSON.stringify({}));
+    poller.refreshAckReactionIfChanged();
+    await poller.reactToMessage(-1001, 2);
+    expect(reactions.length).toBe(1); // no new reaction fired
+  });
+
+  test("ackReaction handles malformed access.json gracefully", async () => {
+    writeFileSync(ACCESS_JSON, "{ not valid json");
+    // Should not throw, just leave the cache as-is and log to stderr.
+    expect(() => poller.refreshAckReactionIfChanged()).not.toThrow();
   });
 });

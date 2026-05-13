@@ -47,6 +47,9 @@ const HEARTBEAT_FILE = join(STATE_DIR, "heartbeat-poller");
 const MOUNTS_JSON = join(STATE_DIR, "mounts.json");
 const PAIRING_CODE_FILE = join(STATE_DIR, "pairing-code");
 const PAIRED_STATE_FILE = join(STATE_DIR, "paired.json");
+// Pager writes the ack-reaction toggle here as `ackReaction: "👀"` (or absent
+// for "off"). Single source of truth — Pager-driven config the poller reads.
+const ACCESS_JSON = process.env.ACCESS_JSON ?? join(homedir(), ".claude/channels/telegram/access.json");
 
 function getApiBase(): string {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -181,6 +184,69 @@ async function reply(
     }
   } catch (e) {
     process.stderr.write(`poller: reply fetch failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+// ─── ack reaction (👀) + typing indicator ────────────────────────────────────
+// Two lightweight UX signals fired on every dispatched message:
+//   1. setMessageReaction with a configurable emoji ("seen" signal).
+//      Toggle controlled by access.json's `ackReaction` field. Pager writes it;
+//      poller reads it. Empty / absent = no reaction.
+//   2. sendChatAction "typing" so the user sees the bot "typing..." while
+//      claude is composing the reply. Telegram auto-clears typing at 5s.
+//      We don't refresh in the v1 implementation — claude usually replies
+//      within that window. (TODO: refresh loop if claude routinely exceeds 5s.)
+
+let ackReactionCache: string | null = null;
+let accessMtimeMs = 0;
+
+function refreshAckReactionIfChanged(): void {
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(ACCESS_JSON).mtimeMs; } catch { /* missing */ }
+  if (mtimeMs === accessMtimeMs) return;
+  accessMtimeMs = mtimeMs;
+  if (mtimeMs === 0) { ackReactionCache = null; return; }
+  try {
+    const raw = readFileSync(ACCESS_JSON, "utf8");
+    const parsed = JSON.parse(raw) as { ackReaction?: unknown };
+    const v = typeof parsed.ackReaction === "string" ? parsed.ackReaction.trim() : "";
+    ackReactionCache = v.length > 0 ? v : null;
+    process.stdout.write(`[${new Date().toISOString()}] ack reaction reloaded: ${ackReactionCache ?? "(off)"}\n`);
+  } catch (e) {
+    process.stderr.write(`poller: access.json read failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+async function reactToMessage(chat_id: number, message_id: number): Promise<void> {
+  if (!ackReactionCache) return; // toggled off
+  try {
+    await fetch(`${getApiBase()}/setMessageReaction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id,
+        message_id,
+        reaction: [{ type: "emoji", emoji: ackReactionCache }],
+      }),
+    });
+    // Telegram returns ok:false for invalid emojis (free-bot whitelist). Don't
+    // surface — just skip silently; the operator picks emoji via Pager UI.
+  } catch (e) {
+    process.stderr.write(`poller: setMessageReaction failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+async function sendTyping(chat_id: number, thread_id?: number): Promise<void> {
+  const body: Record<string, unknown> = { chat_id, action: "typing" };
+  if (thread_id != null) body.message_thread_id = thread_id;
+  try {
+    await fetch(`${getApiBase()}/sendChatAction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    process.stderr.write(`poller: sendChatAction failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
 }
 
@@ -902,9 +968,15 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
   }
   if (!r.ok) {
     process.stderr.write(`poller: update ${u.update_id}: dispatch to ${target} failed: ${r.stderr}\n`);
-  } else {
-    process.stdout.write(`[${new Date().toISOString()}] update ${u.update_id} → ${target} (${text.length} chars)\n`);
+    return;
   }
+  process.stdout.write(`[${new Date().toISOString()}] update ${u.update_id} → ${target} (${text.length} chars)\n`);
+
+  // UX signals fired in parallel with claude composing the reply. Fire-and-
+  // forget — if Telegram is slow we'd rather deliver the reply on time than
+  // block on the typing/ack outbound. Errors are logged inside each helper.
+  void sendTyping(msg.chat.id, msg.message_thread_id);
+  void reactToMessage(msg.chat.id, msg.message_id);
 }
 
 // ─── main loop ───────────────────────────────────────────────────────────────
@@ -960,6 +1032,7 @@ export async function main(): Promise<void> {
   let offset = readOffset();
   refreshMountsIfChanged();
   refreshPairedIfChanged();
+  refreshAckReactionIfChanged();
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
   process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
 
@@ -967,6 +1040,7 @@ export async function main(): Promise<void> {
     touchHeartbeat();
     refreshMountsIfChanged();
     refreshPairedIfChanged();
+    refreshAckReactionIfChanged();
     let updates: TgUpdate[];
     try {
       updates = await getUpdates(offset);
@@ -1011,6 +1085,9 @@ export {
   handleHelp,
   refreshPairedIfChanged,
   refreshMountsIfChanged,
+  refreshAckReactionIfChanged,
+  reactToMessage,
+  sendTyping,
   effectiveChatId,
   effectiveUserId,
   type TgMessage,
