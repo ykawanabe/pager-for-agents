@@ -7,7 +7,6 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STORE="$SCRIPT_DIR/services/mount-store/mount-store.ts"
-BIND_HELPER="$SCRIPT_DIR/services/mount-store/bind-helper.ts"
 
 PASS=0
 FAIL=0
@@ -95,24 +94,18 @@ wait
 WIN_COUNT=$(bun run "$STORE" list | jq '.mounts | length')
 [[ "$WIN_COUNT" == "1" ]] && ok "5 parallel dup adds: exactly 1 winner" || ng "5 parallel dup adds: got $WIN_COUNT winners"
 
-# ─── bind-helper ────────────────────────────────────────────────────────────
+# ─── tmux_session override (used by cta bind) ───────────────────────────────
 
 rm -rf "$STATE" && mkdir -p "$STATE"
 
-BOUND=$(bun run "$BIND_HELPER" 7 /tmp my-custom-tmux iron-flow)
-[[ "$(echo "$BOUND" | jq -r '.tmux_session')" == "my-custom-tmux" ]] && ok "bind-helper: preserves caller-supplied tmux_session" || ng "bind-helper: preserves caller-supplied tmux_session"
-[[ "$(echo "$BOUND" | jq -r '.label')" == "iron-flow" ]] && ok "bind-helper: optional label" || ng "bind-helper: optional label"
+# 4th arg overrides the default `topic-<thread_id>` tmux session name.
+BOUND=$(bun run "$STORE" add 7 /tmp iron-flow my-custom-tmux)
+[[ "$(echo "$BOUND" | jq -r '.tmux_session')" == "my-custom-tmux" ]] && ok "add: tmux_session override pins caller name" || ng "add: tmux_session override pins caller name"
+[[ "$(echo "$BOUND" | jq -r '.label')" == "iron-flow" ]] && ok "add: label preserved with override" || ng "add: label preserved with override"
 
-# bind-helper without label → label field is null
-NOLABEL=$(bun run "$BIND_HELPER" 8 /tmp another-tmux)
-[[ "$(echo "$NOLABEL" | jq -r '.label')" == "null" ]] && ok "bind-helper: missing label → null" || ng "bind-helper: missing label → null"
-
-# Dup detection through bind-helper
-if bun run "$BIND_HELPER" 7 /tmp re-bind 2>/dev/null; then
-  ng "bind-helper: rejects dup thread_id"
-else
-  ok "bind-helper: rejects dup thread_id"
-fi
+# Empty 4th arg → defaults back to topic-<thread_id>
+DEFAULT_TMUX=$(bun run "$STORE" add 8 /tmp another-label "")
+[[ "$(echo "$DEFAULT_TMUX" | jq -r '.tmux_session')" == "topic-8" ]] && ok "add: empty tmux_session arg → default" || ng "add: empty tmux_session arg → default"
 
 # ─── result ─────────────────────────────────────────────────────────────────
 

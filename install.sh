@@ -108,7 +108,7 @@ if [[ -d "$REPO_DIR/services" ]]; then
   mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram" "$SERVICES_DIR/mount-store"
   cp "$REPO_DIR/services/poller/poller.ts" "$REPO_DIR/services/poller/package.json" "$SERVICES_DIR/poller/"
   cp "$REPO_DIR/services/mcp-telegram/server.ts" "$REPO_DIR/services/mcp-telegram/package.json" "$SERVICES_DIR/mcp-telegram/"
-  cp "$REPO_DIR/services/mount-store/mount-store.ts" "$REPO_DIR/services/mount-store/bind-helper.ts" "$REPO_DIR/services/mount-store/package.json" "$SERVICES_DIR/mount-store/"
+  cp "$REPO_DIR/services/mount-store/mount-store.ts" "$REPO_DIR/services/mount-store/package.json" "$SERVICES_DIR/mount-store/"
   cp "$REPO_DIR/services/topic-wrapper.sh" "$SERVICES_DIR/topic-wrapper.sh"
   chmod +x "$SERVICES_DIR/topic-wrapper.sh"
 

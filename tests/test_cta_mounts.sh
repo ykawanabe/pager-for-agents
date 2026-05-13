@@ -20,19 +20,19 @@ TMP_PROJECT=$(mktemp -d)
 export CTA_STATE_DIR="$STATE"
 export CTA_SERVICES_DIR="$SCRIPT_DIR/services"
 
-# Run cta against the private tmux socket so smoke tests can't touch the
-# user's live tmux server. Tests don't need a poller running — they just
-# exercise the JSON mutations + table output.
+# Run cta against an isolated tmux server so tests can never touch the
+# user's live tmux. Two layers of isolation:
+#   1. TMUX_TMPDIR — tells tmux where to put its socket. Setting this for
+#      the cta invocation routes any unqualified `tmux …` calls inside cta
+#      to a socket dir we control. (PATH-shim alone is insufficient because
+#      cta prepends /opt/homebrew/bin in its own header, defeating the shim.)
+#   2. PATH shim with `-L <socket>` — pins the socket name as well so a
+#      stray default-socket session in TMUX_TMPDIR can't be mistaken for ours.
 cta() {
-  TMUX_TMPDIR="$STATE" tmux -L "$PRIVATE_SOCKET" start-server 2>/dev/null || true
-  TMUX="" tmux -L "$PRIVATE_SOCKET" run-shell 'true' >/dev/null 2>&1 || true
-  # Inside cta, `tmux has-session` etc. need to hit the same socket. Override
-  # PATH-relative tmux with a wrapper that pins -L.
-  PATH="$STATE/bin:$PATH" "$CTA" "$@"
+  TMUX_TMPDIR="$STATE" PATH="$STATE/bin:$PATH" "$CTA" "$@"
 }
 
-# Wrapper shim so the cta script's tmux calls go to the private socket.
-mkdir -p "$STATE/bin"
+mkdir -p "$STATE/bin" "$STATE/tmux-$(id -u)"
 cat > "$STATE/bin/tmux" <<EOF
 #!/bin/bash
 exec $(command -v tmux) -L "$PRIVATE_SOCKET" "\$@"
@@ -40,7 +40,7 @@ EOF
 chmod +x "$STATE/bin/tmux"
 
 cleanup() {
-  "$(command -v tmux)" -L "$PRIVATE_SOCKET" kill-server 2>/dev/null || true
+  TMUX_TMPDIR="$STATE" "$(command -v tmux)" -L "$PRIVATE_SOCKET" kill-server 2>/dev/null || true
   rm -rf "$STATE" "$TMP_PROJECT"
 }
 trap cleanup EXIT

@@ -433,11 +433,18 @@ cmd_mount() {
 
   # If the poller is alive we want the topic immediately routable. Spawn
   # the per-topic tmux now; topic-wrapper.sh handles UUID + claude launch.
+  #
+  # tmux new-session's second positional arg is passed to /bin/sh -c, so
+  # paths with spaces or shell metacharacters in $abs_path or $thread_id
+  # would split across args (or execute arbitrary commands). printf %q
+  # shell-escapes each before concatenation.
   if tmux has-session -t poller 2>/dev/null; then
     tmux kill-session -t "$tmux_session" 2>/dev/null || true
     local wrapper
     wrapper=$(_topic_wrapper_path)
-    tmux new-session -d -s "$tmux_session" "$wrapper $thread_id $abs_path $tmux_session"
+    local quoted_cmd
+    quoted_cmd=$(printf '%q ' "$wrapper" "$thread_id" "$abs_path" "$tmux_session")
+    tmux new-session -d -s "$tmux_session" "$quoted_cmd"
     echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session, live)"
   else
     echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session — will start on next 'cta start')"
@@ -547,18 +554,12 @@ cmd_bind() {
     exit 1
   fi
 
-  # bind needs to PIN the *current* tmux session name (whatever the user
-  # named theirs) so the poller dispatches into the live claude — not
-  # spawn a fresh topic-<id> wrapper. mount-store's `add` always generates
-  # topic-<id>, so bind delegates to a sibling helper that calls the same
-  # locked write with the tmux name overridden.
-  local helper="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}/mount-store/bind-helper.ts"
-  if [[ ! -f "$helper" ]]; then
-    echo "cta bind: bind-helper.ts missing at $helper — rerun install.sh" >&2
-    exit 1
-  fi
+  # bind PINs the *current* tmux session name (whatever the user named
+  # theirs) so the poller dispatches into the live claude instead of
+  # spawning a fresh topic-<id> wrapper. mount-store's `add` accepts an
+  # optional 4th arg that overrides the default tmux_session.
   local mount_json
-  mount_json=$(bun run "$helper" "$thread_id" "$pane_cwd" "$current_session" "${label:-}")
+  mount_json=$(bun run "$store" add "$thread_id" "$pane_cwd" "${label:-}" "$current_session")
   local rc=$?
   if [[ "$rc" -ne 0 ]]; then exit "$rc"; fi
 

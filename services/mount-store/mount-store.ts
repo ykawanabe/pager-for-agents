@@ -186,6 +186,12 @@ export async function addMount(args: {
   thread_id: ThreadId;
   path: string;
   label?: string;
+  /**
+   * Optional. Overrides the default `topic-<thread_id>` tmux session
+   * name. Set by `cta bind`, which pins the user's currently-running
+   * tmux session as the routing target instead of spawning a fresh one.
+   */
+  tmux_session?: string;
 }): Promise<Mount> {
   return withLock(() => {
     const data = readMounts();
@@ -197,7 +203,7 @@ export async function addMount(args: {
       path: args.path,
       label: args.label,
       session_id: randomUUID(),
-      tmux_session: `topic-${args.thread_id}`,
+      tmux_session: args.tmux_session ?? `topic-${args.thread_id}`,
       created_at: new Date().toISOString(),
     };
     data.mounts.push(mount);
@@ -247,12 +253,16 @@ async function main(): Promise<void> {
       return;
     }
     case "add": {
+      // Args: <thread_id> <path> [label] [tmux_session]
+      // tmux_session 4th-arg form is used by `cta bind` to pin the current
+      // pane's tmux name; absent → defaults to `topic-<thread_id>`.
       const path = rest[1];
       const label = rest[2];
+      const tmux_session = rest[3] || undefined;
       if (!path) bail("add: path is required");
       try {
         const id = parseThreadId(rest[0] ?? "");
-        const m = await addMount({ thread_id: id, path, label });
+        const m = await addMount({ thread_id: id, path, label, tmux_session });
         process.stdout.write(`${JSON.stringify(m)}\n`);
       } catch (e) {
         bail(e instanceof Error ? e.message : String(e));

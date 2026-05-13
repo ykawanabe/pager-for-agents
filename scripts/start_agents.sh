@@ -159,6 +159,10 @@ main_multi_topic() {
     -e "TELEGRAM_BOT_TOKEN=$token" \
     -e "MAIN_CHAT_ID=$MAIN_CHAT_ID" \
     "bun $poller_path"
+  # Brief settle before pipe-pane — the live install showed an intermittent
+  # "can't find pane: poller" when pipe_to_log ran immediately after new-
+  # session before the pane was fully attached.
+  sleep 0.2
   pipe_to_log poller
 
   sleep 1
@@ -174,8 +178,11 @@ main_multi_topic() {
       continue
     fi
     tmux kill-session -t "$tmux_session" 2>/dev/null || true
-    tmux new-session -d -s "$tmux_session" \
-      "$wrapper_path $thread_id $project_path $tmux_session"
+    # tmux new-session's command arg goes through /bin/sh -c; printf %q
+    # shell-escapes each arg so paths with spaces / metacharacters survive.
+    local quoted_cmd
+    quoted_cmd=$(printf '%q ' "$wrapper_path" "$thread_id" "$project_path" "$tmux_session")
+    tmux new-session -d -s "$tmux_session" "$quoted_cmd"
     pipe_to_log "$tmux_session"
     n=$((n + 1))
   done < <(bun run "$mount_store_path" list \
