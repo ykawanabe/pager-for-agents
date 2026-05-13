@@ -43,6 +43,7 @@ require() {
 require claude "npm install -g @anthropic-ai/claude-code  (or use bun/pnpm)"
 require tmux   "brew install tmux"
 require bun    "brew install oven-sh/bun/bun  (or curl -fsSL https://bun.sh/install | bash)"
+require jq     "brew install jq"
 
 CLAUDE_VERSION="$(claude --version 2>/dev/null || echo unknown)"
 say "Detected claude: $CLAUDE_VERSION"
@@ -104,9 +105,10 @@ done
 # files are missing, so install/uninstall stay symmetric.
 SERVICES_DIR="$HOME/.local/share/claude-telegram-agent/services"
 if [[ -d "$REPO_DIR/services" ]]; then
-  mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram"
+  mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram" "$SERVICES_DIR/mount-store"
   cp "$REPO_DIR/services/poller/poller.ts" "$REPO_DIR/services/poller/package.json" "$SERVICES_DIR/poller/"
   cp "$REPO_DIR/services/mcp-telegram/server.ts" "$REPO_DIR/services/mcp-telegram/package.json" "$SERVICES_DIR/mcp-telegram/"
+  cp "$REPO_DIR/services/mount-store/mount-store.ts" "$REPO_DIR/services/mount-store/package.json" "$SERVICES_DIR/mount-store/"
   cp "$REPO_DIR/services/topic-wrapper.sh" "$SERVICES_DIR/topic-wrapper.sh"
   chmod +x "$SERVICES_DIR/topic-wrapper.sh"
 
