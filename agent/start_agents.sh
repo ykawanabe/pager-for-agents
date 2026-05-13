@@ -14,7 +14,7 @@ umask 077
 
 # Defensive PATH augmentation: launchd-spawned callers (Pager via `cta start`,
 # the LaunchAgent itself) inherit a stripped PATH that doesn't include tmux's
-# Homebrew location. See scripts/cta for the full explanation.
+# Homebrew location. See cli/cta for the full explanation.
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
 
 ENV_FILE="$HOME/.claude-telegram-agent/.env"
@@ -114,7 +114,7 @@ main_single_topic() {
 # sessions on (re)start.
 #
 # Layout while running:
-#   tmux poller            — bun .../services/poller/poller.ts
+#   tmux poller            — bun .../agent/poller/poller.ts
 #   tmux topic-<id>        — one per mounts.json entry (forum topic or "dm")
 #   tmux watchdog          — v0 watchdog for now; Phase 3 swaps in the
 #                            heartbeat-aware version.

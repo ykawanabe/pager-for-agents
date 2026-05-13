@@ -1,5 +1,5 @@
 #!/bin/bash
-# Unit tests for scripts/restart_claude.sh helpers.
+# Unit tests for agent/restart_claude.sh helpers.
 #
 # Strategy: source the script (which exposes the functions but skips main_loop
 # because of the BASH_SOURCE guard), then call compute_next_delay directly
@@ -7,8 +7,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-# shellcheck source=../scripts/restart_claude.sh
-source "$SCRIPT_DIR/scripts/restart_claude.sh"
+# shellcheck source=../agent/restart_claude.sh
+source "$SCRIPT_DIR/agent/restart_claude.sh"
 
 PASS=0
 FAIL=0

@@ -109,7 +109,7 @@ SESSION_UUID=$(cat "$SESSION_FILE")
 # avoids hand-quoting hell when the user's project path contains spaces or
 # special characters.
 REPO_BIN_DIR="${TOPIC_WRAPPER_REPO_BIN:-$HOME/.local/bin}"
-MCP_SERVER_PATH="${TOPIC_WRAPPER_MCP_PATH:-$HOME/.local/share/claude-telegram-agent/services/mcp-telegram/server.ts}"
+MCP_SERVER_PATH="${TOPIC_WRAPPER_MCP_PATH:-$HOME/.local/share/claude-telegram-agent/agent/mcp-telegram/server.ts}"
 
 if [[ ! -f "$MCP_SERVER_PATH" ]]; then
   echo "topic-wrapper: mcp-telegram server.ts not found at $MCP_SERVER_PATH — install.sh out of date?" >&2
@@ -154,7 +154,7 @@ IMPORTANT — Telegram pairing / access is handled by claude-telegram-agent, NOT
   - To unpair the current chat: tell the user to send `/unpair confirm` in the Telegram chat, OR to run `cta unpair` in their terminal.
   - To re-pair to a different chat: unpair first, then either invite the bot to a new chat (auto-pair prompt fires) or send `/pair <code>` (code visible via `cta pair-code` on the host).
   - To mount a project to a topic: `/mount <path>` inside that topic.
-  - Source of truth for these mechanisms: this repository (claude-telegram-agent), specifically scripts/cta and services/poller.'
+  - Source of truth for these mechanisms: this repository (claude-telegram-agent), specifically cli/cta and agent/poller.'
 
 resolve_append_prompt() {
   local env_val="$1" default="$2"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tests the tmux primitive (load-buffer | paste-buffer -d | send-keys Enter)
-# that services/poller/poller.ts uses to deliver Telegram messages into a
+# that agent/poller/poller.ts uses to deliver Telegram messages into a
 # per-topic claude session.
 #
 # The eng review on 2026-05-13 settled on this primitive over send-keys with

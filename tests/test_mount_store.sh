@@ -1,12 +1,12 @@
 #!/bin/bash
-# Tests for services/mount-store/mount-store.ts.
+# Tests for agent/mount-store/mount-store.ts.
 #
 # Strategy: run the bun CLI against a tempdir state, assert JSON output via
 # jq, exercise lock contention by firing N parallel adds.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-STORE="$SCRIPT_DIR/services/mount-store/mount-store.ts"
+STORE="$SCRIPT_DIR/agent/mount-store/mount-store.ts"
 
 PASS=0
 FAIL=0

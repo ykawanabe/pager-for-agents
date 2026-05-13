@@ -1,5 +1,5 @@
 #!/bin/bash
-# Unit tests for scripts/watch_network.sh helpers.
+# Unit tests for agent/watch_network.sh helpers.
 #
 # Strategy: source the script (which exposes the functions but skips the
 # main_loop because of the BASH_SOURCE guard), then override `pgrep` and
@@ -7,8 +7,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-# shellcheck source=../scripts/watch_network.sh
-source "$SCRIPT_DIR/scripts/watch_network.sh"
+# shellcheck source=../agent/watch_network.sh
+source "$SCRIPT_DIR/agent/watch_network.sh"
 
 PASS=0
 FAIL=0

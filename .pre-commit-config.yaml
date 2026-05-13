@@ -18,7 +18,7 @@ repos:
 
       - id: shell-syntax
         name: bash -n (shell syntax check)
-        entry: bash -c 'for f in install.sh uninstall.sh scripts/*.sh scripts/cta; do bash -n "$f" || exit 1; done'
+        entry: bash -c 'for f in install.sh uninstall.sh agent/*.sh cli/cta; do bash -n "$f" || exit 1; done'
         language: system
         pass_filenames: false
         always_run: true

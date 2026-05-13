@@ -645,7 +645,7 @@ async function handleMount(msg: TgMessage, args: string): Promise<void> {
     return;
   }
   // Reuse the mount-store CLI via subprocess — keeps the locking single-sourced.
-  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/services/mount-store/mount-store.ts");
+  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/agent/mount-store/mount-store.ts");
   const r = spawnSync("bun", ["run", storePath, "add", String(thread_id), path], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply(
@@ -678,7 +678,7 @@ async function handleDm(msg: TgMessage, args: string): Promise<void> {
     await reply({ chat_id: msg.chat.id }, `Path \`${path}\` is not a directory on the Mac.`);
     return;
   }
-  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/services/mount-store/mount-store.ts");
+  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/agent/mount-store/mount-store.ts");
   const r = spawnSync("bun", ["run", storePath, "add", "dm", path], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply({ chat_id: msg.chat.id }, `DM mount failed: ${(r.stderr ?? "").trim()}`);
@@ -691,7 +691,7 @@ async function handleDm(msg: TgMessage, args: string): Promise<void> {
 async function handleUnmount(msg: TgMessage): Promise<void> {
   const thread_id = msg.message_thread_id;
   const key = thread_id != null ? String(thread_id) : "dm";
-  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/services/mount-store/mount-store.ts");
+  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/agent/mount-store/mount-store.ts");
   const r = spawnSync("bun", ["run", storePath, "remove", key], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply({ chat_id: msg.chat.id, thread_id }, `Unmount failed: ${(r.stderr ?? "").trim()}`);

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tests for scripts/cta.
+# Tests for cli/cta.
 #
 # Strategy: source cta (BASH_SOURCE guard skips main), override the data-source
 # helpers (_la_loaded, _claude_ps_line, etc.) with stubs, then call cmd_status
@@ -8,8 +8,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-# shellcheck source=../scripts/cta
-source "$SCRIPT_DIR/scripts/cta"
+# shellcheck source=../cli/cta
+source "$SCRIPT_DIR/cli/cta"
 
 PASS=0
 FAIL=0
@@ -261,7 +261,7 @@ unset -f pgrep kill tmux launchctl 2>/dev/null
 # existed in the canonical locations.
 
 EFFECTIVE_PATH=$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-  bash -c "source '$SCRIPT_DIR/scripts/cta' >/dev/null 2>&1; echo \$PATH")
+  bash -c "source '$SCRIPT_DIR/cli/cta' >/dev/null 2>&1; echo \$PATH")
 
 if [[ "$EFFECTIVE_PATH" == *"/opt/homebrew/bin"* ]]; then
   ok "cta prepends /opt/homebrew/bin under stripped launchd PATH"
@@ -278,7 +278,7 @@ fi
 # When PATH is unset entirely (some launchd edge cases), the fallback
 # /usr/bin:/bin must kick in so basic posix tools still resolve.
 EFFECTIVE_PATH_UNSET=$(env -i HOME="$HOME" \
-  bash -c "source '$SCRIPT_DIR/scripts/cta' >/dev/null 2>&1; echo \$PATH")
+  bash -c "source '$SCRIPT_DIR/cli/cta' >/dev/null 2>&1; echo \$PATH")
 if [[ "$EFFECTIVE_PATH_UNSET" == *"/usr/bin"* && "$EFFECTIVE_PATH_UNSET" == *"/bin"* ]]; then
   ok "cta provides /usr/bin:/bin fallback when PATH is unset"
 else

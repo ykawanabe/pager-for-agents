@@ -391,9 +391,9 @@ describe("typing + ack reaction (UX signals)", () => {
   });
 
   test("sendTyping omits thread_id when absent (DM case)", async () => {
-    await poller.sendTyping(8357221620);
+    await poller.sendTyping(8000000000);
     expect(chatActions.length).toBe(1);
-    expect(chatActions[0].chat_id).toBe(8357221620);
+    expect(chatActions[0].chat_id).toBe(8000000000);
     expect(chatActions[0].message_thread_id).toBeUndefined();
   });
 

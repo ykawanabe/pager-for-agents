@@ -89,28 +89,39 @@ fi
 chmod 600 "$CONFIG_DIR/.env" 2>/dev/null || true
 
 # ---- 3. Install scripts -----------------------------------------------------
+# Top-level structure post-merge (2026-05-13):
+#   cli/cta                       — user-facing CLI
+#   agent/{start,watch,restart}.sh — runtime entry points (LaunchAgent calls
+#                                    agent/start_agents.sh)
+#   agent/{poller,mcp-telegram,   — runtime modules (data, copied to
+#         mount-store,                ~/.local/share/claude-telegram-agent/agent)
+#         topic-wrapper.sh}
 mkdir -p "$BIN_DIR"
-for s in restart_claude.sh watch_network.sh start_agents.sh cta; do
-  cp "$REPO_DIR/scripts/$s" "$BIN_DIR/$s"
+cp "$REPO_DIR/cli/cta" "$BIN_DIR/cta"
+chmod +x "$BIN_DIR/cta"
+say "Installed $BIN_DIR/cta"
+for s in restart_claude.sh watch_network.sh start_agents.sh; do
+  cp "$REPO_DIR/agent/$s" "$BIN_DIR/$s"
   chmod +x "$BIN_DIR/$s"
   say "Installed $BIN_DIR/$s"
 done
 
-# ---- 3b. Install F1+F2 services (MULTI_TOPIC mode) --------------------------
-# Layout: ~/.local/share/claude-telegram-agent/services/{poller,mcp-telegram,
-# topic-wrapper.sh}. Honors XDG-ish convention (executables in ~/.local/bin,
-# data/code in ~/.local/share). Services stay opt-in via MULTI_TOPIC=1 in
-# .env, so installing them on a v0 host is a no-op until the user flips that
-# flag. start_agents.sh's MULTI_TOPIC branch refuses to start if these
-# files are missing, so install/uninstall stay symmetric.
-SERVICES_DIR="$HOME/.local/share/claude-telegram-agent/services"
-if [[ -d "$REPO_DIR/services" ]]; then
-  mkdir -p "$SERVICES_DIR/poller" "$SERVICES_DIR/mcp-telegram" "$SERVICES_DIR/mount-store"
-  cp "$REPO_DIR/services/poller/poller.ts" "$REPO_DIR/services/poller/package.json" "$SERVICES_DIR/poller/"
-  cp "$REPO_DIR/services/mcp-telegram/server.ts" "$REPO_DIR/services/mcp-telegram/package.json" "$SERVICES_DIR/mcp-telegram/"
-  cp "$REPO_DIR/services/mount-store/mount-store.ts" "$REPO_DIR/services/mount-store/package.json" "$SERVICES_DIR/mount-store/"
-  cp "$REPO_DIR/services/topic-wrapper.sh" "$SERVICES_DIR/topic-wrapper.sh"
-  chmod +x "$SERVICES_DIR/topic-wrapper.sh"
+# ---- 3b. Install MULTI_TOPIC runtime modules --------------------------------
+# Layout: ~/.local/share/claude-telegram-agent/agent/{poller,mcp-telegram,
+# mount-store, topic-wrapper.sh}. Honors XDG-ish convention (executables in
+# ~/.local/bin, data/code in ~/.local/share). The legacy path used
+# .../services/* — install.sh removes the old dir if present so a re-run
+# upgrades cleanly.
+AGENT_DIR="$HOME/.local/share/claude-telegram-agent/agent"
+LEGACY_SERVICES_DIR="$HOME/.local/share/claude-telegram-agent/services"
+[[ -d "$LEGACY_SERVICES_DIR" ]] && rm -rf "$LEGACY_SERVICES_DIR"
+if [[ -d "$REPO_DIR/agent" ]]; then
+  mkdir -p "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
+  cp "$REPO_DIR/agent/poller/poller.ts" "$REPO_DIR/agent/poller/package.json" "$AGENT_DIR/poller/"
+  cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
+  cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
+  cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
+  chmod +x "$AGENT_DIR/topic-wrapper.sh"
 
   # Resolve mcp-telegram's runtime deps (the SDK). Poller has no deps but
   # `bun install` is a cheap no-op there. If bun is missing, warn and skip

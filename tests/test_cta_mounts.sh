@@ -1,13 +1,13 @@
 #!/bin/bash
 # Tests for cta's mount/umount/list subcommands.
 #
-# Strategy: run scripts/cta against a tempdir state with CTA_SERVICES_DIR
+# Strategy: run cli/cta against a tempdir state with CTA_AGENT_DIR
 # pointing at the repo (no install needed). Use a private tmux socket
 # (-L test-cta) so we never touch the live tmux server.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CTA="$SCRIPT_DIR/scripts/cta"
+CTA="$SCRIPT_DIR/cli/cta"
 PRIVATE_SOCKET="test-cta-$$"
 
 PASS=0
@@ -18,7 +18,7 @@ ng() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 STATE=$(mktemp -d)
 TMP_PROJECT=$(mktemp -d)
 export CTA_STATE_DIR="$STATE"
-export CTA_SERVICES_DIR="$SCRIPT_DIR/services"
+export CTA_AGENT_DIR="$SCRIPT_DIR/agent"
 
 # Run cta against an isolated tmux server so tests can never touch the
 # user's live tmux. Two layers of isolation:

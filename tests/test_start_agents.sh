@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tests for scripts/start_agents.sh — focused on the file-permission
+# Tests for agent/start_agents.sh — focused on the file-permission
 # guarantees added after the 2026-05-13 security audit. The destructive tmux
 # dance (kill + new-session) is skipped via the BASH_SOURCE guard.
 set -uo pipefail
@@ -31,7 +31,7 @@ RESOLVED_UMASK=$(
   bash -c "
     mkdir -p \"\$HOME/.claude-telegram-agent\"
     cp '$ENV_FILE_FAKE' \"\$HOME/.claude-telegram-agent/.env\"
-    source '$SCRIPT_DIR/scripts/start_agents.sh' 2>/dev/null
+    source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
     umask
   "
 )
@@ -58,7 +58,7 @@ PERM=$(
     # Stub tmux to a no-op so pipe-pane doesn't try to attach to a real session.
     tmux() { return 0; }
     export -f tmux
-    source '$SCRIPT_DIR/scripts/start_agents.sh' 2>/dev/null
+    source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
     pipe_to_log dummy-session
     stat -f %Sp \"\$HOME/.claude-telegram-agent/agent.log\"
   "
@@ -87,7 +87,7 @@ chmod 644 "$LARGE_LOG"
 ROTATED_PERM=$(
   HOME="$HOME_OVERRIDE2" \
   bash -c "
-    source '$SCRIPT_DIR/scripts/start_agents.sh' 2>/dev/null
+    source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
     rotate_logs
     stat -f %Sp \"\$HOME/.claude-telegram-agent/\"agent.log.* 2>/dev/null | head -1
   "

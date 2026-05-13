@@ -89,7 +89,7 @@ _claude_ps_line() {
     | awk '{print $1, $2}'
 }
 
-# MULTI_TOPIC: per-topic mcp-telegram process lives at .../services/mcp-telegram/server.ts.
+# MULTI_TOPIC: per-topic mcp-telegram process lives at .../agent/mcp-telegram/server.ts.
 # v0: the official plugin's bun server is also a server.ts; same grep matches both.
 _mcp_alive() {
   ps -Ao command= 2>/dev/null \
@@ -506,7 +506,7 @@ EOF
   local cwd
   cwd=$(grep '^CLAUDE_CWD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
   if [[ -n "$cwd" && -d "$cwd" ]]; then
-    local store="$HOME/.local/share/claude-telegram-agent/services/mount-store/mount-store.ts"
+    local store="$HOME/.local/share/claude-telegram-agent/agent/mount-store/mount-store.ts"
     if [[ -f "$store" ]]; then
       local has_wildcard
       has_wildcard=$(bun run "$store" list 2>/dev/null | jq -r '.mounts[] | select(.thread_id == "*") | .thread_id' 2>/dev/null)
@@ -575,7 +575,7 @@ cmd_unpair() {
     # Wipe mounts.json so the new pair starts clean. Wildcard from install
     # is regenerated next time install.sh runs; for now, just remove all
     # entries. User can re-mount via Telegram /mount or terminal cta mount.
-    local store="$HOME/.local/share/claude-telegram-agent/services/mount-store/mount-store.ts"
+    local store="$HOME/.local/share/claude-telegram-agent/agent/mount-store/mount-store.ts"
     if [[ -f "$store" ]]; then
       # Build a fresh empty mounts.json by removing the file (mount-store
       # creates it on first add).
@@ -631,15 +631,15 @@ cmd_pair_code() {
 # `cta start` again after a mount edit. The poller hot-reloads mounts.json
 # on mtime change, so message routing follows automatically.
 
-# Locate mount-store.ts. CTA_SERVICES_DIR override lets tests point at the
+# Locate mount-store.ts. CTA_AGENT_DIR override lets tests point at the
 # repo copy without installing.
 _mount_store_path() {
-  local d="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
+  local d="${CTA_AGENT_DIR:-$HOME/.local/share/claude-telegram-agent/agent}"
   echo "$d/mount-store/mount-store.ts"
 }
 
 _topic_wrapper_path() {
-  local d="${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/services}"
+  local d="${CTA_AGENT_DIR:-$HOME/.local/share/claude-telegram-agent/agent}"
   echo "$d/topic-wrapper.sh"
 }
 

@@ -32,7 +32,7 @@ ng() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 command -v claude >/dev/null || { echo "claude not on PATH — skipping" >&2; exit 0; }
 command -v bun >/dev/null    || { echo "bun not on PATH — skipping"    >&2; exit 0; }
 
-MCP_SERVER="$SCRIPT_DIR/services/mcp-telegram/server.ts"
+MCP_SERVER="$SCRIPT_DIR/agent/mcp-telegram/server.ts"
 [[ -f "$MCP_SERVER" ]] || { echo "mcp-telegram server.ts not found at $MCP_SERVER" >&2; exit 1; }
 
 # Match topic-wrapper.sh's default system prompt. Update this when the live
