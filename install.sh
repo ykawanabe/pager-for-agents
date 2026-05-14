@@ -139,6 +139,16 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
   chmod +x "$AGENT_DIR/topic-wrapper.sh"
 
+  # Bot-scoped Claude Code hooks: PreCompact/PostCompact/Notification fire
+  # status messages to Telegram during otherwise-silent windows. Passed to
+  # claude via --settings from topic-wrapper.sh so they only affect bot
+  # sessions, not the user's desktop Claude Code.
+  HOOKS_DIR="$AGENT_DIR/../hooks"
+  mkdir -p "$HOOKS_DIR"
+  cp "$REPO_DIR/agent/hooks/pager-notify.sh" "$HOOKS_DIR/pager-notify.sh"
+  chmod +x "$HOOKS_DIR/pager-notify.sh"
+  cp "$REPO_DIR/agent/bot-hooks.json" "$AGENT_DIR/../bot-hooks.json"
+
   # Resolve mcp-telegram's runtime deps (the SDK). Poller has no deps but
   # `bun install` is a cheap no-op there. If bun is missing, warn and skip
   # — the v0 path still works; only MULTI_TOPIC=1 needs bun-resolved deps.

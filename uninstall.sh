@@ -76,4 +76,14 @@ else
   say "Telegram secrets at $TELEGRAM_DIR preserved (pass --purge-telegram to remove)"
 fi
 
+# ---- 6. Remove deployed runtime modules ------------------------------------
+# install.sh copies the runtime into ~/.local/share/claude-telegram-agent/
+# (agent/, hooks/, bot-hooks.json). Safe to drop wholesale — nothing user-
+# generated lives here, and a re-install re-copies everything.
+SHARE_DIR="$HOME/.local/share/claude-telegram-agent"
+if [[ -d "$SHARE_DIR" ]]; then
+  rm -rf "$SHARE_DIR"
+  say "Removed $SHARE_DIR"
+fi
+
 say "Done."

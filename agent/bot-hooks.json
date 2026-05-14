@@ -1,0 +1,35 @@
+{
+  "_comment": "Bot-scoped Claude Code settings. Passed to claude via --settings from topic-wrapper.sh so these hooks only fire for bot-spawned sessions, not the user's desktop Claude Code. Edits here propagate on install.sh redeploy.",
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/share/claude-telegram-agent/hooks/pager-notify.sh precompact"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/share/claude-telegram-agent/hooks/pager-notify.sh postcompact"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/share/claude-telegram-agent/hooks/pager-notify.sh notification"
+          }
+        ]
+      }
+    ]
+  }
+}

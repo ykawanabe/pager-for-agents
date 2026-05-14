@@ -110,6 +110,12 @@ SESSION_UUID=$(cat "$SESSION_FILE")
 # special characters.
 MCP_SERVER_PATH="${TOPIC_WRAPPER_MCP_PATH:-$HOME/.local/share/claude-telegram-agent/agent/mcp-telegram/server.ts}"
 
+# Bot-scoped Claude Code settings file containing PreCompact / PostCompact /
+# Notification hooks that push status to Telegram (so compaction and idle
+# waits don't read as "bot died"). Passed via --settings so it only affects
+# bot-spawned claude sessions, not the user's desktop Claude Code.
+BOT_HOOKS_PATH="${TOPIC_WRAPPER_HOOKS_PATH:-$HOME/.local/share/claude-telegram-agent/bot-hooks.json}"
+
 if [[ ! -f "$MCP_SERVER_PATH" ]]; then
   echo "topic-wrapper: mcp-telegram server.ts not found at $MCP_SERVER_PATH — install.sh out of date?" >&2
   exit 1
@@ -197,6 +203,7 @@ main_loop() {
   local delay=0
   while true; do
     local args=(--mcp-config "$MCP_CFG" --strict-mcp-config --dangerously-skip-permissions)
+    [[ -f "$BOT_HOOKS_PATH" ]] && args+=(--settings "$BOT_HOOKS_PATH")
     [[ -n "$append_prompt" ]] && args+=(--append-system-prompt "$append_prompt")
     local flag
     flag=$(session_arg_flag "$PROJECT_PATH" "$SESSION_UUID")
