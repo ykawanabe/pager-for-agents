@@ -815,6 +815,25 @@ async function handleHelp(msg: TgMessage): Promise<void> {
   );
 }
 
+// Claude Code's own slash commands that open modal UI, terminate the
+// session, or otherwise produce no chat reply. If we forward these to the
+// claude tmux pane, they either get stuck on a modal that swallows
+// subsequent input or silently change session state. Intercept here and
+// tell the user. Unknown `/foo` not in this set still falls through —
+// that's how user skills (e.g. `/qa`, `/codex`) work over Telegram.
+const CLAUDE_BUILTIN_BLOCKLIST = new Set([
+  "/status", "/config", "/agents", "/permissions", "/model",
+  "/output-style", "/init", "/clear",
+  "/exit", "/quit", "/logout", "/login",
+]);
+
+async function handleClaudeBuiltin(msg: TgMessage, command: string): Promise<void> {
+  await reply(
+    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    `\`${command}\` is a Claude Code local UI command and can't run over Telegram. Use the bot's commands (\`/help\`) or send any message to talk to Claude.`,
+  );
+}
+
 /**
  * Attempt to handle a message as an in-chat command. Returns true if the
  * message was consumed by command handling (so normal tmux dispatch should
@@ -823,7 +842,8 @@ async function handleHelp(msg: TgMessage): Promise<void> {
  * Pre-pair: only /pair is accepted from any chat. Everything else returns
  * false (which then drops because there's no MAIN_CHAT_ID yet).
  * Post-pair: only the paired user_id gets commands honored; others fall
- * through. Unknown /commands also fall through (claude can handle them).
+ * through. Unknown /commands also fall through (claude can handle them)
+ * except for the blocklist of UI-only built-ins.
  */
 async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
   const text = msg.text ?? "";
@@ -857,7 +877,12 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
     case "/unmount": await handleUnmount(msg); return true;
     case "/list":  await handleList(msg); return true;
     case "/help":  await handleHelp(msg); return true;
-    default: return false; // unknown /x → let claude see it
+    default:
+      if (CLAUDE_BUILTIN_BLOCKLIST.has(command)) {
+        await handleClaudeBuiltin(msg, command);
+        return true;
+      }
+      return false; // unknown /x → let claude see it (user skills etc.)
   }
 }
 

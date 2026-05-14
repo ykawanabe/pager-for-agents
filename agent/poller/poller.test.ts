@@ -440,3 +440,59 @@ describe("typing + ack reaction (UX signals)", () => {
     expect(() => poller.refreshAckReactionIfChanged()).not.toThrow();
   });
 });
+
+describe("claude built-in interception (post-pair)", () => {
+  function pair(opts?: { chat_id?: number; user_id?: number }): void {
+    const state: poller.PairedState = {
+      version: 1,
+      chat_id: opts?.chat_id ?? -1001,
+      user_id: opts?.user_id ?? 99,
+      paired_at: new Date().toISOString(),
+    };
+    writeFileSync(PAIRED_STATE_FILE, JSON.stringify(state, null, 2));
+    poller.refreshPairedIfChanged();
+  }
+
+  beforeEach(() => { sent.length = 0; });
+
+  test("/status is intercepted with explanation, NOT passed to claude", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/status", chat_id: -1001, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0].text.toLowerCase()).toContain("local ui");
+    expect(sent[0].text).toContain("/status");
+  });
+
+  test("/clear, /model, /agents are all intercepted", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    for (const cmd of ["/clear", "/model", "/agents"]) {
+      sent.length = 0;
+      const handled = await poller.tryHandleCommand(
+        msg({ text: cmd, chat_id: -1001, from_id: 99 }),
+      );
+      expect(handled).toBe(true);
+      expect(sent.length).toBe(1);
+    }
+  });
+
+  test("unknown /skill (not blocklisted) falls through to claude", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/qa run smoke", chat_id: -1001, from_id: 99 }),
+    );
+    expect(handled).toBe(false); // claude dispatches
+    expect(sent.length).toBe(0); // no bot reply
+  });
+
+  test("@-suffixed built-in (/status@MyBot) is still intercepted", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/status@MyBot", chat_id: -1001, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+  });
+});
