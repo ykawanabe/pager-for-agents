@@ -10,8 +10,8 @@ Thanks for your interest. This project is small and opinionated; here's how to l
 ## Local development
 
 ```sh
-git clone https://github.com/ykawanabe/claude-telegram-agent.git
-cd claude-telegram-agent
+git clone https://github.com/ykawanabe/pager-for-agents.git
+cd pager-for-agents
 shellcheck install.sh uninstall.sh scripts/*.sh
 bash -n install.sh        # syntax check
 ./install.sh              # run on your own machine

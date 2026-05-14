@@ -1,6 +1,6 @@
 # Claude Pager
 
-A tiny menu bar app for macOS that shows whether your [Claude Code Telegram bot](https://github.com/ykawanabe/claude-telegram-agent) is alive — at a glance, all the time.
+A tiny menu bar app for macOS that shows whether your [Claude Code Telegram bot](https://github.com/ykawanabe/pager-for-agents) is alive — at a glance, all the time.
 
 Sits in the menu bar as a paperplane icon:
 
@@ -14,7 +14,7 @@ Click the icon for details, a one-tap "Watch bot live" terminal, and a Settings�
 
 ## Companion project
 
-This is the GUI half of a pair. The CLI half — the actual launchd-managed bot — lives at [ykawanabe/claude-telegram-agent](https://github.com/ykawanabe/claude-telegram-agent). Install that first.
+This is the GUI half of a pair. The CLI half — the actual launchd-managed bot — lives at [ykawanabe/pager-for-agents](https://github.com/ykawanabe/pager-for-agents). Install that first.
 
 ## Requirements
 
@@ -25,8 +25,8 @@ This is the GUI half of a pair. The CLI half — the actual launchd-managed bot 
 ## Install
 
 ```sh
-git clone https://github.com/ykawanabe/claude-telegram-agent.git
-cd claude-telegram-agent/pager
+git clone https://github.com/ykawanabe/pager-for-agents.git
+cd pager-for-agents/pager
 ./install.sh
 ```
 
@@ -70,7 +70,7 @@ The bot runs Claude Code with `--dangerously-skip-permissions`. Anyone who can D
 - Stores the bot token at mode 600 in `~/.claude/channels/telegram/`.
 - Provides a UI for setting the allowlist so you don't forget.
 
-That's the extent of the security model. The threat is the bot itself — see the companion project's [SECURITY.md](https://github.com/ykawanabe/claude-telegram-agent/blob/main/SECURITY.md).
+That's the extent of the security model. The threat is the bot itself — see the companion project's [SECURITY.md](https://github.com/ykawanabe/pager-for-agents/blob/main/SECURITY.md).
 
 ## Development
 
@@ -94,7 +94,7 @@ Removes the binary, plist, and unloads the agent. Logs at `~/Library/Logs/claude
 
 ## Distribution
 
-Pre-built binaries are ad-hoc signed for distribution. Download the latest `.zip` from [Releases](https://github.com/ykawanabe/claude-telegram-agent/releases/latest). On first launch, right-click the app → Open to bypass Gatekeeper once.
+Pre-built binaries are ad-hoc signed for distribution. Download the latest `.zip` from [Releases](https://github.com/ykawanabe/pager-for-agents/releases/latest). On first launch, right-click the app → Open to bypass Gatekeeper once.
 
 If you run an unsigned dev build (via `swift run` or unsigned `./install.sh`), Gatekeeper may complain on first launch. Right-click the binary → Open → Confirm.
 

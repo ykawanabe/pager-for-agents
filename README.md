@@ -1,6 +1,6 @@
-# claude-telegram-agent
+# Claude Pager
 
-Run [Claude Code](https://code.claude.com/) as a persistent Telegram agent on macOS — survives crashes, network blips, and reboots.
+Use [Claude Code](https://code.claude.com/) from your phone, through the chat apps you already have. A local CLI bridges your chat app to Claude Code on your Mac, and a tiny menu bar app sits on top to drive it. Currently Telegram only. Nothing goes through a third-party server — the bridge runs locally, and survives crashes, network blips, and reboots.
 
 `install.sh` wires together three things:
 
@@ -23,8 +23,8 @@ It also (optionally) provisions the bot token and allowlist at the canonical loc
 ## Install
 
 ```sh
-git clone https://github.com/ykawanabe/claude-telegram-agent.git
-cd claude-telegram-agent
+git clone https://github.com/ykawanabe/pager-for-agents.git
+cd pager-for-agents
 chmod +x install.sh
 ./install.sh                  # interactive: also offers to install Pager
 # or:

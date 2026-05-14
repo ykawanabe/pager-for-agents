@@ -3,24 +3,24 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>claude-telegram-agent — Claude Code, from Telegram</title>
+    <title>Claude Pager — Claude Code, anywhere you have a phone.</title>
     <meta
       name="description"
-      content="A macOS-native bot that lets you talk to Claude Code over Telegram. Per-topic projects, host-side pairing, MCP-driven outbound. No cloud relay."
+      content="A tiny macOS menu bar app that puts your Claude Code on your phone. Currently via Telegram. No cloud relay."
     />
     <meta name="theme-color" content="#0a0a0c" />
-    <link rel="canonical" href="https://claude-telegram-agent.dev/" />
+    <link rel="canonical" href="https://yusukekawanabe.com/pager-for-agents/" />
 
-    <meta property="og:title" content="claude-telegram-agent" />
+    <meta property="og:title" content="Claude Pager" />
     <meta
       property="og:description"
-      content="Talk to Claude Code from Telegram. Per-topic projects, MCP-driven, macOS-native."
+      content="Claude Code, anywhere you have a phone. Currently via Telegram. macOS, no cloud relay."
     />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://claude-telegram-agent.dev/" />
-    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:url" content="https://yusukekawanabe.com/pager-for-agents/" />
+    <meta name="twitter:card" content="summary" />
 
-    <link rel="stylesheet" href="./site.css?v=1" />
+    <link rel="stylesheet" href="./site.css?v=3" />
   </head>
   <body>
     <div class="aurora" aria-hidden="true">
@@ -31,28 +31,28 @@
     </div>
 
     <header class="masthead">
-      <a class="brand" href="./" aria-label="claude-telegram-agent">
-        <span class="logo" aria-hidden="true">✱</span>
-        <span class="wordmark">claude-telegram-agent</span>
+      <a class="brand" href="./" aria-label="Claude Pager">
+        <span class="wordmark">Claude Pager</span>
       </a>
       <nav class="nav" aria-label="Primary">
-        <a href="https://github.com/ykawanabe/claude-telegram-agent#install">Docs</a>
-        <a href="https://github.com/ykawanabe/claude-telegram-agent">Source</a>
-        <a class="btn primary" href="https://github.com/ykawanabe/claude-telegram-agent/releases/latest">Download</a>
+        <a href="https://github.com/ykawanabe/pager-for-agents#install">Docs</a>
+        <a href="https://github.com/ykawanabe/pager-for-agents">Source</a>
+        <a class="btn primary" href="https://github.com/ykawanabe/pager-for-agents/releases/latest">Download</a>
       </nav>
     </header>
 
     <main>
       <section class="lede">
-        <h1>Talk to Claude Code <span class="grad">from Telegram.</span></h1>
+        <h1>Claude Code, <span class="grad">anywhere you have a phone.</span></h1>
         <p class="dek">
-          A tiny macOS-native bot that turns Telegram into a real terminal for Claude Code.
-          Per-topic projects, in-chat pairing, MCP outbound — no cloud relay, your Mac stays the trust boundary.
+          Use Claude Code from your phone through the chat apps you already have.
+          The bridge runs locally on your Mac, so nothing goes through a third-party server.
+          Currently Telegram only.
         </p>
         <div class="actions">
-          <a class="btn primary lg" href="https://github.com/ykawanabe/claude-telegram-agent#install">Install on macOS</a>
+          <a class="btn primary lg" href="https://github.com/ykawanabe/pager-for-agents/releases/latest">Download for macOS</a>
           <div class="brew" role="group" aria-label="Quick install command">
-            <code id="install-cmd">git clone https://github.com/ykawanabe/claude-telegram-agent &amp;&amp; cd claude-telegram-agent &amp;&amp; ./install.sh</code>
+            <code id="install-cmd">git clone https://github.com/ykawanabe/pager-for-agents &amp;&amp; cd pager-for-agents &amp;&amp; ./install.sh</code>
             <button class="brew-copy" type="button" aria-label="Copy to clipboard" title="Copy">
               <svg class="ic" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="5" y="5" width="9" height="9" rx="1.5" />
@@ -67,86 +67,44 @@
         <p class="fineprint">Free &amp; open source · macOS 14+ · Bring your own Claude Code, bun, tmux</p>
       </section>
 
-      <section class="showcase">
-        <figure class="shot">
-          <img src="./screenshot.png" alt="Telegram conversation with the bot in a forum topic, plus the macOS menu bar showing Claude Pager's status." onerror="this.style.display='none'" />
-        </figure>
-        <div class="features">
-          <article>
-            <h3>Per-topic project routing</h3>
-            <p>Every Telegram forum topic gets its own Claude Code session pinned to a Mac directory. Switch topics, switch projects — no shared context bleed.</p>
-          </article>
-          <article>
-            <h3>In-chat pairing, host-side trust</h3>
-            <p>Pairing code lives on your Mac; the bot only listens to chats you've claimed. <code>/pair</code> in a new chat (as the paired user) switches in one step — no terminal needed.</p>
-          </article>
-          <article>
-            <h3>MCP-driven outbound</h3>
-            <p>Claude replies via the <code>send_telegram</code> MCP tool, with the chat/thread pinned at spawn time. The bot can't redirect outbound to chats you didn't authorize.</p>
-          </article>
-          <article>
-            <h3>Pager menu bar app</h3>
-            <p>Companion macOS app with status, diagnostics, pairing UI, and per-topic path management. Sleep prevention, live log attach, one-click bot restart.</p>
-          </article>
-        </div>
-      </section>
-
       <section class="detail">
         <article class="block">
           <h3>How it works</h3>
           <p>
-            Add the bot to any chat → it asks you to send <code>/pair YOUR-CODE</code> → that chat is paired to you. Then send any message:
-            the poller (long-poll <code>getUpdates</code>) dispatches to a per-topic tmux session running <code>claude</code> with an
-            <code>--mcp-config</code> that lets it reply via Telegram. All state lives in <code>~/.claude-telegram-agent/</code>.
+            Install it on your Mac, pair a Telegram chat, and start messaging Claude.
+            The CLI does the actual work; the menu bar app is just there to make it easier to run.
           </p>
         </article>
         <article class="block">
-          <h3>Privacy</h3>
+          <h3>Per-topic projects</h3>
           <p>
-            No cloud relay. Your bot token, allowlist, mounts, and paired state live in <code>~/.claude/channels/telegram/</code> and
-            <code>~/.claude-telegram-agent/</code> at mode 600. Telegram talks to your Mac directly. No third-party server in the path.
+            Each Telegram forum topic is pinned to a directory on your Mac, with its own Claude Code session running against that project.
+            Switching topics in Telegram switches projects on the Mac.
           </p>
         </article>
         <article class="block">
-          <h3>Security</h3>
+          <h3>Runs on your Mac</h3>
           <p>
-            The bot runs Claude Code with <code>--dangerously-skip-permissions</code>: every tool call is auto-approved. Anyone allowed by
-            your access policy has the same capabilities as Claude on your machine. Use the allowlist; treat the host as trusted; don't share
-            the bot token.
+            Everything lives on your Mac: the bot token, the allowlist, the paired chats. Claude runs with permissions skipped,
+            so any chat you let through effectively has a shell on your machine. Treat the allowlist accordingly.
           </p>
         </article>
         <article class="block">
           <h3>Requirements</h3>
           <p>
-            macOS 14+, Claude Code v2.1.80+, bun, tmux, a Telegram bot token from
-            <a href="https://t.me/BotFather">@BotFather</a>, your numeric Telegram user ID from
+            macOS 14 or newer, Claude Code 2.1.80+, plus <code>bun</code>, <code>tmux</code>, a bot token from
+            <a href="https://t.me/BotFather">@BotFather</a>, and your Telegram user ID from
             <a href="https://t.me/userinfobot">@userinfobot</a>.
           </p>
         </article>
-      </section>
-
-      <section class="companion">
-        <header class="section-head">
-          <h2>Claude Pager</h2>
-          <p>The companion macOS menu bar app for managing the bot without leaving your Mac.</p>
-        </header>
-        <ul class="grid pager-features">
-          <li><strong>Pairing</strong><br/>See paired chat, copy pair code, unpair in two clicks.</li>
-          <li><strong>Mounts</strong><br/>Per-topic path picker. Topic names auto-fill when the bot sees them.</li>
-          <li><strong>Diagnostics</strong><br/>One-click health check across LaunchAgent, processes, tmux, MCP.</li>
-          <li><strong>Live view</strong><br/>Attach to the active topic conversation or the poller routing log.</li>
-        </ul>
-        <p class="cta-row">
-          <a class="btn primary" href="https://github.com/ykawanabe/claude-telegram-agent/releases/latest">Download Claude Pager →</a>
-        </p>
       </section>
     </main>
 
     <footer class="foot">
       <p>
         Built by <a href="https://github.com/ykawanabe">Yusuke Kawanabe</a> ·
-        <a href="https://github.com/ykawanabe/claude-telegram-agent/blob/main/CHANGELOG.md">Changelog</a> ·
-        <a href="https://github.com/ykawanabe/claude-telegram-agent/blob/main/LICENSE">MIT</a>
+        <a href="https://github.com/ykawanabe/pager-for-agents/blob/main/CHANGELOG.md">Changelog</a> ·
+        <a href="https://github.com/ykawanabe/pager-for-agents/blob/main/LICENSE">MIT</a>
       </p>
     </footer>
 

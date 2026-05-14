@@ -10,8 +10,8 @@ Thanks for your interest. This is a small SwiftUI menu bar utility.
 ## Local development
 
 ```sh
-git clone https://github.com/ykawanabe/claude-telegram-agent.git
-cd claude-telegram-agent/pager
+git clone https://github.com/ykawanabe/pager-for-agents.git
+cd pager-for-agents/pager
 swift build
 swift run ClaudePager   # debug build, runs in foreground; Ctrl-C to quit
 ```

@@ -16,7 +16,7 @@ It does NOT:
 
 ## Threat model
 
-The interesting attack surface is the **bot the app monitors**, not the app itself — see the companion project's [SECURITY.md](https://github.com/ykawanabe/claude-telegram-agent/blob/main/SECURITY.md) for the real threat model. The bot runs Claude Code with `--dangerously-skip-permissions`, so anyone who can DM the bot has shell-level access to your Mac.
+The interesting attack surface is the **bot the app monitors**, not the app itself — see the companion project's [SECURITY.md](https://github.com/ykawanabe/pager-for-agents/blob/main/SECURITY.md) for the real threat model. The bot runs Claude Code with `--dangerously-skip-permissions`, so anyone who can DM the bot has shell-level access to your Mac.
 
 Specific to this app:
 

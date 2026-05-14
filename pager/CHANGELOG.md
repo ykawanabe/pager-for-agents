@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.1.0] - 2026-05-12
 
-First tagged release. Pairs with [claude-telegram-agent v0.1.0](https://github.com/ykawanabe/claude-telegram-agent/releases/tag/v0.1.0).
+First tagged release. Pairs with [claude-telegram-agent v0.1.0](https://github.com/ykawanabe/pager-for-agents/releases/tag/v0.1.0).
 
 ### Added
 - SwiftUI menu bar app (`MenuBarExtra`) with three states: `paperplane.fill` (healthy) / `paperplane` (degraded) / `exclamationmark.triangle.fill` (offline).
