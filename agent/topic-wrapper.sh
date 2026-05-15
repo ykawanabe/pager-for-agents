@@ -197,6 +197,13 @@ compute_next_delay() {
 main_loop() {
   cd "$PROJECT_PATH" || { echo "topic-wrapper: cd to PROJECT_PATH=$PROJECT_PATH failed" >&2; exit 1; }
 
+  # Export the chat/thread targets so claude's hook subprocesses (PreCompact /
+  # PostCompact / Notification — see bot-hooks.json) can curl Bot API back to
+  # the right chat. The --mcp-config "env" map only scopes to the mcp-telegram
+  # process; hook scripts inherit claude's env, not the MCP server's.
+  export TELEGRAM_CHAT_ID="$MAIN_CHAT_ID"
+  export TELEGRAM_THREAD_ID="$THREAD_ID"
+
   local append_prompt
   append_prompt=$(resolve_append_prompt "${BOT_APPEND_SYSTEM_PROMPT:-}" "$DEFAULT_BOT_APPEND_SYSTEM_PROMPT")
 

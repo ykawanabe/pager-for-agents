@@ -147,7 +147,10 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   mkdir -p "$HOOKS_DIR"
   cp "$REPO_DIR/agent/hooks/pager-notify.sh" "$HOOKS_DIR/pager-notify.sh"
   chmod +x "$HOOKS_DIR/pager-notify.sh"
-  cp "$REPO_DIR/agent/bot-hooks.json" "$AGENT_DIR/../bot-hooks.json"
+  # Substitute $HOME → absolute path at install time. Claude Code's --settings
+  # treats hook "command" strings as literal shell paths; it does NOT expand
+  # env vars, so a literal "$HOME/..." path fails to spawn the hook.
+  sed "s|\$HOME|$HOME|g" "$REPO_DIR/agent/bot-hooks.json" > "$AGENT_DIR/../bot-hooks.json"
 
   # Resolve mcp-telegram's runtime deps (the SDK). Poller has no deps but
   # `bun install` is a cheap no-op there. If bun is missing, warn and skip

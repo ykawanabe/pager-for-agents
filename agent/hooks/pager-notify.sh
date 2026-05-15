@@ -50,9 +50,7 @@ except Exception:
 
 case "$EVENT" in
   precompact)
-    matcher=$(extract matcher)
-    [[ -z "$matcher" ]] && matcher="auto"
-    TEXT="💭 Compacting context ($matcher) — this may take a moment."
+    TEXT="💭 Compacting context — this may take a moment."
     ;;
   postcompact)
     TEXT="✓ Compaction done — continuing."
