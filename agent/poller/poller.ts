@@ -381,8 +381,31 @@ interface TgChatMemberUpdated {
 interface TgCallbackQuery {
   id: string;
   from: { id: number; first_name?: string };
-  message?: { chat: { id: number }; message_id: number };
+  message?: { chat: { id: number }; message_id: number; message_thread_id?: number; text?: string };
   data?: string;
+}
+
+/**
+ * Edit a sent message's text in-place. Per Telegram Bot API semantics, omitting
+ * reply_markup also drops any inline keyboard attached to the original — so
+ * one call covers "append the user's choice + remove the buttons" for a
+ * send_telegram(buttons=...) prompt the user just answered. Best-effort: if
+ * the edit fails, the worst outcome is a stale button — not a delivery loss.
+ */
+async function editMessageText(
+  chat_id: number,
+  message_id: number,
+  text: string,
+): Promise<void> {
+  try {
+    await fetch(`${getApiBase()}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id, message_id, text }),
+    });
+  } catch (e) {
+    process.stderr.write(`poller: editMessageText failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
 }
 
 async function sendInlineKeyboard(
@@ -486,6 +509,44 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
 
 export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
   if (!cb.data) { await answerCallback(cb.id); return; }
+
+  // Inline-keyboard answer to a send_telegram(buttons=...) prompt. callback_data
+  // shape: `ans:<thread_id>:<label>` (thread_id is "dm" or a numeric forum
+  // topic). We synthesize a TgMessage carrying the label and route it through
+  // the normal dispatch path — claude sees it exactly as if the user had typed
+  // the option text. The paired-user check matches the same enforcement
+  // routeMessage applies to typed messages.
+  if (cb.data.startsWith("ans:")) {
+    if (!pairedCache || cb.from.id !== pairedCache.user_id) {
+      await answerCallback(cb.id, "Only the paired user can answer.", true);
+      return;
+    }
+    if (!cb.message) { await answerCallback(cb.id); return; }
+    const rest = cb.data.slice(4);
+    const colonIdx = rest.indexOf(":");
+    if (colonIdx < 0) { await answerCallback(cb.id); return; }
+    const tidStr = rest.slice(0, colonIdx);
+    const label = rest.slice(colonIdx + 1);
+    const thread_id = tidStr === "dm" ? undefined : Number(tidStr);
+    await answerCallback(cb.id);
+    // Immediate visual ack: append the chosen label to the original prompt
+    // and drop the inline keyboard (one editMessageText call does both per
+    // Bot API semantics). User sees "↳ <choice>" the instant they tap, even
+    // while claude is still composing a reply.
+    const originalText = cb.message.text ?? "";
+    void editMessageText(cb.message.chat.id, cb.message.message_id, `${originalText}\n\n↳ ${label}`);
+    await dispatchUpdate({
+      update_id: 0,
+      message: {
+        message_id: cb.message.message_id,
+        from: { id: cb.from.id },
+        chat: { id: cb.message.chat.id },
+        message_thread_id: thread_id,
+        text: label,
+      },
+    });
+    return;
+  }
 
   // Pending pair expired or never set → tell the user and ack the callback.
   if (!pendingPair || pendingPair.expires_at < Date.now()) {

@@ -72,6 +72,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             enum: ["MarkdownV2", "HTML"],
             description: "Optional. Omit for plain text (recommended).",
           },
+          buttons: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Optional. Render up to 8 inline-keyboard buttons (one per row) " +
+              "for the user to tap on Telegram. The chosen label is dispatched " +
+              "back as if the user typed it — so the next turn proceeds normally. " +
+              "Use this when offering a choice (Yes/No, A/B/C) instead of asking " +
+              "the user to type free-form. Each label ≤50 chars.",
+          },
         },
         required: ["text"],
       },
@@ -83,7 +93,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name !== "send_telegram") {
     return { content: [{ type: "text", text: `unknown tool: ${req.params.name}` }], isError: true };
   }
-  const args = (req.params.arguments ?? {}) as { text?: string; parse_mode?: ParseMode };
+  const args = (req.params.arguments ?? {}) as { text?: string; parse_mode?: ParseMode; buttons?: unknown };
   if (typeof args.text !== "string" || args.text.length === 0) {
     return { content: [{ type: "text", text: "text is required and must be non-empty" }], isError: true };
   }
@@ -96,6 +106,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     body.message_thread_id = Number(THREAD_ID);
   }
   if (args.parse_mode) body.parse_mode = args.parse_mode;
+
+  // Inline-keyboard buttons. callback_data encodes the thread context + label
+  // so the poller can dispatch the tap back into the right tmux topic as if
+  // the user had typed the label. callback_data is capped at 64 bytes by the
+  // Bot API, so we trim aggressively (`ans:<tid>:<label>`).
+  if (Array.isArray(args.buttons) && args.buttons.length > 0) {
+    const tid = THREAD_ID && THREAD_ID !== "dm" && !Number.isNaN(Number(THREAD_ID)) ? THREAD_ID : "dm";
+    const rows = args.buttons.slice(0, 8).map((raw) => {
+      const label = String(raw).slice(0, 50);
+      return [{ text: label, callback_data: `ans:${tid}:${label}` }];
+    });
+    body.reply_markup = { inline_keyboard: rows };
+  }
 
   try {
     const resp = await fetch(`${API_BASE}/sendMessage`, {
