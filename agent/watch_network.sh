@@ -31,8 +31,10 @@ MCP_FAILURE_THRESHOLD=3
 # own first loop iteration before we start enforcing "session must exist."
 WATCHDOG_STARTUP_GRACE_SECS=60
 
+STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
+
 load_env() {
-  local env_file="$HOME/.claude-telegram-agent/.env"
+  local env_file="$STATE_DIR/.env"
   if [[ ! -f "$env_file" ]]; then
     echo "Missing $env_file — run install.sh first." >&2
     exit 1
@@ -51,7 +53,7 @@ kick_claude_session() {
   tmux new-session -d -s "$TMUX_SESSION_CLAUDE" "$HOME/.local/bin/restart_claude.sh" || true
   # Re-attach pipe-pane so the recreated session's output keeps landing in
   # the activity log; otherwise the log goes silent after the first kick.
-  tmux pipe-pane -t "$TMUX_SESSION_CLAUDE" -o "cat >> $HOME/.claude-telegram-agent/agent.log" || true
+  tmux pipe-pane -t "$TMUX_SESSION_CLAUDE" -o "cat >> $STATE_DIR/agent.log" || true
   # Verify: silent failures here used to leave the user with a dead bot and
   # a log line that lied about success. Return non-zero so callers can see
   # the failure (and so the test can assert against it).
@@ -128,8 +130,8 @@ main_loop() {
         # own getUpdates poller, which fights ours and silently drops messages
         # (409 Conflict). Just ping the poller's heartbeat; if it's dead,
         # launchd respawns start_agents.sh via the LaunchAgent's KeepAlive.
-        if [[ -f "$HOME/.claude-telegram-agent/heartbeat-poller" ]]; then
-          local hb_age=$(( $(date +%s) - $(stat -f %m "$HOME/.claude-telegram-agent/heartbeat-poller" 2>/dev/null || echo 0) ))
+        if [[ -f "$STATE_DIR/heartbeat-poller" ]]; then
+          local hb_age=$(( $(date +%s) - $(stat -f %m "$STATE_DIR/heartbeat-poller" 2>/dev/null || echo 0) ))
           if [[ "$hb_age" -gt 120 ]]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat stale (${hb_age}s)"
           else

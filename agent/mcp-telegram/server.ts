@@ -26,8 +26,8 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { unlinkSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { typingDir } from "../lib/paths";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -35,7 +35,7 @@ const THREAD_ID = process.env.TELEGRAM_THREAD_ID; // optional
 // Must match the poller's STATE_DIR resolution so the typing-keepalive marker
 // path lines up. Wrapper passes CTA_STATE_DIR through to keep them in sync
 // even when the operator overrides it.
-const STATE_DIR = process.env.CTA_STATE_DIR ?? join(homedir(), ".claude-telegram-agent");
+const TYPING_DIR = typingDir();
 
 if (!TOKEN || !CHAT_ID) {
   // Don't `throw` at top level — the MCP transport hasn't initialized yet,
@@ -62,7 +62,7 @@ const API_BASE = process.env.TELEGRAM_API_BASE ?? `https://api.telegram.org/bot$
 function clearTypingMarker(): void {
   const t = THREAD_ID && THREAD_ID !== "dm" && !Number.isNaN(Number(THREAD_ID)) ? THREAD_ID : "dm";
   try {
-    unlinkSync(join(STATE_DIR, "typing", `${CHAT_ID}__${t}.token`));
+    unlinkSync(join(TYPING_DIR, `${CHAT_ID}__${t}.token`));
   } catch {
     // Marker may not exist (e.g. mcp-telegram invoked outside the poller
     // path, or already cleared by a previous reply this turn). Either way,
