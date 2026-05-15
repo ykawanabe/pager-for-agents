@@ -25,10 +25,17 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const THREAD_ID = process.env.TELEGRAM_THREAD_ID; // optional
+// Must match the poller's STATE_DIR resolution so the typing-keepalive marker
+// path lines up. Wrapper passes CTA_STATE_DIR through to keep them in sync
+// even when the operator overrides it.
+const STATE_DIR = process.env.CTA_STATE_DIR ?? join(homedir(), ".claude-telegram-agent");
 
 if (!TOKEN || !CHAT_ID) {
   // Don't `throw` at top level — the MCP transport hasn't initialized yet,
@@ -44,6 +51,24 @@ if (!TOKEN || !CHAT_ID) {
 // local mock server (tests/mock-bot-api.ts). Without it, every test would
 // either hit real Telegram or silently no-op when the mock isn't reached.
 const API_BASE = process.env.TELEGRAM_API_BASE ?? `https://api.telegram.org/bot${TOKEN}`;
+
+/**
+ * Clear the poller's "typing in progress" marker for this target. The poller
+ * writes $STATE_DIR/typing/<chat>__<thread_or_dm>.token at dispatch and runs
+ * a keepalive loop that stops when the file disappears. Removing it here
+ * ends the bubble the instant claude's reply hits Telegram. Best-effort — a
+ * stale marker just lets the loop run to its hard cap.
+ */
+function clearTypingMarker(): void {
+  const t = THREAD_ID && THREAD_ID !== "dm" && !Number.isNaN(Number(THREAD_ID)) ? THREAD_ID : "dm";
+  try {
+    unlinkSync(join(STATE_DIR, "typing", `${CHAT_ID}__${t}.token`));
+  } catch {
+    // Marker may not exist (e.g. mcp-telegram invoked outside the poller
+    // path, or already cleared by a previous reply this turn). Either way,
+    // nothing to do.
+  }
+}
 
 type ParseMode = "MarkdownV2" | "HTML";
 
@@ -130,6 +155,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (!json.ok) {
       return { content: [{ type: "text", text: `Telegram API error: ${json.description ?? "(no description)"}` }], isError: true };
     }
+    clearTypingMarker();
     return { content: [{ type: "text", text: `sent: message_id=${json.result?.message_id}` }] };
   } catch (e) {
     return { content: [{ type: "text", text: `send_telegram failed: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
