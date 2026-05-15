@@ -92,7 +92,7 @@ resolve_append_prompt() {
 }
 
 load_env_and_chdir() {
-  local env_file="$HOME/.claude-telegram-agent/.env"
+  local env_file="${CTA_STATE_DIR:-$HOME/.pager}/.env"
   if [[ ! -f "$env_file" ]]; then
     echo "Missing $env_file — run install.sh first." >&2
     exit 1

@@ -8,7 +8,7 @@
 # Responsibilities:
 #   1. cd into the topic's project dir.
 #   2. Pin / read the per-topic session UUID at
-#      ~/.claude-telegram-agent/sessions/<thread_id>.
+#      ${CTA_STATE_DIR:-~/.pager}/sessions/<thread_id>.
 #   3. Build the --mcp-config JSON that wires mcp-telegram with the right
 #      chat_id + thread_id pinned at spawn time (so claude itself can't
 #      redirect outbound).
@@ -46,7 +46,12 @@ fi
 
 # ─── load env ────────────────────────────────────────────────────────────────
 
-AGENT_ENV="$HOME/.claude-telegram-agent/.env"
+# State + install dirs honor env overrides so tests and operator customization
+# can redirect them. Defaults match agent/lib/paths.ts.
+STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
+INSTALL_DIR="${CTA_INSTALL_DIR:-$HOME/.local/share/pager}"
+
+AGENT_ENV="$STATE_DIR/.env"
 PLUGIN_ENV="$HOME/.claude/channels/telegram/.env"
 
 if [[ ! -f "$AGENT_ENV" ]]; then
@@ -63,7 +68,7 @@ set +a
 # DM → group). MCP outbound then sends replies to the dead chat and the user
 # sees silence. paired.json is the live source of truth; .env is a fallback
 # for unpaired / pre-Phase-3 setups.
-PAIRED_FILE="$HOME/.claude-telegram-agent/paired.json"
+PAIRED_FILE="$STATE_DIR/paired.json"
 if [[ -f "$PAIRED_FILE" ]]; then
   PAIRED_CHAT_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["chat_id"])' "$PAIRED_FILE" 2>/dev/null || true)
   if [[ -n "$PAIRED_CHAT_ID" ]]; then
@@ -88,11 +93,10 @@ if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
 fi
 
 # ─── per-topic session UUID ──────────────────────────────────────────────────
-# Pin location: ~/.claude-telegram-agent/sessions/<thread_id>. Living outside
-# the project dir means user-mounted directories that aren't git repos don't
-# get random dotfiles. cta umount can delete it explicitly; cta mount creates
-# it.
-SESSIONS_DIR="$HOME/.claude-telegram-agent/sessions"
+# Pin location: $STATE_DIR/sessions/<thread_id>. Living outside the project
+# dir means user-mounted directories that aren't git repos don't get random
+# dotfiles. cta umount can delete it explicitly; cta mount creates it.
+SESSIONS_DIR="$STATE_DIR/sessions"
 SESSION_FILE="$SESSIONS_DIR/$THREAD_ID"
 mkdir -p "$SESSIONS_DIR"
 chmod 700 "$SESSIONS_DIR" 2>/dev/null || true
@@ -108,13 +112,13 @@ SESSION_UUID=$(cat "$SESSION_FILE")
 # We use Python (always present on macOS) to escape correctly — json.dumps
 # avoids hand-quoting hell when the user's project path contains spaces or
 # special characters.
-MCP_SERVER_PATH="${TOPIC_WRAPPER_MCP_PATH:-$HOME/.local/share/claude-telegram-agent/agent/mcp-telegram/server.ts}"
+MCP_SERVER_PATH="${TOPIC_WRAPPER_MCP_PATH:-$INSTALL_DIR/agent/mcp-telegram/server.ts}"
 
 # Bot-scoped Claude Code settings file containing PreCompact / PostCompact /
 # Notification hooks that push status to Telegram (so compaction and idle
 # waits don't read as "bot died"). Passed via --settings so it only affects
 # bot-spawned claude sessions, not the user's desktop Claude Code.
-BOT_HOOKS_PATH="${TOPIC_WRAPPER_HOOKS_PATH:-$HOME/.local/share/claude-telegram-agent/bot-hooks.json}"
+BOT_HOOKS_PATH="${TOPIC_WRAPPER_HOOKS_PATH:-$INSTALL_DIR/bot-hooks.json}"
 
 if [[ ! -f "$MCP_SERVER_PATH" ]]; then
   echo "topic-wrapper: mcp-telegram server.ts not found at $MCP_SERVER_PATH — install.sh out of date?" >&2
@@ -124,7 +128,7 @@ fi
 # CTA_STATE_DIR pass-through: mcp-telegram clears the poller's typing-keepalive
 # marker after each reply. Both sides must resolve the same state dir or the
 # bubble keeps re-firing until the hard cap. Defaults match if unset.
-CTA_STATE_DIR_VAL="${CTA_STATE_DIR:-$HOME/.claude-telegram-agent}"
+CTA_STATE_DIR_VAL="$STATE_DIR"
 
 MCP_CFG=$(python3 - "$MCP_SERVER_PATH" "$TELEGRAM_BOT_TOKEN" "$MAIN_CHAT_ID" "$THREAD_ID" "$CTA_STATE_DIR_VAL" <<'PY'
 import json, sys
@@ -162,7 +166,7 @@ When you need the user to choose between a small fixed set of options (Yes/No, A
 
 Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.
 
-You also have access to ~/.claude-telegram-agent/shared-context.md — a cross-session memory file shared with every other Telegram-bot claude session on this host. Read it when the user references prior context, or near the start of substantive conversations. Append durable notes there (user preferences, ongoing concerns, decisions, recurring patterns) so future sessions across other topics/projects benefit. Keep entries short and avoid duplication. Do not log every interaction — only durable signal.
+You also have access to ~/.pager/shared-context.md — a cross-session memory file shared with every other Pager-bot claude session on this host. Read it when the user references prior context, or near the start of substantive conversations. Append durable notes there (user preferences, ongoing concerns, decisions, recurring patterns) so future sessions across other topics/projects benefit. Keep entries short and avoid duplication. Do not log every interaction — only durable signal.
 
 IMPORTANT — Telegram pairing / access is handled by claude-telegram-agent, NOT by the official @claude-plugins-official/telegram plugin. If the user asks about pairing, unpair, allowlist, or access changes, DO NOT invoke skills named `telegram:access`, `telegram:configure`, or anything from `@claude-plugins-official/telegram` — those describe a different system and their advice is incorrect here. Instead:
   - To unpair the current chat: tell the user to send `/unpair confirm` in the Telegram chat, OR to run `cta unpair` in their terminal.
