@@ -17,7 +17,9 @@ umask 077
 # Homebrew location. See cli/cta for the full explanation.
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
 
-ENV_FILE="$HOME/.claude-telegram-agent/.env"
+STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
+INSTALL_DIR="${CTA_INSTALL_DIR:-$HOME/.local/share/pager}"
+ENV_FILE="$STATE_DIR/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing $ENV_FILE — run install.sh first." >&2
   exit 1
@@ -29,7 +31,7 @@ source "$ENV_FILE"
 set +a
 
 BIN_DIR="$HOME/.local/bin"
-LOG_FILE="$HOME/.claude-telegram-agent/agent.log"
+LOG_FILE="$STATE_DIR/agent.log"
 LOG_DIR="$(dirname "$LOG_FILE")"
 LOG_ROTATE_MAX_BYTES=$((10 * 1024 * 1024))  # 10 MB
 LOG_ARCHIVE_RETAIN_DAYS=30
@@ -109,7 +111,7 @@ main_single_topic() {
 # F1+F2 Phase 2 path — one poller + one tmux session per mount entry.
 #
 # Required .env: MAIN_CHAT_ID. Everything else (topics, project paths, tmux
-# session names) is driven by ~/.claude-telegram-agent/mounts.json, which is
+# session names) is driven by $STATE_DIR/mounts.json, which is
 # owned by `cta mount/umount`. Mounts can be added at runtime — the poller
 # hot-reloads on mounts.json mtime; this script spawns the per-topic tmux
 # sessions on (re)start.
@@ -128,7 +130,7 @@ main_multi_topic() {
   # CTA_AGENT_DIR overrides the install location (used by tests). The legacy
   # CTA_SERVICES_DIR env name is honored for back-compat with any operator
   # scripts that pinned it; new code should use CTA_AGENT_DIR.
-  local agent_dir="${CTA_AGENT_DIR:-${CTA_SERVICES_DIR:-$HOME/.local/share/claude-telegram-agent/agent}}"
+  local agent_dir="${CTA_AGENT_DIR:-${CTA_SERVICES_DIR:-$INSTALL_DIR/agent}}"
   local poller_path="$agent_dir/poller/poller.ts"
   local wrapper_path="$agent_dir/topic-wrapper.sh"
   local mount_store_path="$agent_dir/mount-store/mount-store.ts"

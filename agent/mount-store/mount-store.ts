@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * mount-store — read/write helper for ~/.claude-telegram-agent/mounts.json.
+ * mount-store — read/write helper for $STATE_DIR/mounts.json.
  *
  * Phase 2 introduces dynamic topic mounts (replacing Phase 1's HARDCODED_*
  * env vars). This is the single source of truth that:
@@ -14,11 +14,12 @@
  * the writer logic in one language with proper atomic-rename + a portable
  * O_EXCL-based mutex. Bash callers shell out via `bun run mount-store.ts <op>`.
  *
- * Schema (version 1):
+ * Schema (version 2 — current):
  *   {
- *     "version": 1,
+ *     "version": 2,
  *     "mounts": [
  *       {
+ *         "channel": "telegram",
  *         "thread_id": 42,
  *         "path": "~/projects/iron-flow",
  *         "label": "iron-flow",
@@ -27,6 +28,7 @@
  *         "created_at": "2026-05-13T03:14:00.000Z"
  *       },
  *       {
+ *         "channel": "telegram",
  *         "thread_id": "dm",
  *         "path": "~/claude-home",
  *         ...
@@ -34,10 +36,20 @@
  *     ]
  *   }
  *
- * `thread_id` is either a positive integer (forum topic_id) or the string
- * "dm" — DMs are treated as just another mount, no separate `dm_mount_path`
- * field. tmux session name is always `topic-<thread_id>` (so DM lives in
- * `topic-dm`). Keeps poller and cta routing uniform.
+ * Schema v1 (legacy) is the same minus the `channel` field. readMounts
+ * auto-upgrades v1 to v2 in memory by stamping `channel: "telegram"` on
+ * each row; the file is rewritten to v2 only when a mutation occurs.
+ *
+ * `channel` is the messaging platform identifier ("telegram" today; "line",
+ * "discord", etc. when added). Routing keys are scoped per-channel — two
+ * different channels can share the same numeric `thread_id` without
+ * collision. Cache lookup key is `<channel>:<thread_id>`.
+ *
+ * `thread_id` is channel-scoped: for Telegram it's the forum topic_id (or
+ * "dm" sentinel for direct messages, or "*" wildcard for catch-all routing).
+ * For LINE it will be the group_id / user_id string. The tmux session name
+ * is `topic-<thread_id>` by default; collisions across channels are
+ * prevented by also including the channel prefix when needed.
  *
  * Concurrency: every mutating op runs inside `withLock` which O_EXCL-opens
  * MOUNTS_JSON.lock. Readers don't lock — the file is replaced atomically
@@ -61,12 +73,12 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { mountsJson, stateDir } from "../lib/paths";
 
-const STATE_DIR = process.env.CTA_STATE_DIR ?? join(homedir(), ".claude-telegram-agent");
-const MOUNTS_JSON = join(STATE_DIR, "mounts.json");
+const STATE_DIR = stateDir();
+const MOUNTS_JSON = mountsJson();
 const LOCK_FILE = `${MOUNTS_JSON}.lock`;
 const STALE_LOCK_MS = 30_000;
 const LOCK_RETRY_MS = 50;
@@ -84,7 +96,17 @@ const LOCK_RETRY_MAX = 200; // ~10s total
  */
 export type ThreadId = number | "dm" | "*";
 
+/**
+ * Messaging platform identifier. New channels get added here as their
+ * adapters land. The string is namespaced storage-side; downstream code
+ * matches against this exact value.
+ */
+export type Channel = "telegram" | "line";
+
+export const DEFAULT_CHANNEL: Channel = "telegram";
+
 export interface Mount {
+  channel: Channel;
   thread_id: ThreadId;
   path: string;
   label?: string;
@@ -94,11 +116,19 @@ export interface Mount {
 }
 
 export interface MountsFile {
-  version: 1;
+  version: 2;
   mounts: Mount[];
 }
 
-const EMPTY: MountsFile = { version: 1, mounts: [] };
+const EMPTY: MountsFile = { version: 2, mounts: [] };
+
+/**
+ * Cache / lookup key for cross-channel uniqueness. Two channels can share
+ * the same numeric thread_id without colliding (LINE 42 ≠ Telegram 42).
+ */
+export function mountKey(channel: Channel, thread_id: ThreadId): string {
+  return `${channel}:${thread_id}`;
+}
 
 /**
  * Parse a CLI-supplied thread_id into our internal ThreadId type. Accepts
@@ -117,6 +147,10 @@ export function parseThreadId(raw: string): ThreadId {
 
 function threadIdsEqual(a: ThreadId, b: ThreadId): boolean {
   return String(a) === String(b);
+}
+
+function sameTarget(m: Mount, channel: Channel, thread_id: ThreadId): boolean {
+  return m.channel === channel && threadIdsEqual(m.thread_id, thread_id);
 }
 
 // ─── locking ────────────────────────────────────────────────────────────────
@@ -161,18 +195,49 @@ async function withLock<T>(fn: () => Promise<T> | T): Promise<T> {
 
 // ─── read / write ───────────────────────────────────────────────────────────
 
+interface AnyMount {
+  channel?: string;
+  thread_id: ThreadId;
+  path: string;
+  label?: string;
+  session_id: string;
+  tmux_session: string;
+  created_at: string;
+}
+
+interface AnyMountsFile {
+  version: 1 | 2;
+  mounts: AnyMount[];
+}
+
+/**
+ * Read mounts.json and return the v2 in-memory representation, upgrading
+ * v1 on the fly. v1 → v2 maps every row to `channel: "telegram"` (the only
+ * channel that existed in v1). The file on disk is left as v1 until the
+ * next mutation rewrites it; this keeps reads idempotent and avoids
+ * surprise writes from background processes.
+ */
 export function readMounts(): MountsFile {
-  if (!existsSync(MOUNTS_JSON)) return { ...EMPTY };
+  if (!existsSync(MOUNTS_JSON)) return { version: 2, mounts: [] };
   try {
     const raw = readFileSync(MOUNTS_JSON, "utf8");
-    const parsed = JSON.parse(raw) as Partial<MountsFile>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.mounts)) {
+    const parsed = JSON.parse(raw) as Partial<AnyMountsFile>;
+    if (
+      (parsed.version !== 1 && parsed.version !== 2) ||
+      !Array.isArray(parsed.mounts)
+    ) {
       throw new Error("mounts.json: unrecognized schema");
     }
-    return {
-      version: 1,
-      mounts: parsed.mounts as Mount[],
-    };
+    const mounts: Mount[] = (parsed.mounts as AnyMount[]).map((m) => ({
+      channel: (m.channel as Channel) ?? DEFAULT_CHANNEL,
+      thread_id: m.thread_id,
+      path: m.path,
+      label: m.label,
+      session_id: m.session_id,
+      tmux_session: m.tmux_session,
+      created_at: m.created_at,
+    }));
+    return { version: 2, mounts };
   } catch (e) {
     throw new Error(`mounts.json: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -194,6 +259,11 @@ function writeMountsAtomic(data: MountsFile): void {
 // ─── mutations ──────────────────────────────────────────────────────────────
 
 export async function addMount(args: {
+  /**
+   * Channel defaults to "telegram" so existing Telegram-only callers (cta,
+   * poller pre-LINE) keep working without explicit threading.
+   */
+  channel?: Channel;
   thread_id: ThreadId;
   path: string;
   label?: string;
@@ -204,12 +274,14 @@ export async function addMount(args: {
    */
   tmux_session?: string;
 }): Promise<Mount> {
+  const channel = args.channel ?? DEFAULT_CHANNEL;
   return withLock(() => {
     const data = readMounts();
-    if (data.mounts.some((m) => threadIdsEqual(m.thread_id, args.thread_id))) {
-      throw new Error(`thread_id ${args.thread_id} is already mounted`);
+    if (data.mounts.some((m) => sameTarget(m, channel, args.thread_id))) {
+      throw new Error(`${channel}:${args.thread_id} is already mounted`);
     }
     const mount: Mount = {
+      channel,
       thread_id: args.thread_id,
       path: args.path,
       label: args.label,
@@ -223,10 +295,13 @@ export async function addMount(args: {
   });
 }
 
-export async function removeMount(thread_id: ThreadId): Promise<Mount | null> {
+export async function removeMount(
+  thread_id: ThreadId,
+  channel: Channel = DEFAULT_CHANNEL,
+): Promise<Mount | null> {
   return withLock(() => {
     const data = readMounts();
-    const idx = data.mounts.findIndex((m) => threadIdsEqual(m.thread_id, thread_id));
+    const idx = data.mounts.findIndex((m) => sameTarget(m, channel, thread_id));
     if (idx < 0) return null;
     const [removed] = data.mounts.splice(idx, 1);
     writeMountsAtomic(data);
@@ -234,8 +309,17 @@ export async function removeMount(thread_id: ThreadId): Promise<Mount | null> {
   });
 }
 
+export function findMount(channel: Channel, thread_id: ThreadId): Mount | null {
+  return readMounts().mounts.find((m) => sameTarget(m, channel, thread_id)) ?? null;
+}
+
+/**
+ * Telegram-specific shorthand. Equivalent to `findMount("telegram", id)`.
+ * Kept so the existing poller / CLI call sites don't all need a channel
+ * argument until LINE work begins.
+ */
 export function findMountByThreadId(thread_id: ThreadId): Mount | null {
-  return readMounts().mounts.find((m) => threadIdsEqual(m.thread_id, thread_id)) ?? null;
+  return findMount(DEFAULT_CHANNEL, thread_id);
 }
 
 // ─── CLI entry point ────────────────────────────────────────────────────────
