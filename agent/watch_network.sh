@@ -119,7 +119,17 @@ main_loop() {
     else
       # Both reachable.
       if [[ "$WAS_OFFLINE" -eq 1 || "$WAS_TG_DOWN" -eq 1 ]]; then
-        kick_claude_session "Connectivity restored"
+        # In MULTI_TOPIC mode the v0 `claude` tmux session must not exist —
+        # spawning it via restart_claude.sh boots the official Telegram plugin
+        # which races our poller (409 Conflict, silent message drops). The
+        # poller and per-topic sessions are owned by LaunchAgent KeepAlive
+        # and topic-wrapper.sh's own restart loop; both recover from a
+        # connectivity blip without watchdog intervention.
+        if [[ "${MULTI_TOPIC:-0}" != "1" ]]; then
+          kick_claude_session "Connectivity restored"
+        else
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Connectivity restored (MULTI_TOPIC — no kick)"
+        fi
         WAS_OFFLINE=0
         WAS_TG_DOWN=0
         MCP_FAILS=0
