@@ -29,8 +29,8 @@ EOF
 RESOLVED_UMASK=$(
   HOME="$(mktemp -d)" \
   bash -c "
-    mkdir -p \"\$HOME/.claude-telegram-agent\"
-    cp '$ENV_FILE_FAKE' \"\$HOME/.claude-telegram-agent/.env\"
+    mkdir -p \"\$HOME/.pager\"
+    cp '$ENV_FILE_FAKE' \"\$HOME/.pager/.env\"
     source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
     umask
   "
@@ -49,8 +49,8 @@ fi
 
 WORK=$(mktemp -d)
 HOME_OVERRIDE="$WORK"
-mkdir -p "$HOME_OVERRIDE/.claude-telegram-agent"
-cp "$ENV_FILE_FAKE" "$HOME_OVERRIDE/.claude-telegram-agent/.env"
+mkdir -p "$HOME_OVERRIDE/.pager"
+cp "$ENV_FILE_FAKE" "$HOME_OVERRIDE/.pager/.env"
 
 PERM=$(
   HOME="$HOME_OVERRIDE" \
@@ -60,7 +60,7 @@ PERM=$(
     export -f tmux
     source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
     pipe_to_log dummy-session
-    stat -f %Sp \"\$HOME/.claude-telegram-agent/agent.log\"
+    stat -f %Sp \"\$HOME/.pager/agent.log\"
   "
 )
 if [[ "$PERM" == "-rw-------" ]]; then
@@ -77,10 +77,10 @@ fi
 
 WORK2=$(mktemp -d)
 HOME_OVERRIDE2="$WORK2"
-mkdir -p "$HOME_OVERRIDE2/.claude-telegram-agent"
-cp "$ENV_FILE_FAKE" "$HOME_OVERRIDE2/.claude-telegram-agent/.env"
+mkdir -p "$HOME_OVERRIDE2/.pager"
+cp "$ENV_FILE_FAKE" "$HOME_OVERRIDE2/.pager/.env"
 # Seed an oversized active log at intentionally-loose 0644.
-LARGE_LOG="$HOME_OVERRIDE2/.claude-telegram-agent/agent.log"
+LARGE_LOG="$HOME_OVERRIDE2/.pager/agent.log"
 dd if=/dev/zero of="$LARGE_LOG" bs=1024 count=$((11 * 1024)) 2>/dev/null
 chmod 644 "$LARGE_LOG"
 
@@ -89,7 +89,7 @@ ROTATED_PERM=$(
   bash -c "
     source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
     rotate_logs
-    stat -f %Sp \"\$HOME/.claude-telegram-agent/\"agent.log.* 2>/dev/null | head -1
+    stat -f %Sp \"\$HOME/.pager/\"agent.log.* 2>/dev/null | head -1
   "
 )
 if [[ "$ROTATED_PERM" == "-rw-------" ]]; then
