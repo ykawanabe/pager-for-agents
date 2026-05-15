@@ -441,6 +441,93 @@ describe("typing + ack reaction (UX signals)", () => {
   });
 });
 
+describe("typing keepalive", () => {
+  // The keepalive loop's primary contract: re-fire sendChatAction past
+  // Telegram's 5s auto-clear, and stop the moment mcp-telegram clears the
+  // marker. We use short intervals to keep the test fast.
+  test("re-fires sendChatAction until marker is cleared", async () => {
+    const tk = await import("./typing-keepalive");
+    const STATE = process.env.CTA_STATE_DIR!;
+    chatActions.length = 0;
+
+    // Run keepalive at 30ms cadence. Cancel after ~120ms — expect 3-5 fires
+    // (1 initial + ~3 interval ticks before we clear).
+    const token = tk.markTypingActive(STATE, -1001, 42);
+    const sendCounts: number[] = [];
+    const runP = tk.runTypingKeepalive({
+      stateDir: STATE,
+      chatId: -1001,
+      threadId: 42,
+      token,
+      send: async () => {
+        sendCounts.push(Date.now());
+        await poller.sendTyping(-1001, 42);
+      },
+      intervalMs: 30,
+      maxMs: 5_000,
+    });
+
+    await new Promise((r) => setTimeout(r, 120));
+    expect(sendCounts.length).toBeGreaterThanOrEqual(3);
+
+    tk.markTypingDone(STATE, -1001, 42);
+    await runP;
+    const fires = sendCounts.length;
+
+    // Confirm no further fires after the marker is gone.
+    await new Promise((r) => setTimeout(r, 80));
+    expect(sendCounts.length).toBe(fires);
+
+    // Every fire should have hit sendChatAction with the right target.
+    expect(chatActions.length).toBe(fires);
+    for (const a of chatActions) {
+      expect(a.chat_id).toBe(-1001);
+      expect(a.action).toBe("typing");
+      expect(a.message_thread_id).toBe(42);
+    }
+  });
+
+  test("stops when a newer dispatch replaces the marker token", async () => {
+    const tk = await import("./typing-keepalive");
+    const STATE = process.env.CTA_STATE_DIR!;
+
+    const oldToken = tk.markTypingActive(STATE, -1001, 7);
+    let fires = 0;
+    const runP = tk.runTypingKeepalive({
+      stateDir: STATE,
+      chatId: -1001,
+      threadId: 7,
+      token: oldToken,
+      send: async () => { fires++; },
+      intervalMs: 25,
+      maxMs: 5_000,
+    });
+
+    await new Promise((r) => setTimeout(r, 60));
+    // Simulate a newer message arriving: marker overwritten with a new token.
+    tk.markTypingActive(STATE, -1001, 7);
+    await runP;
+
+    const afterStop = fires;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fires).toBe(afterStop);
+  });
+
+  test("dm keepalive uses the 'dm' sentinel path", async () => {
+    const tk = await import("./typing-keepalive");
+    const STATE = process.env.CTA_STATE_DIR!;
+    const expected = tk.typingMarkerPath(STATE, 8000000000, undefined);
+    expect(expected.endsWith("8000000000__dm.token")).toBe(true);
+
+    // markTypingDone should accept the same undefined/dm shape mcp-telegram
+    // would synthesize for a DM, and undelete cleanly.
+    tk.markTypingActive(STATE, 8000000000);
+    tk.markTypingDone(STATE, 8000000000, "dm");
+    // Second call is a no-op (file already gone) — must not throw.
+    expect(() => tk.markTypingDone(STATE, 8000000000)).not.toThrow();
+  });
+});
+
 describe("claude built-in interception (post-pair)", () => {
   function pair(opts?: { chat_id?: number; user_id?: number }): void {
     const state: poller.PairedState = {

@@ -121,9 +121,14 @@ if [[ ! -f "$MCP_SERVER_PATH" ]]; then
   exit 1
 fi
 
-MCP_CFG=$(python3 - "$MCP_SERVER_PATH" "$TELEGRAM_BOT_TOKEN" "$MAIN_CHAT_ID" "$THREAD_ID" <<'PY'
+# CTA_STATE_DIR pass-through: mcp-telegram clears the poller's typing-keepalive
+# marker after each reply. Both sides must resolve the same state dir or the
+# bubble keeps re-firing until the hard cap. Defaults match if unset.
+CTA_STATE_DIR_VAL="${CTA_STATE_DIR:-$HOME/.claude-telegram-agent}"
+
+MCP_CFG=$(python3 - "$MCP_SERVER_PATH" "$TELEGRAM_BOT_TOKEN" "$MAIN_CHAT_ID" "$THREAD_ID" "$CTA_STATE_DIR_VAL" <<'PY'
 import json, sys
-server_path, token, chat_id, thread_id = sys.argv[1:5]
+server_path, token, chat_id, thread_id, state_dir = sys.argv[1:6]
 cfg = {
     "mcpServers": {
         "telegram": {
@@ -133,6 +138,7 @@ cfg = {
                 "TELEGRAM_BOT_TOKEN": token,
                 "TELEGRAM_CHAT_ID": chat_id,
                 "TELEGRAM_THREAD_ID": thread_id,
+                "CTA_STATE_DIR": state_dir,
             },
         }
     }
