@@ -23,15 +23,23 @@
  * restart rather than re-delivering it (less surprising for the user than
  * doubled messages).
  *
- * Heartbeat: touches ~/.claude-telegram-agent/heartbeat-poller every loop
+ * Heartbeat: touches $STATE_DIR/heartbeat-poller every loop
  * iteration so the watchdog can detect a hung poller.
  */
 import { spawnSync } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { addMount, readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
+import { addMount, mountKey, readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
+
+// Poller-side cache key for Telegram updates. Hardcoded "telegram" because
+// this file is the Telegram adapter; the LINE adapter (when added) will
+// build keys with "line" instead.
+function tgKey(thread_id: ThreadId): string {
+  return mountKey("telegram", thread_id);
+}
 import { markTypingActive, runTypingKeepalive } from "./typing-keepalive";
+import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, installAgentDir, installMountStoreTs } from "../lib/paths";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
@@ -42,12 +50,12 @@ import { markTypingActive, runTypingKeepalive } from "./typing-keepalive";
 const ENV_MAIN_CHAT_ID = process.env.MAIN_CHAT_ID; // optional Phase 2 override
 const POLL_TIMEOUT_SEC = Number(process.env.POLL_TIMEOUT_SEC ?? "25");
 
-const STATE_DIR = process.env.CTA_STATE_DIR ?? join(homedir(), ".claude-telegram-agent");
-const OFFSET_FILE = join(STATE_DIR, "poller-offset");
-const HEARTBEAT_FILE = join(STATE_DIR, "heartbeat-poller");
-const MOUNTS_JSON = join(STATE_DIR, "mounts.json");
-const PAIRING_CODE_FILE = join(STATE_DIR, "pairing-code");
-const PAIRED_STATE_FILE = join(STATE_DIR, "paired.json");
+const STATE_DIR = stateDir();
+const OFFSET_FILE = pollerOffsetFile();
+const HEARTBEAT_FILE = heartbeatFile();
+const MOUNTS_JSON = mountsJson();
+const PAIRING_CODE_FILE = pairingCodeFile();
+const PAIRED_STATE_FILE = pairedStateFile();
 // Pager writes the ack-reaction toggle here as `ackReaction: "👀"` (or absent
 // for "off"). Single source of truth — Pager-driven config the poller reads.
 const ACCESS_JSON = process.env.ACCESS_JSON ?? join(homedir(), ".claude/channels/telegram/access.json");
@@ -55,7 +63,7 @@ const ACCESS_JSON = process.env.ACCESS_JSON ?? join(homedir(), ".claude/channels
 // forum_topic_created / forum_topic_edited service message fly past. Key is
 // "<chat_id>/<message_thread_id>" so multi-chat installs don't collide on
 // numeric thread ids.
-const TOPICS_JSON = join(STATE_DIR, "topics.json");
+const TOPICS_JSON = topicsJson();
 
 function getApiBase(): string {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -734,7 +742,7 @@ async function handleMount(msg: TgMessage, args: string): Promise<void> {
     return;
   }
   // Reuse the mount-store CLI via subprocess — keeps the locking single-sourced.
-  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/agent/mount-store/mount-store.ts");
+  const storePath = process.env.MOUNT_STORE_PATH ?? installMountStoreTs();
   const r = spawnSync("bun", ["run", storePath, "add", String(thread_id), path], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply(
@@ -767,7 +775,7 @@ async function handleDm(msg: TgMessage, args: string): Promise<void> {
     await reply({ chat_id: msg.chat.id }, `Path \`${path}\` is not a directory on the Mac.`);
     return;
   }
-  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/agent/mount-store/mount-store.ts");
+  const storePath = process.env.MOUNT_STORE_PATH ?? installMountStoreTs();
   const r = spawnSync("bun", ["run", storePath, "add", "dm", path], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply({ chat_id: msg.chat.id }, `DM mount failed: ${(r.stderr ?? "").trim()}`);
@@ -780,7 +788,7 @@ async function handleDm(msg: TgMessage, args: string): Promise<void> {
 async function handleUnmount(msg: TgMessage): Promise<void> {
   const thread_id = msg.message_thread_id;
   const key = thread_id != null ? String(thread_id) : "dm";
-  const storePath = process.env.MOUNT_STORE_PATH ?? join(homedir(), ".local/share/claude-telegram-agent/agent/mount-store/mount-store.ts");
+  const storePath = process.env.MOUNT_STORE_PATH ?? installMountStoreTs();
   const r = spawnSync("bun", ["run", storePath, "remove", key], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply({ chat_id: msg.chat.id, thread_id }, `Unmount failed: ${(r.stderr ?? "").trim()}`);
@@ -993,7 +1001,7 @@ function refreshMountsIfChanged(): void {
   try {
     const data = readMounts();
     const next = new Map<string, Mount>();
-    for (const m of data.mounts) next.set(String(m.thread_id), m);
+    for (const m of data.mounts) next.set(mountKey(m.channel, m.thread_id), m);
     mountsCache = next;
     mountsMtimeMs = mtimeMs;
     process.stdout.write(`[${new Date().toISOString()}] mounts reloaded (${next.size} entries)\n`);
@@ -1022,7 +1030,7 @@ function refreshMountsIfChanged(): void {
 function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): string | null {
   const servicesDir = process.env.MOUNT_STORE_PATH
     ? join(process.env.MOUNT_STORE_PATH, "..", "..")
-    : join(homedir(), ".local/share/claude-telegram-agent/agent");
+    : installAgentDir();
   const storePath = join(servicesDir, "mount-store/mount-store.ts");
   const wrapperPath = join(servicesDir, "topic-wrapper.sh");
 
@@ -1070,7 +1078,7 @@ function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): 
 function respawnTopicSession(mount: Mount): boolean {
   const servicesDir = process.env.MOUNT_STORE_PATH
     ? join(process.env.MOUNT_STORE_PATH, "..", "..")
-    : join(homedir(), ".local/share/claude-telegram-agent/agent");
+    : installAgentDir();
   const wrapperPath = join(servicesDir, "topic-wrapper.sh");
   const cmd = [wrapperPath, String(mount.thread_id), mount.path, mount.tmux_session]
     .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
@@ -1102,12 +1110,12 @@ function routeMessage(msg: TgMessage): string | null {
     return null;
   }
   const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
-  const specific = mountsCache.get(String(key));
+  const specific = mountsCache.get(tgKey(key));
   if (specific) return specific.tmux_session;
 
   // No specific mount — try the wildcard. Auto-spawns a real per-thread
   // mount + tmux session using the wildcard's path as the project dir.
-  const wildcard = mountsCache.get("*");
+  const wildcard = mountsCache.get(tgKey("*"));
   if (wildcard) {
     return autoSpawnFromWildcard(key, wildcard.path);
   }
@@ -1154,7 +1162,7 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
     // first message). Find the mount and respawn from its persisted path.
     // One retry — if respawn fails we drop the message and surface the error.
     const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
-    const mount = mountsCache.get(String(key));
+    const mount = mountsCache.get(tgKey(key));
     if (mount && respawnTopicSession(mount)) {
       r = tmuxDispatch(target, text);
     }
