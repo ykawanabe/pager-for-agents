@@ -872,7 +872,8 @@ cmd_migrate_state() {
   # Backup manifest: a record of what moved, so a panicked operator can
   # locate files after the rename. Not a rollback script — `mv` is atomic
   # on the same filesystem (same $HOME volume), so rollback is `mv` back.
-  local manifest="$HOME/.pager-migration-$(date +%Y%m%d-%H%M%S).manifest"
+  local manifest
+  manifest="$HOME/.pager-migration-$(date +%Y%m%d-%H%M%S).manifest"
   {
     echo "# pager-for-agents state migration"
     echo "# timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
