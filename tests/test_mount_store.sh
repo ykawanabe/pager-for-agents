@@ -138,6 +138,67 @@ BOUND=$(bun run "$STORE" add 7 /tmp iron-flow my-custom-tmux)
 DEFAULT_TMUX=$(bun run "$STORE" add 8 /tmp another-label "")
 [[ "$(echo "$DEFAULT_TMUX" | jq -r '.tmux_session')" == "topic-8" ]] && ok "add: empty tmux_session arg → default" || ng "add: empty tmux_session arg → default"
 
+# ─── schema v1 → v2 read upgrade ────────────────────────────────────────────
+# v0.1 installs wrote `{"version":1, "mounts":[{"thread_id",...}]}` without a
+# `channel` field. readMounts must stamp `channel: "telegram"` on each row
+# without rewriting the file (writes happen lazily on the next mutation).
+
+rm -rf "$STATE" && mkdir -p "$STATE"
+cat > "$STATE/mounts.json" <<'EOF'
+{
+  "version": 1,
+  "mounts": [
+    {
+      "thread_id": 42,
+      "path": "/tmp/iron-flow",
+      "label": "iron-flow",
+      "session_id": "legacy-uuid-1",
+      "tmux_session": "topic-42",
+      "created_at": "2026-05-13T04:26:39.826Z"
+    }
+  ]
+}
+EOF
+
+V1_OUT=$(bun run "$STORE" list)
+[[ "$(echo "$V1_OUT" | jq -r '.version')" == "2" ]] && ok "v1 read: upgraded to version 2 in memory" || ng "v1 read: upgraded to version 2 in memory"
+[[ "$(echo "$V1_OUT" | jq -r '.mounts[0].channel')" == "telegram" ]] && ok "v1 read: stamps channel=telegram" || ng "v1 read: stamps channel=telegram"
+[[ "$(echo "$V1_OUT" | jq -r '.mounts[0].thread_id')" == "42" ]] && ok "v1 read: thread_id preserved" || ng "v1 read: thread_id preserved"
+[[ "$(echo "$V1_OUT" | jq -r '.mounts[0].session_id')" == "legacy-uuid-1" ]] && ok "v1 read: session_id preserved" || ng "v1 read: session_id preserved"
+
+# File on disk stays v1 until a mutation rewrites it (no surprise writes).
+[[ "$(jq -r '.version' "$STATE/mounts.json")" == "1" ]] && ok "v1 read: file on disk untouched" || ng "v1 read: file on disk untouched"
+
+# Next mutation upgrades the file to v2.
+bun run "$STORE" add 99 /tmp/other >/dev/null
+[[ "$(jq -r '.version' "$STATE/mounts.json")" == "2" ]] && ok "post-mutation: file rewritten to v2" || ng "post-mutation: file rewritten to v2"
+[[ "$(jq -r '.mounts[0].channel' "$STATE/mounts.json")" == "telegram" ]] && ok "post-mutation: legacy row gets channel" || ng "post-mutation: legacy row gets channel"
+[[ "$(jq -r '.mounts[1].channel' "$STATE/mounts.json")" == "telegram" ]] && ok "post-mutation: new row defaults to telegram" || ng "post-mutation: new row defaults to telegram"
+
+# ─── schema v2 round-trip ────────────────────────────────────────────────────
+# A native-v2 file (with explicit channel) reads back without modification.
+
+rm -rf "$STATE" && mkdir -p "$STATE"
+cat > "$STATE/mounts.json" <<'EOF'
+{
+  "version": 2,
+  "mounts": [
+    {
+      "channel": "telegram",
+      "thread_id": 42,
+      "path": "/tmp/iron-flow",
+      "session_id": "v2-uuid-1",
+      "tmux_session": "topic-42",
+      "created_at": "2026-05-13T04:26:39.826Z"
+    }
+  ]
+}
+EOF
+
+V2_OUT=$(bun run "$STORE" list)
+[[ "$(echo "$V2_OUT" | jq -r '.version')" == "2" ]] && ok "v2 read: version=2" || ng "v2 read: version=2"
+[[ "$(echo "$V2_OUT" | jq -r '.mounts[0].channel')" == "telegram" ]] && ok "v2 read: explicit channel preserved" || ng "v2 read: explicit channel preserved"
+
 # ─── result ─────────────────────────────────────────────────────────────────
 
 echo
