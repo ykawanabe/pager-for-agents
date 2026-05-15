@@ -15,7 +15,27 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.claude-telegram-agent"
+
+# State + install dirs. Defaults match agent/lib/paths.ts and cli/cta. Env
+# overrides flow through so a single shell can target a non-default layout
+# for testing or operator customization.
+STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
+INSTALL_DIR="${CTA_INSTALL_DIR:-$HOME/.local/share/pager}"
+LEGACY_STATE_DIR="$HOME/.claude-telegram-agent"
+LEGACY_INSTALL_DIR="$HOME/.local/share/claude-telegram-agent"
+
+# Auto-migrate v0.1 layouts before any deploy steps touch the new paths.
+# Idempotent — exits silently when there's nothing to move. Refuses if the
+# poller is still alive against the legacy dir; user must `cta stop` first.
+if [[ -d "$LEGACY_STATE_DIR" || -d "$LEGACY_INSTALL_DIR" ]]; then
+  printf "→ Detected v0.1 layout — migrating to v0.2 paths\n"
+  if ! bash "$REPO_DIR/cli/cta" migrate-state; then
+    printf "✗ migrate-state failed — aborting install. Resolve and re-run.\n" >&2
+    exit 1
+  fi
+fi
+
+CONFIG_DIR="$STATE_DIR"
 BIN_DIR="$HOME/.local/bin"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_LABEL="com.claude-agent"
@@ -110,7 +130,7 @@ chmod 600 "$CONFIG_DIR/.env" 2>/dev/null || true
 #   agent/{start,watch,restart}.sh — runtime entry points (LaunchAgent calls
 #                                    agent/start_agents.sh)
 #   agent/{poller,mcp-telegram,   — runtime modules (data, copied to
-#         mount-store,                ~/.local/share/claude-telegram-agent/agent)
+#         mount-store, lib,           $INSTALL_DIR/agent)
 #         topic-wrapper.sh}
 mkdir -p "$BIN_DIR"
 cp "$REPO_DIR/cli/cta" "$BIN_DIR/cta"
@@ -123,16 +143,13 @@ for s in restart_claude.sh watch_network.sh start_agents.sh; do
 done
 
 # ---- 3b. Install MULTI_TOPIC runtime modules --------------------------------
-# Layout: ~/.local/share/claude-telegram-agent/agent/{poller,mcp-telegram,
-# mount-store, topic-wrapper.sh}. Honors XDG-ish convention (executables in
-# ~/.local/bin, data/code in ~/.local/share). The legacy path used
-# .../services/* — install.sh removes the old dir if present so a re-run
-# upgrades cleanly.
-AGENT_DIR="$HOME/.local/share/claude-telegram-agent/agent"
-LEGACY_SERVICES_DIR="$HOME/.local/share/claude-telegram-agent/services"
-[[ -d "$LEGACY_SERVICES_DIR" ]] && rm -rf "$LEGACY_SERVICES_DIR"
+# Layout: $INSTALL_DIR/agent/{lib,poller,mcp-telegram,mount-store,
+# topic-wrapper.sh}. Honors XDG-ish convention (executables in
+# ~/.local/bin, data/code in ~/.local/share).
+AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
-  mkdir -p "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
+  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
+  cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" "$REPO_DIR/agent/poller/typing-keepalive.ts" "$REPO_DIR/agent/poller/package.json" "$AGENT_DIR/poller/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
