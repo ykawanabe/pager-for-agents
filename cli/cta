@@ -78,8 +78,12 @@ _multi_topic_enabled() {
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
+# Atomic single-arg form. The piped `launchctl list | grep -q LABEL` shape
+# under `set -uo pipefail` flips false ~8% of polls under I/O load: grep -q
+# closes its stdin on first match, launchctl is still streaming over IPC,
+# gets SIGPIPE, pipeline returns non-zero, Pager sees a false Degraded.
 _la_loaded() {
-  launchctl list 2>/dev/null | grep -q "$PLIST_LABEL"
+  launchctl list "$PLIST_LABEL" >/dev/null 2>&1
 }
 
 # Print "<pid> <rss_kb>" if claude is running, else empty line. Caller parses.
@@ -91,21 +95,24 @@ _claude_ps_line() {
   if _multi_topic_enabled; then pat="claude --mcp-config"
   else pat="claude --channels plugin:telegram"
   fi
+  # Local `set +o pipefail`: the head -1 / grep chain can SIGPIPE the upstream
+  # ps under load and flip pipefail to non-zero, which would empty out the
+  # claude.pid field in cta status. Same family of bug as _la_loaded's old form.
   # shellcheck disable=SC2009  # pgrep can't match multi-word patterns + we need rss
-  ps -Ao pid=,rss=,command= 2>/dev/null \
-    | grep "$pat" \
-    | grep -v grep \
-    | head -1 \
-    | awk '{print $1, $2}'
+  ( set +o pipefail
+    ps -Ao pid=,rss=,command= 2>/dev/null \
+      | grep "$pat" \
+      | grep -v grep \
+      | head -1 \
+      | awk '{print $1, $2}'
+  )
 }
 
 # MULTI_TOPIC: per-topic mcp-telegram process lives at .../agent/mcp-telegram/server.ts.
 # v0: the official plugin's bun server is also a server.ts; same grep matches both.
+# pgrep -f is atomic — no pipe, no pipefail-vs-SIGPIPE race window.
 _mcp_alive() {
-  # shellcheck disable=SC2009  # pgrep -f "bun.*server.ts" is fuzzier than this explicit chain
-  ps -Ao command= 2>/dev/null \
-    | grep "bun" | grep "server.ts" | grep -v grep \
-    | head -1 >/dev/null
+  pgrep -f "bun.*server.ts" >/dev/null 2>&1
 }
 
 _tmux_session_alive() {
