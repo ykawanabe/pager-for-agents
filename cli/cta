@@ -59,6 +59,7 @@ CAFFEINATE_PID_FILE="$STATE_DIR/caffeinate.pid"
 PAIRING_CODE_FILE="$STATE_DIR/pairing-code"
 PAIRED_STATE_FILE="$STATE_DIR/paired.json"
 MOUNTS_FILE="$STATE_DIR/mounts.json"
+TOPICS_FILE="$STATE_DIR/topics.json"
 MOUNT_STORE_TS="$INSTALL_DIR/agent/mount-store/mount-store.ts"
 
 # Default emoji used by `cta config ack on`. Must be in Telegram's free-bot
@@ -759,6 +760,24 @@ cmd_umount() {
     echo "Unmounted thread $thread_id (tmux $tmux_session was not running)"
 }
 
+# Look up topic display name from topics.json (poller-maintained cache of
+# forum_topic_created / forum_topic_edited service messages). Returns empty
+# if topics.json is missing, paired.json is missing, the thread_id is not
+# numeric, or the topic wasn't observed by the poller (e.g., created before
+# bot joined — Telegram has no getForumTopic API, so pre-bot topics are
+# unrecoverable). Always exits 0 — callers treat empty as "unknown."
+_topic_name() {
+  local thread_id="$1"
+  # Non-numeric thread_ids ("dm", "*") have no forum topic by definition.
+  [[ "$thread_id" =~ ^[0-9]+$ ]] || return 0
+  [[ -f "$TOPICS_FILE" && -f "$PAIRED_STATE_FILE" ]] || return 0
+  local chat_id
+  chat_id=$(jq -r '.chat_id // empty' "$PAIRED_STATE_FILE" 2>/dev/null) || return 0
+  [[ -n "$chat_id" ]] || return 0
+  jq -r --arg key "${chat_id}/${thread_id}" \
+    '.topics[$key].name // empty' "$TOPICS_FILE" 2>/dev/null
+}
+
 cmd_list() {
   local store
   store=$(_mount_store_path)
@@ -767,13 +786,37 @@ cmd_list() {
     exit 1
   fi
 
+  local raw
+  raw=$(bun run "$store" list)
+
   if [[ "${1:-}" == "--json" ]]; then
-    bun run "$store" list
+    # Enrich each mount with topic_name when the poller has cached it.
+    # Topic names live in a separate file (topics.json) maintained from
+    # Telegram service messages; we join them here so JSON consumers
+    # (Pager, scripts) get a one-stop view without a second roundtrip.
+    local chat_id=""
+    if [[ -f "$PAIRED_STATE_FILE" ]]; then
+      chat_id=$(jq -r '.chat_id // empty' "$PAIRED_STATE_FILE" 2>/dev/null || echo "")
+    fi
+    local topics_arg="{}"
+    if [[ -f "$TOPICS_FILE" ]]; then
+      topics_arg=$(jq -c '.topics // {}' "$TOPICS_FILE" 2>/dev/null || echo "{}")
+    fi
+    echo "$raw" | jq \
+      --arg chat_id "$chat_id" \
+      --argjson topics "$topics_arg" \
+      '.mounts |= map(
+        . + (
+          if (.thread_id | type) == "number" and ($chat_id | length) > 0 then
+            { topic_name: ($topics[($chat_id + "/" + (.thread_id | tostring))].name // null) }
+          else
+            { topic_name: null }
+          end
+        )
+      )'
     return
   fi
 
-  local raw
-  raw=$(bun run "$store" list)
   local count
   count=$(echo "$raw" | jq '.mounts | length')
   if [[ "$count" -eq 0 ]]; then
@@ -781,12 +824,14 @@ cmd_list() {
     return
   fi
 
-  printf "%-10s %-15s %-50s %-12s %s\n" "THREAD" "LABEL" "PATH" "TMUX" "STATUS"
+  printf "%-10s %-20s %-15s %-50s %-12s %s\n" "THREAD" "TOPIC" "LABEL" "PATH" "TMUX" "STATUS"
   while IFS=$'\t' read -r thread_id label path tmux_session; do
     local status="dead"
     tmux has-session -t "$tmux_session" 2>/dev/null && status="alive"
-    printf "%-10s %-15s %-50s %-12s %s\n" \
-      "$thread_id" "${label:--}" "$path" "$tmux_session" "$status"
+    local topic
+    topic=$(_topic_name "$thread_id")
+    printf "%-10s %-20s %-15s %-50s %-12s %s\n" \
+      "$thread_id" "${topic:--}" "${label:--}" "$path" "$tmux_session" "$status"
   done < <(echo "$raw" | jq -r '.mounts[] | [.thread_id, .label // "", .path, .tmux_session] | @tsv')
 }
 
