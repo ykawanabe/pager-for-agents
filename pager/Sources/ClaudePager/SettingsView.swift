@@ -429,6 +429,49 @@ private struct MountsTab: View {
     @State private var refreshTimer: Timer? = nil
     @State private var actionError: String? = nil
 
+    /// Picker selection. Mirrors newThreadId but adds a "custom" sentinel
+    /// that swaps the dropdown for a free-text TextField — covers thread_ids
+    /// the bot hasn't observed yet (topics created before joining the group)
+    /// without forcing every user through manual ID lookup.
+    @State private var threadSelection: String = ""
+
+    /// Options offered in the Thread picker. Computed at render time off
+    /// paired state + known topics + existing mounts so the menu refreshes
+    /// as the bot learns new topics. "dm" picker label depends on chat type
+    /// — General in a group, DM in a private chat — matching how mount rows
+    /// are labeled by the CLI's topic_name join.
+    private struct ThreadOption: Identifiable, Hashable {
+        let value: String   // the thread_id string written to mounts.json
+        let label: String   // displayed in the menu
+        var id: String { value }
+    }
+    private var threadOptions: [ThreadOption] {
+        let mounted = Set(mounts.map { $0.threadId.stringValue })
+        let isGroup = (CTAClient.pairedState()?.chatId ?? 0) < 0
+        var opts: [ThreadOption] = []
+        // dm sentinel: General in a group, DM in a private chat.
+        if !mounted.contains("dm") {
+            opts.append(.init(value: "dm", label: isGroup ? "General" : "DM"))
+        }
+        // Forum topics the poller has seen, sorted by name.
+        for t in CTAClient.knownTopics() where !mounted.contains(String(t.threadId)) {
+            opts.append(.init(value: String(t.threadId), label: "\(t.name) (#\(t.threadId))"))
+        }
+        // Wildcard catch-all.
+        if !mounted.contains("*") {
+            opts.append(.init(value: "*", label: "Wildcard (catch-all)"))
+        }
+        // Always-available custom escape hatch. Empty value flags "use the
+        // TextField below" — see `effectiveNewThreadId`.
+        opts.append(.init(value: "__custom__", label: "Custom topic ID…"))
+        return opts
+    }
+    private var effectiveNewThreadId: String {
+        threadSelection == "__custom__" || threadSelection.isEmpty
+            ? newThreadId.trimmingCharacters(in: .whitespaces)
+            : threadSelection
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Table-style list. We use a Form so the styling matches the other
@@ -477,7 +520,7 @@ private struct MountsTab: View {
                             .foregroundStyle(.red)
                     } else {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("`*` = wildcard (catch-all); `dm` = DM / group root; numbers = forum topic IDs. The agent spawns one claude session per mount.")
+                            Text("`*` = wildcard (catch-all); `dm` = the bot's DM in a private chat, or the General topic in a group (Telegram sends both without a topic id, so the agent uses the same sentinel); numbers = forum topic IDs. The agent spawns one claude session per mount.")
                             Text("Topic names appear automatically once the bot sees the topic (creation or rename). Telegram's Bot API doesn't expose names retroactively, so topics that existed before the bot joined will show as bare IDs until renamed.")
                         }
                         .font(.caption)
@@ -492,8 +535,22 @@ private struct MountsTab: View {
                     // input the full row width.
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Thread").font(.subheadline).foregroundStyle(.secondary)
-                        TextField("dm, *, or topic id (e.g. 42)", text: $newThreadId)
-                            .textFieldStyle(.roundedBorder)
+                        // Picker over observed topics + sentinels. Falls back
+                        // to a free-text TextField via the "Custom…" option
+                        // when the desired thread_id isn't in the menu (e.g.
+                        // a forum topic created before the bot joined the
+                        // group — Telegram has no API to enumerate those).
+                        Picker("", selection: $threadSelection) {
+                            ForEach(threadOptions) { opt in
+                                Text(opt.label).tag(opt.value)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        if threadSelection == "__custom__" {
+                            TextField("topic id (e.g. 42) or dm or *", text: $newThreadId)
+                                .textFieldStyle(.roundedBorder)
+                        }
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Path").font(.subheadline).foregroundStyle(.secondary)
@@ -513,7 +570,7 @@ private struct MountsTab: View {
                         Spacer()
                         Button("Add mount") { add() }
                             .keyboardShortcut(.defaultAction)
-                            .disabled(newThreadId.trimmingCharacters(in: .whitespaces).isEmpty
+                            .disabled(effectiveNewThreadId.isEmpty
                                       || newPath.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
                 } header: {
@@ -534,6 +591,12 @@ private struct MountsTab: View {
         }
         .onAppear {
             reload()
+            // Default the picker to the first available option so the menu
+            // doesn't render with an empty selection (which would also leave
+            // the Add button disabled with no visible cause).
+            if threadSelection.isEmpty, let first = threadOptions.first {
+                threadSelection = first.value
+            }
             refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in reload() }
         }
         .onDisappear { refreshTimer?.invalidate(); refreshTimer = nil }
@@ -570,7 +633,7 @@ private struct MountsTab: View {
     }
 
     private func add() {
-        let thread = newThreadId.trimmingCharacters(in: .whitespaces)
+        let thread = effectiveNewThreadId
         let path = (newPath as NSString).expandingTildeInPath
         let label = newLabel.trimmingCharacters(in: .whitespaces)
         actionError = nil
@@ -579,6 +642,7 @@ private struct MountsTab: View {
                 _ = try CTAClient.addMount(thread: thread, path: path, label: label.isEmpty ? nil : label)
                 DispatchQueue.main.async {
                     newThreadId = ""; newPath = ""; newLabel = ""
+                    threadSelection = ""
                     reload()
                 }
             } catch {

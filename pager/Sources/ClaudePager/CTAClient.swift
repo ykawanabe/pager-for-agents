@@ -318,6 +318,27 @@ enum CTAClient {
         return decoded.topics["\(chatId)/\(threadId)"]?.name
     }
 
+    /// All forum topics the poller has cached for the currently-paired chat.
+    /// Used by the Add-mount picker so the user can pick from observed topics
+    /// instead of having to look up a numeric thread_id. Returns
+    /// (threadId, name) tuples sorted by name for stable menu ordering.
+    /// Empty when unpaired, paired to a private chat (no forum topics there),
+    /// or when topics.json hasn't seen any forum_topic_created/edited yet.
+    static func knownTopics() -> [(threadId: Int, name: String)] {
+        guard let chatId = pairedState()?.chatId else { return [] }
+        let path = "\(stateDir)/topics.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let decoded = try? JSONDecoder().decode(TopicsFileJSON.self, from: data)
+        else { return [] }
+        let prefix = "\(chatId)/"
+        var out: [(Int, String)] = []
+        for (key, entry) in decoded.topics where key.hasPrefix(prefix) {
+            let tail = String(key.dropFirst(prefix.count))
+            if let id = Int(tail) { out.append((id, entry.name)) }
+        }
+        return out.sorted { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
+    }
+
     // MARK: - Internals
 
     /// Invoke `cta` with args and capture stdout. Reads pipes before
