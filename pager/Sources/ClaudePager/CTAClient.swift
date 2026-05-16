@@ -178,6 +178,12 @@ enum CTAClient {
         let sessionId: String?
         let tmuxSession: String
         let createdAt: String
+        /// Human topic name joined in by `cta list --json` — forum-topic name
+        /// for numeric thread_ids, "General" for the "dm" mount when paired
+        /// to a group. Null when no name is known. Pager prefers this over
+        /// re-deriving the label from threadId so the CLI stays the single
+        /// source of truth for labeling.
+        let topicName: String?
 
         var id: String { threadId.stringValue }
 
@@ -207,6 +213,7 @@ enum CTAClient {
             case sessionId = "session_id"
             case tmuxSession = "tmux_session"
             case createdAt = "created_at"
+            case topicName = "topic_name"
         }
     }
 

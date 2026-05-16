@@ -194,22 +194,17 @@ struct MenuView: View {
     /// the raw thread_id so the menu is still useful immediately after invite
     /// (before the user posts in the topic and triggers a cache update).
     private func menuLabel(for mount: CTAClient.MountJSON, pairedChatId: Int?) -> String {
+        // Prefer the topic_name joined in by `cta list --json` so the CLI is
+        // the single source of truth for labeling (handles "General" for the
+        // dm mount in groups, forum topic names for numeric thread_ids).
         switch mount.threadId {
         case .string("dm"):
-            // In a group (chat_id < 0), the "dm" mount catches the General
-            // topic — Telegram omits message_thread_id for General messages,
-            // so the poller routes them to the "dm" fallback. Show "General"
-            // instead of "DM" so the label matches what the user sees in
-            // Telegram.
-            if let chatId = pairedChatId, chatId < 0 { return "General" }
+            if let name = mount.topicName, !name.isEmpty { return name }
             return "DM"
         case .string("*"):
             return "Wildcard fallback"
         case .number(let n):
-            if let chatId = pairedChatId,
-               let name = CTAClient.topicName(chatId: chatId, threadId: n) {
-                return "\(name) (#\(n))"
-            }
+            if let name = mount.topicName, !name.isEmpty { return "\(name) (#\(n))" }
             return "Topic #\(n)"
         case .string(let s):
             return s

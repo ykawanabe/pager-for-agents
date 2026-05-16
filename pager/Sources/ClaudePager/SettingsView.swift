@@ -540,19 +540,20 @@ private struct MountsTab: View {
     }
 
     private func threadLabel(_ m: CTAClient.MountJSON) -> String {
+        // Prefer the topic_name joined in by `cta list --json` — the CLI
+        // already knows when "dm" should display as "General" (paired to a
+        // group) and what each numeric topic is called. Re-deriving here
+        // would risk drift.
         switch m.threadId {
-        case .string("*"): return "* (wildcard)"
-        case .string("dm"): return "dm"
-        case .string(let s): return s
+        case .string("*"):
+            return "* (wildcard)"
+        case .string("dm"):
+            if let name = m.topicName, !name.isEmpty { return "\(name) (dm)" }
+            return "dm"
+        case .string(let s):
+            return s
         case .number(let n):
-            // Best-effort name lookup. Only the currently-paired chat's topics
-            // are in topics.json (poller scopes them to chat_id/thread_id).
-            // If the user is paired to a different group than the one this
-            // mount belongs to, the name won't resolve — fall back to bare id.
-            if let pairedChat = CTAClient.pairedState()?.chatId,
-               let name = CTAClient.topicName(chatId: pairedChat, threadId: n) {
-                return "\(name) (#\(n))"
-            }
+            if let name = m.topicName, !name.isEmpty { return "\(name) (#\(n))" }
             return "topic \(n)"
         }
     }
