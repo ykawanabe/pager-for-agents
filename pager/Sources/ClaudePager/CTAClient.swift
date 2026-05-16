@@ -83,6 +83,20 @@ enum CTAClient {
         case unsupportedSchema(got: Int, expected: Int)
     }
 
+    /// State directory: where the agent writes paired.json, topics.json, agent.log,
+    /// etc. Mirrors `stateDir()` in agent/lib/paths.ts and `$STATE_DIR` in cli/cta.
+    /// Respects `CTA_STATE_DIR` for tests and custom installs; defaults to
+    /// `~/.pager` (post-rename from `~/.claude-telegram-agent`). Centralizing here
+    /// prevents the same legacy-hardcode bug that bit cli/cta where the cta script
+    /// and the agent looked at different state files. Regression-guarded by
+    /// CTAClientTests.stateDir_*.
+    static var stateDir: String {
+        if let override = ProcessInfo.processInfo.environment["CTA_STATE_DIR"], !override.isEmpty {
+            return override
+        }
+        return "\(NSHomeDirectory())/.pager"
+    }
+
     /// Where to look for `cta`. Order matters: install.sh places it at
     /// `~/.local/bin/cta`, so we check user-bin first. Homebrew paths are
     /// included for hypothetical future package installs.
@@ -260,7 +274,7 @@ enum CTAClient {
     }
 
     static func pairedState() -> PairedStateJSON? {
-        let path = ("~/.claude-telegram-agent/paired.json" as NSString).expandingTildeInPath
+        let path = "\(stateDir)/paired.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
         return try? JSONDecoder().decode(PairedStateJSON.self, from: data)
     }
@@ -290,7 +304,7 @@ enum CTAClient {
     /// nil if unknown. Keyed by "<chat_id>/<thread_id>" — same format the
     /// poller writes.
     static func topicName(chatId: Int, threadId: Int) -> String? {
-        let path = ("~/.claude-telegram-agent/topics.json" as NSString).expandingTildeInPath
+        let path = "\(stateDir)/topics.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let decoded = try? JSONDecoder().decode(TopicsFileJSON.self, from: data)
         else { return nil }
