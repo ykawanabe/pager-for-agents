@@ -78,45 +78,28 @@ final class TelegramConfigTests: XCTestCase {
     }
 
     // MARK: - access.json (allowlist)
+    //
+    // Pager no longer reads or writes `allowFrom` / `dmPolicy`. In MULTI_TOPIC
+    // mode the poller only honors paired.json's `user_id` — the allowlist UI
+    // was a misleading no-op (removed 2026-05-16). Tests that asserted the
+    // old read/write behavior are intentionally deleted; the only contract
+    // worth pinning is "saving doesn't clobber existing allowFrom" so users
+    // who relied on the old single-topic path don't lose their allowlist on
+    // a Pager save.
 
-    func test_load_parsesStringAllowlist() throws {
-        let json = #"{"allowFrom":["111","222"]}"#
-        try json.write(toFile: accessPath, atomically: true, encoding: .utf8)
+    func test_save_preservesExistingAllowFrom() throws {
+        try #"{"allowFrom":["111","222"],"dmPolicy":"allowlist"}"#
+            .write(toFile: accessPath, atomically: true, encoding: .utf8)
         let c = TelegramConfig(envPath: envPath, accessPath: accessPath)
-        XCTAssertEqual(c.allowedIDs, ["111", "222"])
-    }
-
-    /// The plugin historically wrote IDs as ints; we still need to read those
-    /// without crashing or returning nothing.
-    func test_load_parsesIntAllowlist() throws {
-        let json = #"{"allowFrom":[111,222]}"#
-        try json.write(toFile: accessPath, atomically: true, encoding: .utf8)
-        let c = TelegramConfig(envPath: envPath, accessPath: accessPath)
-        XCTAssertEqual(c.allowedIDs, ["111", "222"])
-    }
-
-    /// Saving an empty allowlist must flip dmPolicy back to "open". The bot
-    /// reads dmPolicy first, so a stale "allowlist" with no IDs would lock
-    /// the user out of their own bot.
-    func test_save_emptyAllowlistFlipsPolicyToOpen() throws {
-        let c = TelegramConfig(envPath: envPath, accessPath: accessPath)
-        c.allowedIDs = []
+        c.ackReaction = "🔥"
         c.save()
 
         let data = try Data(contentsOf: URL(fileURLWithPath: accessPath))
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        XCTAssertEqual(json?["dmPolicy"] as? String, "open")
-    }
-
-    func test_save_nonEmptyAllowlistFlipsPolicyToAllowlist() throws {
-        let c = TelegramConfig(envPath: envPath, accessPath: accessPath)
-        c.allowedIDs = ["123"]
-        c.save()
-
-        let data = try Data(contentsOf: URL(fileURLWithPath: accessPath))
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertEqual(json?["allowFrom"] as? [String], ["111", "222"],
+                       "Pager save should leave existing allowFrom alone")
         XCTAssertEqual(json?["dmPolicy"] as? String, "allowlist")
-        XCTAssertEqual(json?["allowFrom"] as? [String], ["123"])
+        XCTAssertEqual(json?["ackReaction"] as? String, "🔥")
     }
 
     // MARK: - access.json (ackReaction)
@@ -156,7 +139,6 @@ final class TelegramConfigTests: XCTestCase {
         let c = TelegramConfig(envPath: envPath, accessPath: accessPath)
         XCTAssertEqual(c.ackReaction, "👀")
         c.ackReaction = ""
-        c.allowedIDs = ["1"]
         c.save()
 
         let data = try Data(contentsOf: URL(fileURLWithPath: accessPath))
@@ -170,7 +152,6 @@ final class TelegramConfigTests: XCTestCase {
     func test_save_whitespaceAckReactionRemovesKey() throws {
         let c = TelegramConfig(envPath: envPath, accessPath: accessPath)
         c.ackReaction = "   "
-        c.allowedIDs = ["1"]
         c.save()
 
         let data = try Data(contentsOf: URL(fileURLWithPath: accessPath))

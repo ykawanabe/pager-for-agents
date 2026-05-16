@@ -109,13 +109,13 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `/mount` says "not a directory" | Path doesn't exist on the Mac | Use full path, no relative or shell-globbed paths |
 | `/mount` says "inside a forum topic" | You sent it in the chat root, not a topic | Open a topic and resend, or use `/dm` for the DM mount |
 | Messages arrive but no claude reply | tmux session crashed / claude died | `tmux attach -t topic-<id>` to inspect; `cta start` to restart |
-| Want to start over | — | `cta stop`, delete `~/.claude-telegram-agent/paired.json`, `cta pair-code --reset`, `cta start` |
+| Want to start over | — | `cta stop`, delete `~/.pager/paired.json`, `cta pair-code --reset`, `cta start` |
 
 ## Where the secrets live
 
 | Path | What | Mode |
 |---|---|---|
-| `~/.claude-telegram-agent/.env` | Agent config (paths, tmux session names, ping target) | 644 |
+| `~/.pager/.env` | Agent config (paths, tmux session names, ping target) | 644 |
 | `~/.claude/channels/telegram/.env` | `TELEGRAM_BOT_TOKEN=...` | 600 |
 | `~/.claude/channels/telegram/access.json` | Allowlist policy | 600 |
 | `~/Library/LaunchAgents/com.claude-agent.plist` | LaunchAgent definition | 644 |
@@ -134,7 +134,7 @@ Mandatory hardening:
 1. **Set the allowlist.** `dmPolicy: "allowlist"` with your numeric Telegram user ID in `allowFrom`. The installer asks for this; don't skip it.
 2. **Don't share the bot token.** It's stored at `~/.claude/channels/telegram/.env` with `chmod 600`. Don't commit it. Don't paste it into chats.
 3. **Treat this Mac as the trusted machine.** Don't run the agent on a shared or unattended computer.
-4. **Audit periodically.** `tail -f ~/.claude-telegram-agent/agent.log` shows what Claude is doing in real time.
+4. **Audit periodically.** `tail -f ~/.pager/agent.log` shows what Claude is doing in real time.
 
 If any of those bullets makes you uncomfortable, **do not run this**. Use the official `/telegram:configure` interactive flow inside Claude Code instead — it has a per-message approval mode.
 
@@ -165,7 +165,7 @@ Covers `mcp_healthy`, `kick_claude_session`, and the `check-no-secrets` pre-comm
 ./uninstall.sh --purge-telegram # also removes ~/.claude/channels/telegram
 ```
 
-Both modes back up `.env` files into `~/.claude-telegram-agent-backup-<timestamp>/` first.
+Both modes back up `.env` files into `~/.pager-backup-<timestamp>/` first.
 
 ## Project layout
 

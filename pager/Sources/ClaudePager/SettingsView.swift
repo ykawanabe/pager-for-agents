@@ -5,13 +5,16 @@ import SwiftUI
 /// - ~/.claude/channels/telegram/access.json (allowlist policy)
 final class TelegramConfig: ObservableObject {
     @Published var token: String = ""
-    @Published var allowedIDs: [String] = []
     /// Emoji the bot reacts with on every inbound message so the user has a
     /// visible "received, processing" signal. Empty string = no reaction.
     /// Telegram only accepts a fixed whitelist of free-bot reaction emojis;
     /// invalid values are silently dropped by the plugin (`server.ts:946`).
     @Published var ackReaction: String = ""
     @Published var saveError: String? = nil
+    // Note: `allowFrom` / `dmPolicy` are no longer surfaced by Pager. In
+    // MULTI_TOPIC mode the poller only honors paired.json's `user_id` — the
+    // access.json allowlist is dead in that path. Single-source-of-truth for
+    // "who can drive this bot" is the paired user. Removed UI 2026-05-16.
 
     let envPath: String
     let accessPath: String
@@ -31,7 +34,6 @@ final class TelegramConfig: ObservableObject {
 
     func load() {
         token = readToken() ?? ""
-        allowedIDs = readAllowlist()
         ackReaction = readAckReaction()
     }
 
@@ -69,15 +71,6 @@ final class TelegramConfig: ObservableObject {
             return value
         }
         return nil
-    }
-
-    private func readAllowlist() -> [String] {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: accessPath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return [] }
-        if let list = json["allowFrom"] as? [String] { return list }
-        if let list = json["allowFrom"] as? [Int] { return list.map(String.init) }
-        return []
     }
 
     private func readAckReaction() -> String {
@@ -118,10 +111,10 @@ final class TelegramConfig: ObservableObject {
         } else {
             dict = ["groups": [:], "pending": [:]]
         }
-        let trimmed = allowedIDs.map { $0.trimmingCharacters(in: .whitespaces) }
-                                .filter { !$0.isEmpty }
-        dict["dmPolicy"] = trimmed.isEmpty ? "open" : "allowlist"
-        dict["allowFrom"] = trimmed
+        // We no longer touch `dmPolicy` / `allowFrom` here — the poller only
+        // honors paired.json's `user_id` in MULTI_TOPIC mode, so writing the
+        // allowlist from Pager would give users a misleading sense of access
+        // control. Leave whatever's in access.json alone.
         // Empty string → remove the key entirely so the plugin falls back to
         // its default (no reaction). Storing "" would still be falsy in JS
         // but explicit omission keeps the file clean.
@@ -250,7 +243,6 @@ private struct PagerTab: View {
 
 private struct TelegramTab: View {
     @ObservedObject var config: TelegramConfig
-    @State private var newID: String = ""
 
     var body: some View {
         Form {
@@ -280,64 +272,31 @@ private struct TelegramTab: View {
             } header: {
                 Text("Message reactions")
             } footer: {
-                Text("Reacts to every inbound message so you know the bot received it. To customize which emoji is used, edit access.json directly — Telegram only accepts its fixed whitelist.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                if config.allowedIDs.isEmpty {
-                    LabeledContent("Status") {
-                        Label("No allowlist set", systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                    }
-                } else {
-                    ForEach(config.allowedIDs, id: \.self) { id in
-                        LabeledContent(id) {
-                            Button {
-                                config.allowedIDs.removeAll { $0 == id }
-                                config.save()
-                            } label: {
-                                Image(systemName: "minus.circle")
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-                }
-                LabeledContent("Add user") {
-                    HStack {
-                        TextField("Telegram user ID", text: $newID)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit(addID)
-                        Button("Add", action: addID)
-                            .disabled(newID.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
-                }
-            } header: {
-                Text("Allowed users")
-            } footer: {
                 if let err = config.saveError {
                     Label(err, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.red)
                 } else {
-                    Text("Only these Telegram users can DM the bot. Find your ID with @userinfobot.")
+                    Text("Reacts to every inbound message so you know the bot received it. To customize which emoji is used, edit access.json directly — Telegram only accepts its fixed whitelist.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
+
+            Section {
+                LabeledContent("Authorized user") {
+                    Text("Set when you /pair")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Access")
+            } footer: {
+                Text("In MULTI_TOPIC mode the bot only accepts commands from the paired user (recorded in ~/.pager/paired.json). To switch authorized users, unpair via `/unpair confirm` or `cta unpair` and pair again from the new account.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-    }
-
-    private func addID() {
-        let trimmed = newID.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty,
-              trimmed.allSatisfy({ $0.isNumber }),
-              !config.allowedIDs.contains(trimmed) else { return }
-        config.allowedIDs.append(trimmed)
-        config.save()
-        newID = ""
     }
 }
 
