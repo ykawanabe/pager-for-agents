@@ -92,4 +92,61 @@ final class CTAClientTests: XCTestCase {
         XCTAssertEqual(s.tmux.claude.name, "my-bot")
         XCTAssertEqual(s.tmux.watchdog.name, "my-watchdog")
     }
+
+    // MARK: - State directory resolution (regression guard)
+    //
+    // Same class of bug as cli/cta's legacy-path hardcode: if Pager and the
+    // agent read state files from different directories, paired.json /
+    // topics.json lookups silently return nil and the UI shows blanks. These
+    // tests pin the contract — stateDir respects $CTA_STATE_DIR and defaults
+    // to ~/.pager, matching agent/lib/paths.ts:stateDir() and cli/cta:STATE_DIR.
+
+    func test_stateDir_defaultsToHomeSlashPager() {
+        // Clear any inherited override in case CI runs with one set.
+        unsetenv("CTA_STATE_DIR")
+        let expected = "\(NSHomeDirectory())/.pager"
+        XCTAssertEqual(CTAClient.stateDir, expected)
+    }
+
+    func test_stateDir_respectsEnvOverride() {
+        setenv("CTA_STATE_DIR", "/tmp/cta-pager-test", 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        XCTAssertEqual(CTAClient.stateDir, "/tmp/cta-pager-test")
+    }
+
+    func test_stateDir_emptyOverrideFallsBack() {
+        // Empty string is treated as "unset" — protects against shells that
+        // export CTA_STATE_DIR='' and would otherwise crash the lookup.
+        setenv("CTA_STATE_DIR", "", 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        XCTAssertEqual(CTAClient.stateDir, "\(NSHomeDirectory())/.pager")
+    }
+
+    func test_pairedState_readsFromStateDir() throws {
+        // Write a fixture paired.json into a temp stateDir, point CTA_STATE_DIR
+        // at it, and verify pairedState() finds it. Confirms the function isn't
+        // still hardcoded to the legacy path.
+        let tmp = NSTemporaryDirectory() + "cta-pager-paired-test-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let payload = #"{"version":1,"chat_id":-12345,"user_id":67,"paired_at":"2026-05-16T00:00:00Z"}"#
+        try payload.write(toFile: "\(tmp)/paired.json", atomically: true, encoding: .utf8)
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        let s = CTAClient.pairedState()
+        XCTAssertEqual(s?.chatId, -12345)
+        XCTAssertEqual(s?.userId, 67)
+    }
+
+    func test_topicName_readsFromStateDir() throws {
+        let tmp = NSTemporaryDirectory() + "cta-pager-topics-test-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let payload = #"{"version":1,"topics":{"-12345/42":{"name":"Iron Flow","captured_at":"2026-05-16T00:00:00Z"}}}"#
+        try payload.write(toFile: "\(tmp)/topics.json", atomically: true, encoding: .utf8)
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        XCTAssertEqual(CTAClient.topicName(chatId: -12345, threadId: 42), "Iron Flow")
+        XCTAssertNil(CTAClient.topicName(chatId: -12345, threadId: 99))
+    }
 }
