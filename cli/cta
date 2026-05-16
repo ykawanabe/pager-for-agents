@@ -111,6 +111,13 @@ _claude_ps_line() {
 # MULTI_TOPIC: per-topic mcp-telegram process lives at .../agent/mcp-telegram/server.ts.
 # v0: the official plugin's bun server is also a server.ts; same grep matches both.
 # pgrep -f is atomic — no pipe, no pipefail-vs-SIGPIPE race window.
+#
+# Liveness-check vs kill-target distinction: this generic `bun.*server.ts`
+# match is intentional for "is _any_ MCP server alive?". A false-positive
+# (user runs their own unrelated bun + server.ts) is acceptable here. cmd_stop
+# uses a plugin-specific pattern instead, so we never kill the user's other
+# bun processes (see test_cta.sh "cmd_stop: did NOT pgrep for plugin-specific
+# pattern" regression test).
 _mcp_alive() {
   pgrep -f "bun.*server.ts" >/dev/null 2>&1
 }
