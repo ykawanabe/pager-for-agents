@@ -494,6 +494,90 @@ else
   ng "_claude_ps_line: missing 'set +o pipefail' guard around head -1 chain"
 fi
 
+# ─── state path derivation regression guard ──────────────────────────────────
+# Bug: cta hardcoded $HOME/.claude-telegram-agent/pairing-code for the pairing
+# code file, while the poller (agent/lib/paths.ts) reads from
+# stateDir()/pairing-code (default $HOME/.pager). Result: `cta pair-code`
+# showed code A, poller checked against code B, every /pair attempt failed
+# with "Pairing code did not match."
+#
+# Same shape failed for paired.json and mounts.json. Root cause: a legacy
+# hardcode kept after state-dir migration. Class of bug, not one-off.
+#
+# Defense:
+#   1. Top-of-file STATE_DIR block defines all state-file paths from $STATE_DIR.
+#   2. This test asserts (a) the values resolve through $STATE_DIR / $INSTALL_DIR
+#      and (b) no NEW legacy hardcodes have been added outside cmd_migrate_state.
+
+state_paths_resolve_from_state_dir() {
+  bash -c '
+    set -uo pipefail
+    source "'"$SCRIPT_DIR"'/cli/cta"
+    # Each state-file path must contain $STATE_DIR (default ~/.pager) or
+    # $INSTALL_DIR (default ~/.local/share/pager) when expanded.
+    for var in PAIRING_CODE_FILE PAIRED_STATE_FILE MOUNTS_FILE ENV_FILE CAFFEINATE_PID_FILE; do
+      val="${!var}"
+      case "$val" in
+        "$STATE_DIR"/*) ;;
+        *) echo "FAIL: $var=$val does not start with \$STATE_DIR=$STATE_DIR"; exit 1 ;;
+      esac
+    done
+    case "$MOUNT_STORE_TS" in
+      "$INSTALL_DIR"/*) ;;
+      *) echo "FAIL: MOUNT_STORE_TS=$MOUNT_STORE_TS does not start with \$INSTALL_DIR=$INSTALL_DIR"; exit 1 ;;
+    esac
+  '
+}
+if state_paths_resolve_from_state_dir; then
+  ok "state paths: all resolve from \$STATE_DIR / \$INSTALL_DIR"
+else
+  ng "state paths: at least one hardcodes a legacy location"
+fi
+
+# Override CTA_STATE_DIR to make sure the path indirection is real (not just
+# a literal "$HOME/.pager" coincidence). If any path is hardcoded, this fails.
+overridden_state_dir_takes_effect() {
+  CTA_STATE_DIR=/tmp/cta-test-state-$$ bash -c '
+    set -uo pipefail
+    source "'"$SCRIPT_DIR"'/cli/cta"
+    for var in PAIRING_CODE_FILE PAIRED_STATE_FILE MOUNTS_FILE ENV_FILE CAFFEINATE_PID_FILE; do
+      val="${!var}"
+      case "$val" in
+        /tmp/cta-test-state-*/*) ;;
+        *) echo "FAIL: $var=$val ignored CTA_STATE_DIR override"; exit 1 ;;
+      esac
+    done
+  '
+}
+if overridden_state_dir_takes_effect; then
+  ok "state paths: respect CTA_STATE_DIR env override"
+else
+  ng "state paths: at least one ignores CTA_STATE_DIR (hardcoded path)"
+fi
+
+# Structural guard: grep for legacy hardcodes outside the allowlist.
+# Allowed legacy refs are: LEGACY_STATE_DIR / LEGACY_INSTALL_DIR definitions
+# (intentional, for migrate-state), the warning comment, and the body of
+# cmd_migrate_state. Anything else is a regression.
+legacy_hardcode_count() {
+  # Strip cmd_migrate_state body (function-scope only)
+  awk '
+    /^cmd_migrate_state\(\) \{/ { in_fn=1 }
+    in_fn && /^\}/ { in_fn=0; next }
+    !in_fn
+  ' "$SCRIPT_DIR/cli/cta" | grep -cE '\$HOME/\.(claude-telegram-agent|local/share/claude-telegram-agent)'
+}
+hc=$(legacy_hardcode_count)
+# Expected refs OUTSIDE cmd_migrate_state:
+#   - LEGACY_STATE_DIR=...        (line 49)
+#   - LEGACY_INSTALL_DIR=...      (line 50)
+#   - the comment that explains the bug (1 line)
+if [[ "$hc" -le 3 ]]; then
+  ok "legacy hardcodes outside cmd_migrate_state: $hc (allowlisted: LEGACY_*_DIR + warning comment)"
+else
+  ng "legacy hardcodes outside cmd_migrate_state: $hc (expected ≤3 — new hardcode? use \$STATE_DIR / \$INSTALL_DIR)"
+fi
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo

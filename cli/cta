@@ -49,8 +49,17 @@ INSTALL_DIR="${CTA_INSTALL_DIR:-$HOME/.local/share/pager}"
 LEGACY_STATE_DIR="$HOME/.claude-telegram-agent"
 LEGACY_INSTALL_DIR="$HOME/.local/share/claude-telegram-agent"
 
+# All state-file paths MUST derive from $STATE_DIR. Hardcoding $HOME/.claude-telegram-agent/...
+# anywhere outside cmd_migrate_state diverges from agent/lib/paths.ts (which uses
+# stateDir() = ~/.pager) and causes silent mismatches — e.g., poller writes to ~/.pager,
+# cta reads from the legacy dir, /pair fails with "Pairing code did not match".
+# Regression test in tests/test_cta.sh guards this.
 ENV_FILE="$STATE_DIR/.env"
 CAFFEINATE_PID_FILE="$STATE_DIR/caffeinate.pid"
+PAIRING_CODE_FILE="$STATE_DIR/pairing-code"
+PAIRED_STATE_FILE="$STATE_DIR/paired.json"
+MOUNTS_FILE="$STATE_DIR/mounts.json"
+MOUNT_STORE_TS="$INSTALL_DIR/agent/mount-store/mount-store.ts"
 
 # Default emoji used by `cta config ack on`. Must be in Telegram's free-bot
 # reaction whitelist — eyes reads as "seen" and is universally available.
@@ -434,11 +443,11 @@ _config_caffeinate() {
 # consumes the code. After pairing, only the paired user can issue commands.
 #
 # Threat model: anyone who can see the pairing code can claim the bot before
-# you do. Code lives at $HOME/.claude-telegram-agent/pairing-code (mode 600)
+# you do. Code lives at $STATE_DIR/pairing-code (mode 600, default $HOME/.pager)
 # and is deleted on first successful pair. install.sh prints it once to stdout.
 # Lost code → `cta pair-code --reset` regenerates.
 
-PAIRING_CODE_FILE="$HOME/.claude-telegram-agent/pairing-code"
+# PAIRING_CODE_FILE moved to the top-of-file STATE_DIR block.
 
 # Confusion-free alphabet: drops 0/O, 1/I/L, S/5, Z/2, B/8 — so a code copied
 # from a terminal phone-photo is unambiguous. 25 chars × 8 ≈ 37 bits entropy,
@@ -456,7 +465,7 @@ _generate_pairing_code() {
   printf '%s-%s\n' "${code:0:4}" "${code:4:8}"
 }
 
-PAIRED_STATE_FILE="$HOME/.claude-telegram-agent/paired.json"
+# PAIRED_STATE_FILE moved to the top-of-file STATE_DIR block.
 
 # cta pair — host-driven pairing. Bypasses Telegram entirely. The user types
 # the chat_id (and optional user_id) they want to claim, and we write
@@ -531,12 +540,11 @@ EOF
   local cwd
   cwd=$(grep '^CLAUDE_CWD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
   if [[ -n "$cwd" && -d "$cwd" ]]; then
-    local store="$HOME/.local/share/claude-telegram-agent/agent/mount-store/mount-store.ts"
-    if [[ -f "$store" ]]; then
+    if [[ -f "$MOUNT_STORE_TS" ]]; then
       local has_wildcard
-      has_wildcard=$(bun run "$store" list 2>/dev/null | jq -r '.mounts[] | select(.thread_id == "*") | .thread_id' 2>/dev/null)
+      has_wildcard=$(bun run "$MOUNT_STORE_TS" list 2>/dev/null | jq -r '.mounts[] | select(.thread_id == "*") | .thread_id' 2>/dev/null)
       if [[ -z "$has_wildcard" ]]; then
-        bun run "$store" add '*' "$cwd" default >/dev/null 2>&1 \
+        bun run "$MOUNT_STORE_TS" add '*' "$cwd" default >/dev/null 2>&1 \
           && echo "Wildcard mount auto-created: * → $cwd"
       fi
     fi
@@ -600,11 +608,10 @@ cmd_unpair() {
     # Wipe mounts.json so the new pair starts clean. Wildcard from install
     # is regenerated next time install.sh runs; for now, just remove all
     # entries. User can re-mount via Telegram /mount or terminal cta mount.
-    local store="$HOME/.local/share/claude-telegram-agent/agent/mount-store/mount-store.ts"
-    if [[ -f "$store" ]]; then
+    if [[ -f "$MOUNT_STORE_TS" ]]; then
       # Build a fresh empty mounts.json by removing the file (mount-store
       # creates it on first add).
-      rm -f "$HOME/.claude-telegram-agent/mounts.json"
+      rm -f "$MOUNTS_FILE"
       echo "Cleared mounts.json (use --keep-mounts to preserve next time)."
     fi
   fi
@@ -659,12 +666,12 @@ cmd_pair_code() {
 # Locate mount-store.ts. CTA_AGENT_DIR override lets tests point at the
 # repo copy without installing.
 _mount_store_path() {
-  local d="${CTA_AGENT_DIR:-$HOME/.local/share/claude-telegram-agent/agent}"
+  local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
   echo "$d/mount-store/mount-store.ts"
 }
 
 _topic_wrapper_path() {
-  local d="${CTA_AGENT_DIR:-$HOME/.local/share/claude-telegram-agent/agent}"
+  local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
   echo "$d/topic-wrapper.sh"
 }
 
