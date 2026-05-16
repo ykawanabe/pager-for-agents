@@ -808,7 +808,19 @@ async function handleList(msg: TgMessage): Promise<void> {
     await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, "No mounts yet. Send `/mount <path>` in a topic to add one.");
     return;
   }
-  const lines = data.mounts.map((m) => `• thread ${m.thread_id} → ${m.path}${m.label ? ` (${m.label})` : ""}`);
+  // Join with topics.json so users see "thread 42 (Plans)" instead of bare
+  // "thread 42". Mirrors cta list's TOPIC column. Topics created before the
+  // bot joined the group remain anonymous until renamed — Telegram API gap.
+  const topics = readTopics().topics;
+  const chatId = pairedCache?.chat_id;
+  const lines = data.mounts.map((m) => {
+    let nameSuffix = "";
+    if (typeof m.thread_id === "number" && chatId !== undefined) {
+      const cachedName = topics[`${chatId}/${m.thread_id}`]?.name;
+      if (cachedName) nameSuffix = ` "${cachedName}"`;
+    }
+    return `• thread ${m.thread_id}${nameSuffix} → ${m.path}${m.label ? ` (${m.label})` : ""}`;
+  });
   await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, `Current mounts:\n${lines.join("\n")}`);
 }
 
