@@ -152,13 +152,41 @@ struct MenuView: View {
         }
     }
 
-    /// Pull the current mount list from `cta list --json`. Called at menu-render
-    /// time — SwiftUI re-renders the body when the user opens the menu bar item,
-    /// so we get a fresh snapshot on each open without polling. Returns empty on
-    /// any error (cta not installed, JSON parse failure) so the menu degrades
-    /// gracefully into a "no topics" hint.
+    /// Pull the current mount list from `cta list --json`, then filter out
+    /// mounts that aren't reachable in the currently paired chat. Called at
+    /// menu-render time — SwiftUI re-renders the body when the user opens
+    /// the menu bar item, so we get a fresh snapshot on each open without
+    /// polling. Returns empty on any error (cta not installed, JSON parse
+    /// failure) so the menu degrades gracefully into a "no topics" hint.
+    ///
+    /// Reachability rule: a mount is reachable only if its `thread_id` shape
+    /// can carry inbound messages in the paired chat's type. Numeric
+    /// thread_ids are forum topics, which only exist in groups/supergroups
+    /// (chat_id < 0). "dm" is reachable in both chat types — in a DM it's
+    /// the root, and in a group it catches the General topic (Telegram
+    /// omits message_thread_id for General, so the poller routes those
+    /// messages to the "dm" fallback). "*" is the catch-all and always
+    /// shown. Hiding unreachable mounts keeps stale entries out of the
+    /// picker — clicking them would attach a tmux session that receives
+    /// no traffic.
     private var currentMounts: [CTAClient.MountJSON] {
-        (try? CTAClient.listMounts()) ?? []
+        let all = (try? CTAClient.listMounts()) ?? []
+        let paired = CTAClient.pairedState()
+        return all.filter { isReachable($0, paired: paired) }
+    }
+
+    private func isReachable(
+        _ mount: CTAClient.MountJSON,
+        paired: CTAClient.PairedStateJSON?
+    ) -> Bool {
+        guard let paired else { return true }   // unpaired: show everything
+        let isGroup = paired.chatId < 0
+        switch mount.threadId {
+        case .string("dm"):  return true        // DM root (private) or General (group)
+        case .string("*"):   return true
+        case .number:        return isGroup
+        case .string:        return true        // unknown literal — fall back to visible
+        }
     }
 
     /// Format a mount for the Watch-live submenu. Prefer the human topic name
@@ -168,6 +196,12 @@ struct MenuView: View {
     private func menuLabel(for mount: CTAClient.MountJSON, pairedChatId: Int?) -> String {
         switch mount.threadId {
         case .string("dm"):
+            // In a group (chat_id < 0), the "dm" mount catches the General
+            // topic — Telegram omits message_thread_id for General messages,
+            // so the poller routes them to the "dm" fallback. Show "General"
+            // instead of "DM" so the label matches what the user sees in
+            // Telegram.
+            if let chatId = pairedChatId, chatId < 0 { return "General" }
             return "DM"
         case .string("*"):
             return "Wildcard fallback"

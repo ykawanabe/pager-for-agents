@@ -796,7 +796,18 @@ cmd_umount() {
 # unrecoverable). Always exits 0 — callers treat empty as "unknown."
 _topic_name() {
   local thread_id="$1"
-  # Non-numeric thread_ids ("dm", "*") have no forum topic by definition.
+  # "dm" mount in a group catches the General topic (Telegram omits
+  # message_thread_id for General messages, so the poller routes them to
+  # the "dm" fallback). Show "General" so the column matches what the user
+  # sees in Telegram. In a private DM, "dm" stays unlabeled.
+  if [[ "$thread_id" == "dm" ]]; then
+    [[ -f "$PAIRED_STATE_FILE" ]] || return 0
+    local chat_id
+    chat_id=$(jq -r '.chat_id // empty' "$PAIRED_STATE_FILE" 2>/dev/null) || return 0
+    [[ -n "$chat_id" && "$chat_id" -lt 0 ]] && echo "General"
+    return 0
+  fi
+  # Non-numeric thread_ids ("*") have no forum topic by definition.
   [[ "$thread_id" =~ ^[0-9]+$ ]] || return 0
   [[ -f "$TOPICS_FILE" && -f "$PAIRED_STATE_FILE" ]] || return 0
   local chat_id
@@ -830,13 +841,20 @@ cmd_list() {
     if [[ -f "$TOPICS_FILE" ]]; then
       topics_arg=$(jq -c '.topics // {}' "$TOPICS_FILE" 2>/dev/null || echo "{}")
     fi
+    # In a group (chat_id < 0), the "dm" mount catches the General topic;
+    # surface "General" so JSON consumers don't have to re-derive this.
+    local is_group="false"
+    if [[ -n "$chat_id" && "$chat_id" -lt 0 ]]; then is_group="true"; fi
     echo "$raw" | jq \
       --arg chat_id "$chat_id" \
       --argjson topics "$topics_arg" \
+      --argjson is_group "$is_group" \
       '.mounts |= map(
         . + (
           if (.thread_id | type) == "number" and ($chat_id | length) > 0 then
             { topic_name: ($topics[($chat_id + "/" + (.thread_id | tostring))].name // null) }
+          elif .thread_id == "dm" and $is_group then
+            { topic_name: "General" }
           else
             { topic_name: null }
           end
