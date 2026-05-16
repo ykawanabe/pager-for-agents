@@ -36,37 +36,55 @@ struct MenuView: View {
 
         Divider()
 
-        Button("Watch bot live") {
-            // "Live view" means the claude conversation, not the poller's log.
-            // MULTI_TOPIC has one session per topic (topic-dm + topic-<id>).
-            // Pick the most-recently-active topic-* session so the user lands
-            // on the conversation they're currently driving. Fall back to v0
-            // `claude` for single-topic installs.
-            //
-            // We don't pre-bake a list because topic sessions come and go —
-            // resolve at click time via tmux list-sessions.
-            let pick = """
-                LATEST=$(tmux list-sessions -F '#{session_activity} #{session_name}' 2>/dev/null \
-                  | awk '$2 ~ /^topic-/ {print $0}' | sort -rn | head -1 | awk '{print $2}')
-                if [ -n "$LATEST" ]; then
-                  tmux attach -t "$LATEST"
-                else
-                  tmux attach -t claude 2>/dev/null || { \
-                    echo "No claude conversation session is running yet."; \
-                    echo "Send a message in your paired Telegram chat to spawn one."; \
-                    read -n1 -s -r -p "Press any key to close..."; \
-                  }
-                fi
-                """
-            openTerminal(running: pick)
+        // MULTI_TOPIC has one claude session per topic (topic-dm + topic-<id>).
+        // Show a submenu listing every known mount so the user picks which
+        // conversation to attach to. Mounts come from cta — the single source
+        // of truth for "what topics exist." Topic names join via topics.json
+        // when the poller has cached them; missing names fall back to the
+        // thread_id so the menu is always actionable.
+        Menu("Watch bot live") {
+            let mounts = currentMounts
+            let pairedChatId = CTAClient.pairedState()?.chatId
+            if mounts.isEmpty {
+                Text("No topics running yet")
+                Text("Send a message in your paired chat first")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(mounts) { mount in
+                    Button(menuLabel(for: mount, pairedChatId: pairedChatId)) {
+                        let session = mount.tmuxSession
+                        // Quote the session name — Telegram topic IDs are numeric
+                        // but the fallback wildcard mount is `topic-*` which the
+                        // shell would glob otherwise.
+                        openTerminal(running: "tmux attach -t \"\(session)\" 2>/dev/null || { echo 'No tmux session \(session) — topic may be idle.'; read -n1 -s -r -p 'Press any key to close...'; }")
+                    }
+                }
+            }
+            Divider()
+            Button("Auto (most recent)") {
+                let pick = """
+                    LATEST=$(tmux list-sessions -F '#{session_activity} #{session_name}' 2>/dev/null \
+                      | awk '$2 ~ /^topic-/ {print $0}' | sort -rn | head -1 | awk '{print $2}')
+                    if [ -n "$LATEST" ]; then
+                      tmux attach -t "$LATEST"
+                    else
+                      tmux attach -t claude 2>/dev/null || { \
+                        echo "No claude conversation session is running yet."; \
+                        echo "Send a message in your paired Telegram chat to spawn one."; \
+                        read -n1 -s -r -p "Press any key to close..."; \
+                      }
+                    fi
+                    """
+                openTerminal(running: pick)
+            }
         }
         Button("Watch poller log") {
             // Separate item for the dispatch / routing log (poller stdout).
             // Helpful for diagnosing drops, pair state changes, etc.
-            openTerminal(running: "tmux attach -t poller 2>/dev/null || tail -F ~/.claude-telegram-agent/agent.log")
+            openTerminal(running: "tmux attach -t poller 2>/dev/null || tail -F \"\(CTAClient.stateDir)/agent.log\"")
         }
         Button("Show recent activity") {
-            openTerminal(running: "tail -f ~/.claude-telegram-agent/agent.log")
+            openTerminal(running: "tail -f \"\(CTAClient.stateDir)/agent.log\"")
         }
         Button("Restart bot") {
             _ = run("/bin/bash", ["-lc", "~/.local/bin/start_agents.sh"])
@@ -131,6 +149,36 @@ struct MenuView: View {
         case .green:  return .accentColor   // honors the system accent in System Settings → Appearance
         case .yellow: return .orange
         case .red:    return .red
+        }
+    }
+
+    /// Pull the current mount list from `cta list --json`. Called at menu-render
+    /// time — SwiftUI re-renders the body when the user opens the menu bar item,
+    /// so we get a fresh snapshot on each open without polling. Returns empty on
+    /// any error (cta not installed, JSON parse failure) so the menu degrades
+    /// gracefully into a "no topics" hint.
+    private var currentMounts: [CTAClient.MountJSON] {
+        (try? CTAClient.listMounts()) ?? []
+    }
+
+    /// Format a mount for the Watch-live submenu. Prefer the human topic name
+    /// when the poller cached it (forum_topic_created/edited), otherwise show
+    /// the raw thread_id so the menu is still useful immediately after invite
+    /// (before the user posts in the topic and triggers a cache update).
+    private func menuLabel(for mount: CTAClient.MountJSON, pairedChatId: Int?) -> String {
+        switch mount.threadId {
+        case .string("dm"):
+            return "DM"
+        case .string("*"):
+            return "Wildcard fallback"
+        case .number(let n):
+            if let chatId = pairedChatId,
+               let name = CTAClient.topicName(chatId: chatId, threadId: n) {
+                return "\(name) (#\(n))"
+            }
+            return "Topic #\(n)"
+        case .string(let s):
+            return s
         }
     }
 
