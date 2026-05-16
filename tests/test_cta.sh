@@ -494,6 +494,62 @@ else
   ng "_claude_ps_line: missing 'set +o pipefail' guard around head -1 chain"
 fi
 
+# ─── _topic_name: forum topic name lookup ─────────────────────────────────────
+# Topic names are cached by the poller in $STATE_DIR/topics.json from
+# forum_topic_created / forum_topic_edited service messages. cta list joins
+# this cache with the mount list so the user sees "Iron Flow" instead of
+# bare thread_id 140. Test the helper in isolation against a fixture state dir.
+
+topic_test_dir=$(mktemp -d)
+mkdir -p "$topic_test_dir"
+cat > "$topic_test_dir/paired.json" <<EOF
+{"version":1,"chat_id":-1003738946626,"user_id":1,"paired_at":"2026-05-16T00:00:00Z"}
+EOF
+cat > "$topic_test_dir/topics.json" <<EOF
+{"version":1,"topics":{"-1003738946626/140":{"name":"Iron Flow","captured_at":"2026-05-16T00:00:00Z"}}}
+EOF
+
+run_topic_name() {
+  CTA_STATE_DIR="$topic_test_dir" bash -c '
+    set -uo pipefail
+    source "'"$SCRIPT_DIR"'/cli/cta"
+    _topic_name "'"$1"'"
+  '
+}
+
+[[ "$(run_topic_name 140)" == "Iron Flow" ]] \
+  && ok "_topic_name: numeric thread_id with cached topic returns name" \
+  || ng "_topic_name: 140 → expected 'Iron Flow', got '$(run_topic_name 140)'"
+
+[[ -z "$(run_topic_name 999)" ]] \
+  && ok "_topic_name: unknown numeric thread_id returns empty" \
+  || ng "_topic_name: 999 (uncached) should return empty"
+
+[[ -z "$(run_topic_name dm)" ]] \
+  && ok "_topic_name: non-numeric 'dm' returns empty (no forum topic)" \
+  || ng "_topic_name: 'dm' should return empty (no forum topic by definition)"
+
+[[ -z "$(run_topic_name '*')" ]] \
+  && ok "_topic_name: wildcard '*' returns empty" \
+  || ng "_topic_name: '*' should return empty"
+
+# Missing topics.json → graceful empty
+rm -f "$topic_test_dir/topics.json"
+[[ -z "$(run_topic_name 140)" ]] \
+  && ok "_topic_name: missing topics.json returns empty without error" \
+  || ng "_topic_name: missing topics.json should return empty"
+
+# Missing paired.json → graceful empty (no chat_id, so no lookup key)
+cat > "$topic_test_dir/topics.json" <<EOF
+{"version":1,"topics":{"-1003738946626/140":{"name":"Iron Flow","captured_at":"2026-05-16T00:00:00Z"}}}
+EOF
+rm -f "$topic_test_dir/paired.json"
+[[ -z "$(run_topic_name 140)" ]] \
+  && ok "_topic_name: missing paired.json returns empty without error" \
+  || ng "_topic_name: missing paired.json should return empty"
+
+rm -rf "$topic_test_dir"
+
 # ─── state path derivation regression guard ──────────────────────────────────
 # Bug: cta hardcoded $HOME/.claude-telegram-agent/pairing-code for the pairing
 # code file, while the poller (agent/lib/paths.ts) reads from
