@@ -442,6 +442,58 @@ assert caff["pid"] is None, "pid should be null, got " + repr(caff["pid"])
   && ok "cmd_status json: caffeinate.alive=false when no pid file" \
   || ng "cmd_status json: caffeinate=off state wrong"
 
+# ─── pipefail+SIGPIPE regression guard ───────────────────────────────────────
+# Under `set -uo pipefail`, the old `launchctl list | grep -q LABEL` (and
+# similar ps|grep|head pipelines for _claude_ps_line / _mcp_alive) flipped
+# false intermittently under I/O load: the downstream sink closes its stdin
+# on first match, the upstream gets SIGPIPE, pipefail propagates non-zero,
+# and Pager shows a spurious "Degraded — LaunchAgent not loaded".
+#
+# These tests assert the function bodies use the atomic forms (no
+# `| grep -q`, no bare `| head -1` chain) so an accidental revert blows up
+# CI instead of silently re-introducing the flicker. Empirical load-time
+# verification (200/200 green) lives in the bug-investigation memory.
+
+# Earlier sections override these functions with stubs, so re-source cta in a
+# clean subshell and capture the real function bodies before assertions.
+bodies=$(bash -c '
+set -uo pipefail
+source "'"$SCRIPT_DIR"'/cli/cta"
+echo "===_la_loaded==="
+declare -f _la_loaded
+echo "===_mcp_alive==="
+declare -f _mcp_alive
+echo "===_claude_ps_line==="
+declare -f _claude_ps_line
+')
+
+la_body="$(awk '/^===_la_loaded===/,/^===_mcp_alive===/' <<< "$bodies")"
+mcp_body="$(awk '/^===_mcp_alive===/,/^===_claude_ps_line===/' <<< "$bodies")"
+ps_body="$(awk '/^===_claude_ps_line===/,0' <<< "$bodies")"
+
+if [[ "$la_body" != *"| grep -q"* ]]; then
+  ok "_la_loaded: no pipefail-vulnerable grep -q pipe"
+else
+  ng "_la_loaded: still contains '| grep -q' (pipefail+SIGPIPE risk)"
+fi
+if [[ "$la_body" == *"launchctl list \"\$PLIST_LABEL\""* || "$la_body" == *"launchctl list \$PLIST_LABEL"* ]]; then
+  ok "_la_loaded: uses atomic launchctl list LABEL form"
+else
+  ng "_la_loaded: does not use atomic launchctl list LABEL form"
+fi
+
+if [[ "$mcp_body" == *"pgrep"* && "$mcp_body" != *"| grep -v grep"* ]]; then
+  ok "_mcp_alive: atomic pgrep -f form, no ps|grep|head chain"
+else
+  ng "_mcp_alive: not using atomic pgrep -f form"
+fi
+
+if [[ "$ps_body" == *"set +o pipefail"* ]]; then
+  ok "_claude_ps_line: pipefail disabled in subshell around head -1 chain"
+else
+  ng "_claude_ps_line: missing 'set +o pipefail' guard around head -1 chain"
+fi
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo
