@@ -813,11 +813,17 @@ async function handleList(msg: TgMessage): Promise<void> {
   // bot joined the group remain anonymous until renamed — Telegram API gap.
   const topics = readTopics().topics;
   const chatId = pairedCache?.chat_id;
+  const isGroup = chatId !== undefined && chatId < 0;
   const lines = data.mounts.map((m) => {
     let nameSuffix = "";
     if (typeof m.thread_id === "number" && chatId !== undefined) {
       const cachedName = topics[`${chatId}/${m.thread_id}`]?.name;
       if (cachedName) nameSuffix = ` "${cachedName}"`;
+    } else if (m.thread_id === "dm" && isGroup) {
+      // In a group, "dm" mount catches messages from the General topic
+      // (Telegram omits message_thread_id for General). Label it as such
+      // so users don't see "DM" in a group context.
+      nameSuffix = ` "General"`;
     }
     return `• thread ${m.thread_id}${nameSuffix} → ${m.path}${m.label ? ` (${m.label})` : ""}`;
   });
