@@ -120,6 +120,16 @@ if ! grep -q '^BOT_SESSION_ID=..*' "$CONFIG_DIR/.env" 2>/dev/null; then
   say "Generated BOT_SESSION_ID=$bot_uuid for conversation persistence"
 fi
 
+# MULTI_TOPIC=1 is the Phase 1+ default. Older .env files written before the
+# Phase 1+ default switch lack the line entirely; without it start_agents.sh
+# silently falls back to the v0 single-topic path, leaving group / forum-topic
+# features unreachable. Append (don't replace — operators who explicitly set
+# MULTI_TOPIC=0 want the v0 path kept).
+if ! grep -q '^MULTI_TOPIC=' "$CONFIG_DIR/.env" 2>/dev/null; then
+  printf '\nMULTI_TOPIC=1\n' >> "$CONFIG_DIR/.env"
+  say "Enabled MULTI_TOPIC=1 (per-topic routing — the default since Phase 1+)"
+fi
+
 # Always clamp .env to 0600. Catches pre-existing installs that ran before
 # we tightened the cp umask, and re-asserts on every run as cheap insurance.
 chmod 600 "$CONFIG_DIR/.env" 2>/dev/null || true
@@ -164,10 +174,12 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   mkdir -p "$HOOKS_DIR"
   cp "$REPO_DIR/agent/hooks/pager-notify.sh" "$HOOKS_DIR/pager-notify.sh"
   chmod +x "$HOOKS_DIR/pager-notify.sh"
-  # Substitute $HOME → absolute path at install time. Claude Code's --settings
-  # treats hook "command" strings as literal shell paths; it does NOT expand
-  # env vars, so a literal "$HOME/..." path fails to spawn the hook.
-  sed "s|\$HOME|$HOME|g" "$REPO_DIR/agent/bot-hooks.json" > "$AGENT_DIR/../bot-hooks.json"
+  # Substitute __HOOKS_DIR__ → absolute path at install time. Claude Code's
+  # --settings treats hook "command" strings as literal shell paths; it does
+  # NOT expand env vars, so a literal `$HOME/...` path fails to spawn the hook.
+  # The placeholder also tracks INSTALL_DIR renames (we hit this once during
+  # the .claude-telegram-agent → pager rename — hooks silently stopped firing).
+  sed "s|__HOOKS_DIR__|$HOOKS_DIR|g" "$REPO_DIR/agent/bot-hooks.json" > "$AGENT_DIR/../bot-hooks.json"
 
   # Resolve mcp-telegram's runtime deps (the SDK). Poller has no deps but
   # `bun install` is a cheap no-op there. If bun is missing, warn and skip

@@ -256,8 +256,17 @@ cmd_start() {
   # or recovery), so it must NOT be the path for "make sure the bot is up."
   # Pager calls this on every launch via ensureBotRunning(); without this
   # guard, every Pager launch took the bot offline for ~3s.
-  if _tmux_session_alive "$TMUX_SESSION_CLAUDE" && _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then
-    echo "Already running (tmux $TMUX_SESSION_CLAUDE + $TMUX_SESSION_WATCHDOG alive)."
+  #
+  # MULTI_TOPIC mode flips which control session matters. The v0 single-topic
+  # path uses TMUX_SESSION_CLAUDE ("claude" by default); MULTI_TOPIC uses
+  # `poller` instead — there's no `claude` session in that mode. Match
+  # cmd_status's mapping so the "Already running" guard isn't dead code.
+  local control_session
+  if _multi_topic_enabled; then control_session="poller"
+  else control_session="$TMUX_SESSION_CLAUDE"
+  fi
+  if _tmux_session_alive "$control_session" && _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then
+    echo "Already running (tmux $control_session + $TMUX_SESSION_WATCHDOG alive)."
     # Still ensure the LaunchAgent is loaded so launchd will respawn at login.
     # This is non-destructive — launchctl load is a no-op when already loaded.
     if [[ -f "$PLIST_PATH" ]]; then
@@ -277,8 +286,27 @@ cmd_start() {
 }
 
 cmd_stop() {
+  # v0 sessions: harmless no-ops in MULTI_TOPIC mode (sessions don't exist).
   tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
   tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
+
+  # MULTI_TOPIC: kill the poller and every spawned topic-* session.
+  # Without this, `cta stop` left orphans that kept long-polling Telegram
+  # (poller) and consuming resources (topic-* claudes). Next `cta start` would
+  # race a second poller, half of inbound messages silently dropped — same
+  # shape as the v0 bun-orphan bug, just at a different layer.
+  tmux kill-session -t "poller" 2>/dev/null || true
+  # Kill every topic-<id> session. tmux list-sessions exits non-zero when the
+  # server isn't running, so guard with 2>/dev/null; awk filters by name prefix.
+  local topic_sessions
+  topic_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | awk '/^topic-/' || true)
+  if [[ -n "$topic_sessions" ]]; then
+    local sess
+    while IFS= read -r sess; do
+      [[ -z "$sess" ]] && continue
+      tmux kill-session -t "$sess" 2>/dev/null || true
+    done <<< "$topic_sessions"
+  fi
 
   # Clean up the bun MCP grandchildren the official telegram plugin spawned.
   # Process tree:  claude → bun (wrapper, --cwd .../telegram ...) → bun server.ts
