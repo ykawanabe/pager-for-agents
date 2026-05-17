@@ -28,8 +28,15 @@ export CTA_AGENT_DIR="$SCRIPT_DIR/agent"
 #      cta prepends /opt/homebrew/bin in its own header, defeating the shim.)
 #   2. PATH shim with `-L <socket>` — pins the socket name as well so a
 #      stray default-socket session in TMUX_TMPDIR can't be mistaken for ours.
+#   3. Unset TMUX/TMUX_PANE — if the test itself is run from inside a tmux
+#      pane, child tmux invocations inherit TMUX and connect back to the
+#      OUTER server (ignoring TMUX_TMPDIR + -L). That makes the user's real
+#      poller session visible to cta has-session checks and breaks the
+#      no-poller assertion. Stripping these vars forces tmux to fall back
+#      to TMUX_TMPDIR resolution.
 cta() {
-  TMUX_TMPDIR="$STATE" PATH="$STATE/bin:$PATH" "$CTA" "$@"
+  TMUX_TMPDIR="$STATE" PATH="$STATE/bin:$PATH" \
+    env -u TMUX -u TMUX_PANE "$CTA" "$@"
 }
 
 mkdir -p "$STATE/bin" "$STATE/tmux-$(id -u)"

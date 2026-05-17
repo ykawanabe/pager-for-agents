@@ -30,7 +30,7 @@ import { spawnSync } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { addMount, mountKey, readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
+import { addMount, gcProvisional, mountKey, readMounts, removeMount, type Mount, type ThreadId } from "../mount-store/mount-store";
 
 // Poller-side cache key for Telegram updates. Hardcoded "telegram" because
 // this file is the Telegram adapter; the LINE adapter (when added) will
@@ -628,6 +628,147 @@ async function ensureWildcardMount(): Promise<void> {
   }
 }
 
+// ─── mount-helper (auto-mount) ───────────────────────────────────────────────
+// When an unmounted topic receives a message AND no wildcard exists AND the
+// kill-switch is unset, spawn a one-shot helper claude in $HOME. Helper finds
+// a real project directory via send_telegram conversation, then commits via
+// `cta mount`. Cancellation: user sends `/cancel`. Cleanup: gcOrphanedProvisionals
+// runs at startup to drop rows whose helper tmux is dead.
+
+const HELPER_DISABLED = process.env.PAGER_DISABLE_HELPER === "1";
+
+function tmuxHasSession(name: string): boolean {
+  return spawnSync("tmux", ["has-session", "-t", name], { encoding: "utf8" }).status === 0;
+}
+
+function readTopicNameFromCache(thread_id: number | "dm"): string | null {
+  if (thread_id === "dm") return null;
+  try {
+    const cache = readTopics();
+    const chat = effectiveChatId();
+    if (!chat) return null;
+    const key = `${chat}/${thread_id}`;
+    return cache.topics?.[key]?.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendImmediateAck(thread_id: number | "dm", topic_name: string | null): Promise<void> {
+  const chat_id = effectiveChatId();
+  if (!chat_id) return;
+  const text = topic_name
+    ? `Looking for projects matching "${topic_name}"…`
+    : "Setting up this topic — what project should it point to?";
+  const body: Record<string, unknown> = { chat_id, text };
+  if (typeof thread_id === "number") body.message_thread_id = thread_id;
+  try {
+    await fetch(`${getApiBase()}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    process.stderr.write(`poller: sendImmediateAck failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+async function spawnHelper(thread_id: number | "dm"): Promise<string | null> {
+  if (HELPER_DISABLED) return null;
+  const tmuxSession = `helper-${thread_id}`;
+
+  // Idempotent: existing helper tmux means a helper is already mid-conversation.
+  if (tmuxHasSession(tmuxSession)) return tmuxSession;
+
+  const topicName = readTopicNameFromCache(thread_id);
+  // Immediate ack first — claude cold-start takes ~5-15s; without this the
+  // user stares at silence and assumes the bot is dead.
+  await sendImmediateAck(thread_id, topicName);
+
+  const home = process.env.HOME ?? "/tmp";
+  try {
+    await addMount({
+      thread_id,
+      path: home,
+      label: topicName ?? `helper-${thread_id}`,
+      tmux_session: tmuxSession,
+      provisional: true,
+    });
+  } catch (e) {
+    process.stderr.write(`poller: spawnHelper addMount failed for ${thread_id}: ${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
+  }
+
+  const servicesDir = process.env.MOUNT_STORE_PATH
+    ? join(process.env.MOUNT_STORE_PATH, "..", "..")
+    : installAgentDir();
+  const wrapperPath = join(servicesDir, "topic-wrapper.sh");
+  const cmd = [wrapperPath, String(thread_id), home, tmuxSession, "helper"]
+    .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
+    .join(" ");
+
+  // Pass PAGER_TOPIC_NAME through tmux's send-environment list isn't reliable;
+  // simpler to wrap the cmd in `env PAGER_TOPIC_NAME=...` so it gets to the
+  // helper-wrapper without polluting the poller's environment.
+  const safeName = (topicName ?? "").replace(/'/g, "'\\''");
+  const cmdWithEnv = `env PAGER_TOPIC_NAME='${safeName}' ${cmd}`;
+
+  spawnSync("tmux", ["kill-session", "-t", tmuxSession], { encoding: "utf8" });
+  const newSession = spawnSync(
+    "tmux",
+    ["new-session", "-d", "-s", tmuxSession, cmdWithEnv],
+    { encoding: "utf8" },
+  );
+  if (newSession.status !== 0) {
+    process.stderr.write(`poller: spawnHelper tmux new-session failed for ${thread_id}: ${newSession.stderr}\n`);
+    // Roll back the provisional mount so a retry can re-attempt cleanly.
+    try { await removeMount(thread_id); } catch { /* best effort */ }
+    return null;
+  }
+
+  refreshMountsIfChanged();
+  process.stdout.write(`[${new Date().toISOString()}] mount-helper spawned: thread ${thread_id} → ${tmuxSession} (topic_name=${topicName ?? "(unknown)"})\n`);
+  return tmuxSession;
+}
+
+async function gcOrphanedProvisionals(): Promise<void> {
+  try {
+    const dropped = await gcProvisional((s) => tmuxHasSession(s));
+    if (dropped > 0) {
+      process.stdout.write(`[${new Date().toISOString()}] poller: gc dropped ${dropped} orphaned provisional mount(s)\n`);
+      refreshMountsIfChanged();
+    }
+  } catch (e) {
+    process.stderr.write(`poller: gcOrphanedProvisionals failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+async function handleCancel(msg: TgMessage): Promise<void> {
+  const chat_id = msg.chat.id;
+  const thread_id_raw = msg.message_thread_id;
+  const key: number | "dm" = thread_id_raw != null ? thread_id_raw : "dm";
+  const mount = mountsCache.get(tgKey(key));
+  if (!mount?.provisional) {
+    await reply(
+      { chat_id, thread_id: thread_id_raw },
+      "Nothing to cancel — this topic isn't in mount-helper mode.",
+    );
+    return;
+  }
+  const helperSession = mount.tmux_session ?? `helper-${key}`;
+  spawnSync("tmux", ["kill-session", "-t", helperSession], { encoding: "utf8" });
+  try {
+    await removeMount(key);
+  } catch (e) {
+    process.stderr.write(`poller: handleCancel removeMount failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+  refreshMountsIfChanged();
+  await reply(
+    { chat_id, thread_id: thread_id_raw },
+    "Cancelled. Send any message here to start over, or use `cta mount` from your Mac to point this topic at a project directly.",
+  );
+}
+
 // ─── in-chat commands (Phase 3) ──────────────────────────────────────────────
 // The bot listens for /pair, /mount, /unmount, /list, /help in any message.
 // Pre-pair state: only /pair <code> accepted, from any chat — once it matches
@@ -962,6 +1103,7 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
     case "/mount": await handleMount(msg, args); return true;
     case "/dm":    await handleDm(msg, args); return true;
     case "/unmount": await handleUnmount(msg); return true;
+    case "/cancel": await handleCancel(msg); return true;
     case "/list":  await handleList(msg); return true;
     case "/help":  await handleHelp(msg); return true;
     default:
@@ -1164,8 +1306,22 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
   // are gated by paired user_id inside tryHandleCommand.
   if (await tryHandleCommand(msg)) return;
 
-  const target = routeMessage(msg);
-  if (!target) return;
+  let target = routeMessage(msg);
+  if (!target) {
+    // No specific mount, no wildcard. Try the mount-helper before dropping.
+    // Helper is skipped if PAGER_DISABLE_HELPER=1 — falls back to legacy
+    // silent-drop behavior for users who opt out.
+    const text0 = msg.text ?? msg.caption ?? "";
+    if (text0.length === 0) return;
+    const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+    const helperSession = await spawnHelper(key);
+    if (!helperSession) return; // disabled or spawn failed; original drop
+    // Brief delay for tmux+helper-wrapper to come up before dispatching the
+    // user's original message. Helper claude greets via its system prompt
+    // even if this dispatch loses the text — at worst the user re-types.
+    await new Promise((r) => setTimeout(r, 2000));
+    target = helperSession;
+  }
 
   const text = msg.text ?? msg.caption ?? "";
   if (text.length === 0) {
@@ -1251,10 +1407,15 @@ export async function main(): Promise<void> {
   await preflightBotToken();
   let offset = readOffset();
   refreshMountsIfChanged();
+  // Clean up orphaned provisional mounts from prior helper sessions whose
+  // tmux is no longer alive (host reboot, claude crash, manual kill). Real
+  // mounts are not touched. Must run AFTER the first mountsCache load so the
+  // refresh below sees the post-GC state.
+  await gcOrphanedProvisionals();
   refreshPairedIfChanged();
   refreshAckReactionIfChanged();
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
-  process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
+  process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}, helper=${HELPER_DISABLED ? "disabled" : "enabled"}\n`);
 
   for (;;) {
     touchHeartbeat();
