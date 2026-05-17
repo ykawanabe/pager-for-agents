@@ -22,6 +22,7 @@
 #   $1 = thread_id        e.g. 42
 #   $2 = project_path     e.g. ~/projects/iron-flow
 #   $3 = tmux_session     e.g. topic-42
+#   $4 = mode (optional)  e.g. "topic" (default) or "helper" for auto-mount
 
 set -uo pipefail
 
@@ -34,9 +35,14 @@ export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/b
 THREAD_ID="${1:-}"
 PROJECT_PATH="${2:-}"
 TMUX_SESSION="${3:-}"
+MODE="${4:-topic}"
 
 if [[ -z "$THREAD_ID" || -z "$PROJECT_PATH" || -z "$TMUX_SESSION" ]]; then
-  echo "Usage: topic-wrapper.sh <thread_id> <project_path> <tmux_session>" >&2
+  echo "Usage: topic-wrapper.sh <thread_id> <project_path> <tmux_session> [mode]" >&2
+  exit 1
+fi
+if [[ "$MODE" != "topic" && "$MODE" != "helper" ]]; then
+  echo "topic-wrapper: mode must be 'topic' or 'helper' (got '$MODE')" >&2
   exit 1
 fi
 if [[ ! -d "$PROJECT_PATH" ]]; then
@@ -206,6 +212,49 @@ compute_next_delay() {
   echo "$next"
 }
 
+helper_loop() {
+  # Helper mode: one-shot. cwd is $HOME (no cd into PROJECT_PATH — the helper
+  # is finding the project, not running inside one). No restart loop — the
+  # helper either commits a mount and gets torn down by cta mount, or exits
+  # naturally on user cancel / claude turn limit.
+  cd "$HOME" || { echo "topic-wrapper(helper): cd to HOME failed" >&2; exit 1; }
+
+  export TELEGRAM_CHAT_ID="$MAIN_CHAT_ID"
+  export TELEGRAM_THREAD_ID="$THREAD_ID"
+  export PAGER_TOPIC_NAME="${PAGER_TOPIC_NAME:-}"
+
+  local helper_prompt_path="$INSTALL_DIR/agent/helper-prompt.md"
+  local helper_perms_path="$INSTALL_DIR/agent/helper-permissions.json"
+  # Dev-mode fallback: tests and source-tree invocations point at the repo
+  # directly. resolve relative to this script's directory.
+  if [[ ! -f "$helper_prompt_path" ]]; then
+    local self_dir; self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    helper_prompt_path="$self_dir/helper-prompt.md"
+    helper_perms_path="$self_dir/helper-permissions.json"
+  fi
+  if [[ ! -f "$helper_prompt_path" || ! -f "$helper_perms_path" ]]; then
+    echo "topic-wrapper(helper): helper-prompt.md or helper-permissions.json not found (looked in $INSTALL_DIR/agent and script dir)" >&2
+    exit 1
+  fi
+  local append_prompt; append_prompt=$(cat "$helper_prompt_path")
+
+  local args=(--mcp-config "$MCP_CFG" --strict-mcp-config --dangerously-skip-permissions)
+  # Settings layering: bot-hooks gives us PreCompact/PostCompact/Notification
+  # status pings; helper-permissions adds the deny list. claude code accepts
+  # multiple --settings flags; later layers compose with earlier.
+  [[ -f "$BOT_HOOKS_PATH" ]] && args+=(--settings "$BOT_HOOKS_PATH")
+  args+=(--settings "$helper_perms_path")
+  args+=(--append-system-prompt "$append_prompt")
+
+  local flag
+  flag=$(session_arg_flag "$HOME" "$SESSION_UUID")
+  args+=("$flag" "$SESSION_UUID")
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] helper for topic $THREAD_ID: claude starting in \$HOME (no restart loop)"
+  claude "${args[@]}" || true
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] helper for topic $THREAD_ID: exited"
+}
+
 main_loop() {
   cd "$PROJECT_PATH" || { echo "topic-wrapper: cd to PROJECT_PATH=$PROJECT_PATH failed" >&2; exit 1; }
 
@@ -244,5 +293,9 @@ main_loop() {
 # Sourcing for tests exposes the helpers (compute_next_delay,
 # session_arg_flag, resolve_append_prompt) without spawning claude.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  main_loop
+  if [[ "$MODE" == "helper" ]]; then
+    helper_loop
+  else
+    main_loop
+  fi
 fi
