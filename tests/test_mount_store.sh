@@ -199,6 +199,44 @@ V2_OUT=$(bun run "$STORE" list)
 [[ "$(echo "$V2_OUT" | jq -r '.version')" == "2" ]] && ok "v2 read: version=2" || ng "v2 read: version=2"
 [[ "$(echo "$V2_OUT" | jq -r '.mounts[0].channel')" == "telegram" ]] && ok "v2 read: explicit channel preserved" || ng "v2 read: explicit channel preserved"
 
+# ─── provisional / replace / gc-provisional ─────────────────────────────────
+# Helper-mode features added 2026-05-17 for auto-mount.
+
+rm -rf "$STATE" && mkdir -p "$STATE"
+
+# Round-trip the provisional flag through add → get.
+PROV=$(bun run "$STORE" add 11 /tmp/foo helper-test --provisional)
+[[ "$(echo "$PROV" | jq -r '.provisional')" == "true" ]] && ok "add --provisional: flag set on returned mount" || ng "add --provisional: flag set on returned mount"
+[[ "$(jq -r '.mounts[] | select(.thread_id==11) | .provisional' "$STATE/mounts.json")" == "true" ]] && ok "add --provisional: flag persisted to disk" || ng "add --provisional: flag persisted to disk"
+
+# Plain add omits provisional entirely (absent, not false).
+bun run "$STORE" add 12 /tmp/bar baz >/dev/null
+PROV_PLAIN=$(jq -r '.mounts[] | select(.thread_id==12) | .provisional // "absent"' "$STATE/mounts.json")
+[[ "$PROV_PLAIN" == "absent" ]] && ok "add without flag: provisional field absent on disk" || ng "add without flag: provisional field absent (got $PROV_PLAIN)"
+
+# replace overwrites a provisional row and clears the flag.
+REPLACED=$(bun run "$STORE" replace 11 /tmp/foo-real real-label)
+[[ "$(echo "$REPLACED" | jq -r '.path')" == "/tmp/foo-real" ]] && ok "replace 11: path updated" || ng "replace 11: path updated"
+[[ "$(echo "$REPLACED" | jq -r '.label')" == "real-label" ]] && ok "replace 11: label updated" || ng "replace 11: label updated"
+[[ "$(echo "$REPLACED" | jq -r '.provisional // "absent"')" == "absent" ]] && ok "replace 11: provisional flag cleared" || ng "replace 11: provisional flag cleared"
+
+# replace on a missing thread_id creates the row (no throw).
+REPLACED_NEW=$(bun run "$STORE" replace 22 /tmp/new new-label)
+[[ "$(echo "$REPLACED_NEW" | jq -r '.thread_id')" == "22" ]] && ok "replace on missing thread_id: creates row" || ng "replace on missing thread_id: creates row"
+
+# gc-provisional drops provisional rows whose tmux is dead, keeps live rows.
+rm -rf "$STATE" && mkdir -p "$STATE"
+bun run "$STORE" add 33 /tmp/dead helper --provisional --tmux-session helper-33-DEAD >/dev/null
+bun run "$STORE" add 44 /tmp/real real-mount >/dev/null
+GC_OUT=$(bun run "$STORE" gc-provisional)
+[[ "$(echo "$GC_OUT" | jq -r '.dropped')" == "1" ]] && ok "gc-provisional: drops orphan helper" || ng "gc-provisional: drops orphan helper (got $GC_OUT)"
+[[ "$(bun run "$STORE" get 33)" == "null" ]] && ok "gc-provisional: removed thread 33" || ng "gc-provisional: removed thread 33"
+[[ "$(bun run "$STORE" get 44 | jq -r '.thread_id')" == "44" ]] && ok "gc-provisional: kept non-provisional mount" || ng "gc-provisional: kept non-provisional mount"
+
+# gc-provisional is idempotent.
+GC_OUT_2=$(bun run "$STORE" gc-provisional)
+[[ "$(echo "$GC_OUT_2" | jq -r '.dropped')" == "0" ]] && ok "gc-provisional: idempotent (0 on second run)" || ng "gc-provisional: idempotent"
+
 # ─── result ─────────────────────────────────────────────────────────────────
 
 echo
