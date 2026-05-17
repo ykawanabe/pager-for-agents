@@ -525,13 +525,30 @@ run_topic_name() {
   && ok "_topic_name: unknown numeric thread_id returns empty" \
   || ng "_topic_name: 999 (uncached) should return empty"
 
-[[ -z "$(run_topic_name dm)" ]] \
-  && ok "_topic_name: non-numeric 'dm' returns empty (no forum topic)" \
-  || ng "_topic_name: 'dm' should return empty (no forum topic by definition)"
+# dm in a group chat → "General" (the General topic catches no-thread_id
+# messages; the fixture's chat_id is negative = group). For DMs the fixture
+# would use a positive chat_id and dm would return empty — covered separately
+# below.
+[[ "$(run_topic_name dm)" == "General" ]] \
+  && ok "_topic_name: 'dm' in group returns 'General'" \
+  || ng "_topic_name: 'dm' in group should return 'General', got '$(run_topic_name dm)'"
 
 [[ -z "$(run_topic_name '*')" ]] \
   && ok "_topic_name: wildcard '*' returns empty" \
   || ng "_topic_name: '*' should return empty"
+
+# dm in a private chat (positive chat_id) → empty, since there's no General
+# topic to label and the dm sentinel is just the chat root.
+cat > "$topic_test_dir/paired.json" <<EOF
+{"version":1,"chat_id":12345,"user_id":1,"paired_at":"2026-05-16T00:00:00Z"}
+EOF
+[[ -z "$(run_topic_name dm)" ]] \
+  && ok "_topic_name: 'dm' in private chat returns empty" \
+  || ng "_topic_name: 'dm' in private chat should return empty, got '$(run_topic_name dm)'"
+# Restore group fixture for downstream tests
+cat > "$topic_test_dir/paired.json" <<EOF
+{"version":1,"chat_id":-1003738946626,"user_id":1,"paired_at":"2026-05-16T00:00:00Z"}
+EOF
 
 # Missing topics.json → graceful empty
 rm -f "$topic_test_dir/topics.json"

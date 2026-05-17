@@ -160,12 +160,14 @@ PY
 # ─── claude argv ─────────────────────────────────────────────────────────────
 
 # shellcheck disable=SC2016  # backticks in this prompt are literal markdown, not command subs
-DEFAULT_BOT_APPEND_SYSTEM_PROMPT='You are responding through a Telegram bot. The user is on Telegram; your terminal output is NOT visible to them. To deliver ANY reply, you MUST call the `send_telegram` MCP tool with your response text. A reply that only appears in the terminal never reaches the user.
+DEFAULT_BOT_APPEND_SYSTEM_PROMPT='You are responding through a Telegram bot. The user is on Telegram; your terminal output is NOT visible to them. To deliver ANY reply, you MUST call the `send_telegram` MCP tool (fully qualified name: `mcp__telegram__send_telegram`) with your response text. A reply that only appears in the terminal never reaches the user — they will see silence and assume the bot is broken.
+
+On long-running sessions, harness context compaction may move `mcp__telegram__send_telegram` to the deferred-tools list. If you ever encounter that — or you see ANY response from the model start to compose terminal-only text instead of calling the tool — STOP, call `ToolSearch` with `query="select:mcp__telegram__send_telegram"` to reload its schema, then send the reply via the tool. Never write phrases like "Telegram disconnected" or "I''ll keep this inline" — the connection is fine, the tool just needs to be reloaded.
 
 Workflow for every user message:
   1. Read the message, do any tool work needed (file reads, code edits, etc.).
   2. Compose your reply.
-  3. Call `send_telegram(text=...)` to deliver it.
+  3. Call `send_telegram(text=...)` to deliver it. If that fails with "tool not found" or "deferred", run ToolSearch first then retry.
 You can call `send_telegram` multiple times in one turn if the response is long or progresses through phases (e.g. "looking into it" → final answer).
 
 When you need the user to choose between a small fixed set of options (Yes/No, A/B/C, two paths forward), pass `buttons=["Option A","Option B",...]` to `send_telegram` instead of asking with prose alone. Up to 8 buttons, each ≤50 chars. The user taps one and the chosen label is dispatched back as their next message — natural turn boundary, no extra typing on mobile. Do NOT use `AskUserQuestion` over Telegram (it opens a local modal that the user cannot see or answer).
@@ -189,11 +191,34 @@ resolve_append_prompt() {
 
 session_arg_flag() {
   local cwd="$1" uuid="$2"
+  # claude encodes both `/` and `.` as `-` when naming the project dir under
+  # ~/.claude/projects. We MUST match that exactly — a mismatch makes the
+  # function think the jsonl doesn't exist, return `--session-id` instead of
+  # `--resume`, and claude then rejects with "already in use" (because it
+  # finds the real jsonl via its own encoding). Crash-loop bug observed
+  # 2026-05-17 on github.com paths.
   local encoded="${cwd//\//-}"
+  encoded="${encoded//./-}"
   if [[ -f "$HOME/.claude/projects/${encoded}/${uuid}.jsonl" ]]; then
     echo "--resume"
   else
     echo "--session-id"
+  fi
+}
+
+# claude maintains a per-session lock at ~/.claude/tasks/<uuid>/.lock and
+# refuses --session-id / --resume with "Session ID X is already in use" if
+# the lock is present. When a previous claude crashes or is SIGKILLed the
+# lock survives, and the restart loop wedges in a crash-loop that only an
+# operator can break. lsof on the lock returns nonzero when no process
+# holds it — that's our stale signal. Clear before each attempt.
+clear_stale_lock() {
+  local uuid="$1"
+  local lock="$HOME/.claude/tasks/$uuid/.lock"
+  [[ -f "$lock" ]] || return 0
+  if ! lsof "$lock" >/dev/null 2>&1; then
+    rm -f "$lock"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] cleared stale session lock $lock"
   fi
 }
 
@@ -251,6 +276,7 @@ helper_loop() {
   args+=("$flag" "$SESSION_UUID")
 
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] helper for topic $THREAD_ID: claude starting in \$HOME (no restart loop)"
+  clear_stale_lock "$SESSION_UUID"
   claude "${args[@]}" || true
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] helper for topic $THREAD_ID: exited"
 }
@@ -279,6 +305,7 @@ main_loop() {
 
     local start_ts end_ts ran_for
     start_ts=$(date +%s)
+    clear_stale_lock "$SESSION_UUID"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] topic $THREAD_ID: claude starting in $PROJECT_PATH ($flag $SESSION_UUID)"
     claude "${args[@]}" || true
     end_ts=$(date +%s)
