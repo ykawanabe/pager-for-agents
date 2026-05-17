@@ -119,6 +119,19 @@ flag=$(session_arg_flag "/tmp/fakehome/other-home" "$UUID")
 [[ "$flag" == "--session-id" ]] && ok "different cwd → --session-id" \
   || ng "different cwd → expected --session-id, got $flag"
 
+# Path with dots — claude encodes both `/` and `.` as `-`. If session_arg_flag
+# only translates `/`, it will miss the jsonl, return --session-id, and claude
+# rejects on launch with "already in use". Crash-loop bug seen 2026-05-17 on
+# github.com paths.
+DOT_CWD="/tmp/fakehome/ghq/src/github.com/owner/repo"
+DOT_ENCODED="-tmp-fakehome-ghq-src-github-com-owner-repo"
+DOT_UUID="22222222-2222-3333-4444-555555555555"
+mkdir -p "$HOME/.claude/projects/${DOT_ENCODED}"
+touch "$HOME/.claude/projects/${DOT_ENCODED}/${DOT_UUID}.jsonl"
+flag=$(session_arg_flag "$DOT_CWD" "$DOT_UUID")
+[[ "$flag" == "--resume" ]] && ok "cwd with dots → --resume (matches claude's encoding)" \
+  || ng "cwd with dots → expected --resume, got $flag"
+
 # ─── resolve_append_prompt: env-driven prompt selection ──────────────────────
 #
 # The bot passes claude `--append-system-prompt <text>` so its replies stop

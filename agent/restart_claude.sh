@@ -64,8 +64,13 @@ compute_next_delay() {
 #   $2 = session UUID
 session_arg_flag() {
   local cwd="$1" uuid="$2"
+  # claude encodes both `/` and `.` as `-` when naming the project dir under
+  # ~/.claude/projects. Match that exactly — a `/` only translation makes
+  # github.com paths miss the jsonl, fall through to --session-id, and crash
+  # claude with "already in use" (it finds the file via its own encoding).
   local encoded
   encoded="${cwd//\//-}"
+  encoded="${encoded//./-}"
   if [[ -f "$HOME/.claude/projects/${encoded}/${uuid}.jsonl" ]]; then
     echo "--resume"
   else
