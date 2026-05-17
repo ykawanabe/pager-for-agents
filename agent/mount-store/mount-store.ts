@@ -113,6 +113,14 @@ export interface Mount {
   session_id: string;
   tmux_session: string;
   created_at: string;
+  /**
+   * Helper-mode marker. When true, the row was written by the poller's
+   * spawnHelper path as a placeholder so subsequent messages route to
+   * the helper-<thread_id> tmux session. cta mount replaces it with a
+   * real entry; gcProvisional drops it if the helper tmux is dead.
+   * Absent on all non-helper mounts.
+   */
+  provisional?: boolean;
 }
 
 export interface MountsFile {
@@ -203,6 +211,7 @@ interface AnyMount {
   session_id: string;
   tmux_session: string;
   created_at: string;
+  provisional?: boolean;
 }
 
 interface AnyMountsFile {
@@ -236,6 +245,7 @@ export function readMounts(): MountsFile {
       session_id: m.session_id,
       tmux_session: m.tmux_session,
       created_at: m.created_at,
+      ...(m.provisional ? { provisional: true } : {}),
     }));
     return { version: 2, mounts };
   } catch (e) {
@@ -273,6 +283,12 @@ export async function addMount(args: {
    * tmux session as the routing target instead of spawning a fresh one.
    */
   tmux_session?: string;
+  /**
+   * Optional. Marks the row as a helper-mode placeholder (see Mount.provisional).
+   * Used by the poller's spawnHelper path; cta mount replaces these with
+   * real entries via replaceMount.
+   */
+  provisional?: boolean;
 }): Promise<Mount> {
   const channel = args.channel ?? DEFAULT_CHANNEL;
   return withLock(() => {
@@ -288,10 +304,65 @@ export async function addMount(args: {
       session_id: randomUUID(),
       tmux_session: args.tmux_session ?? `topic-${args.thread_id}`,
       created_at: new Date().toISOString(),
+      ...(args.provisional ? { provisional: true } : {}),
     };
     data.mounts.push(mount);
     writeMountsAtomic(data);
     return mount;
+  });
+}
+
+/**
+ * Atomic remove-and-add. The intended use is the helper-mode commit path:
+ * `cta mount` detects an existing provisional row and overwrites it with
+ * the user-chosen real path under a single lock acquisition. Unlike
+ * addMount, this never throws on duplicate — it is the duplicate handler.
+ */
+export async function replaceMount(args: {
+  channel?: Channel;
+  thread_id: ThreadId;
+  path: string;
+  label?: string;
+  tmux_session?: string;
+}): Promise<Mount> {
+  const channel = args.channel ?? DEFAULT_CHANNEL;
+  return withLock(() => {
+    const data = readMounts();
+    const filtered = data.mounts.filter((m) => !sameTarget(m, channel, args.thread_id));
+    const mount: Mount = {
+      channel,
+      thread_id: args.thread_id,
+      path: args.path,
+      label: args.label,
+      session_id: randomUUID(),
+      tmux_session: args.tmux_session ?? `topic-${args.thread_id}`,
+      created_at: new Date().toISOString(),
+    };
+    filtered.push(mount);
+    writeMountsAtomic({ ...data, mounts: filtered });
+    return mount;
+  });
+}
+
+/**
+ * Drop provisional rows whose helper tmux session is dead. Called by the
+ * poller at startup to clean up state left behind when a helper crashed,
+ * a host rebooted mid-conversation, or `cta umount` partially ran. Real
+ * (non-provisional) mounts are never touched. Returns the number dropped.
+ */
+export async function gcProvisional(
+  isAlive: (tmuxSession: string) => boolean,
+): Promise<number> {
+  return withLock(() => {
+    const data = readMounts();
+    const kept = data.mounts.filter((m) => {
+      if (!m.provisional) return true;
+      if (!m.tmux_session) return false;
+      return isAlive(m.tmux_session);
+    });
+    const dropped = data.mounts.length - kept.length;
+    if (dropped > 0) writeMountsAtomic({ ...data, mounts: kept });
+    return dropped;
   });
 }
 
@@ -349,15 +420,40 @@ async function main(): Promise<void> {
     }
     case "add": {
       // Args: <thread_id> <path> [label] [tmux_session]
-      // tmux_session 4th-arg form is used by `cta bind` to pin the current
-      // pane's tmux name; absent → defaults to `topic-<thread_id>`.
+      // Flags: --provisional, --tmux-session <name> (alternative to positional)
+      // tmux_session positional (4th arg) is used by `cta bind` to pin the
+      // current pane's tmux name; absent → defaults to `topic-<thread_id>`.
+      const provisional = rest.includes("--provisional");
+      const tmuxFlagIdx = rest.indexOf("--tmux-session");
+      const tmuxFromFlag = tmuxFlagIdx >= 0 ? rest[tmuxFlagIdx + 1] : undefined;
+      const positional = rest.filter((a, i) =>
+        !a.startsWith("--") && rest[i - 1] !== "--tmux-session"
+      );
+      const path = positional[1];
+      const label = positional[2];
+      // Empty 4th arg is treated as "not provided" — callers that want the
+      // default `topic-<thread_id>` session name pass "" rather than omitting
+      // the arg entirely (preserved for backward-compat with shell-quoting).
+      const tmux_session = (tmuxFromFlag || positional[3]) || undefined;
+      if (!path) bail("add: path is required");
+      try {
+        const id = parseThreadId(positional[0] ?? "");
+        const m = await addMount({ thread_id: id, path, label, tmux_session, provisional });
+        process.stdout.write(`${JSON.stringify(m)}\n`);
+      } catch (e) {
+        bail(e instanceof Error ? e.message : String(e));
+      }
+      return;
+    }
+    case "replace": {
+      // Args: <thread_id> <path> [label] [tmux_session]
       const path = rest[1];
       const label = rest[2];
       const tmux_session = rest[3] || undefined;
-      if (!path) bail("add: path is required");
+      if (!path) bail("replace: path is required");
       try {
         const id = parseThreadId(rest[0] ?? "");
-        const m = await addMount({ thread_id: id, path, label, tmux_session });
+        const m = await replaceMount({ thread_id: id, path, label, tmux_session });
         process.stdout.write(`${JSON.stringify(m)}\n`);
       } catch (e) {
         bail(e instanceof Error ? e.message : String(e));
@@ -374,8 +470,20 @@ async function main(): Promise<void> {
       }
       return;
     }
+    case "gc-provisional": {
+      const dropped = await gcProvisional((s) => {
+        try {
+          const r = Bun.spawnSync(["tmux", "has-session", "-t", s]);
+          return r.exitCode === 0;
+        } catch {
+          return false;
+        }
+      });
+      process.stdout.write(`${JSON.stringify({ dropped })}\n`);
+      return;
+    }
     default:
-      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, remove`);
+      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, replace, remove, gc-provisional`);
   }
 }
 
