@@ -326,6 +326,15 @@ main_loop() {
 
   setup_pane_log "$TMUX_SESSION" "$THREAD_ID" "$STATE_DIR"
 
+  # Enable mouse mode on the topic session so wheel/trackpad scroll
+  # naturally enters tmux copy-mode and scrolls through pane history.
+  # Without this, Pager's Watch live (and any tmux client) is stuck on
+  # the visible pane — tmux's own scrollback is invisible. Per-session
+  # so we don't touch the user's global config or unrelated sessions
+  # (poller / watchdog). Tradeoff: text selection inside Pager now
+  # requires holding Option, which is the standard tmux+mouse idiom.
+  tmux set-option -t "$TMUX_SESSION" mouse on 2>/dev/null || true
+
   local append_prompt
   append_prompt=$(resolve_append_prompt "${BOT_APPEND_SYSTEM_PROMPT:-}" "$DEFAULT_BOT_APPEND_SYSTEM_PROMPT")
 
