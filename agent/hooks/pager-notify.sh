@@ -57,8 +57,34 @@ case "$EVENT" in
     ;;
   notification)
     msg=$(extract message)
-    [[ -z "$msg" ]] && msg="Claude is waiting on you."
-    TEXT="🔔 $msg"
+    tool_name=$(extract tool_name)
+    [[ -z "$msg" ]] && msg="Claude is waiting for your input — reply in this thread to continue."
+
+    # Best-effort topic name lookup. Multi-topic users see notifications
+    # from N topics; including the human-readable name disambiguates
+    # which session is waiting. Falls back to no-prefix when the topic
+    # isn't in topics.json yet (forum-topic-created service message
+    # hasn't arrived, or this is a DM).
+    topic_label=""
+    if [[ -n "$THREAD_ID" && "$THREAD_ID" != "0" ]]; then
+      topics_json="${CTA_STATE_DIR:-$HOME/.pager}/topics.json"
+      if [[ -f "$topics_json" ]]; then
+        topic_label=$(python3 -c "
+import json
+try:
+    d = json.load(open('$topics_json'))
+    print(d.get('topics', {}).get('${CHAT_ID}/${THREAD_ID}', {}).get('name', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+      fi
+    fi
+
+    # Compose: [topic] [tool:Bash] message
+    prefix=""
+    [[ -n "$topic_label" ]] && prefix="[$topic_label] "
+    [[ -n "$tool_name"   ]] && prefix="${prefix}[tool:$tool_name] "
+    TEXT="🔔 ${prefix}${msg}"
     ;;
   *)
     exit 0
