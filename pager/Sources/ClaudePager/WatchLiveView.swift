@@ -125,7 +125,19 @@ struct WatchLiveView: View {
     private var paneBody: some View {
         if let threadId = vm.focusedThreadId {
             switch vm.paneStatus {
-            case .live, .starting:
+            case .live, .starting, .unknown:
+                // Optimistic render: show the terminal as soon as we have a
+                // focused thread, without waiting for the 2s polling loop to
+                // confirm .live. The previous "case .unknown: placeholderText
+                // (Loading…)" path was the source of the user-perceived
+                // "load 走ってる" flash on every window open — paneStatus
+                // resets to .unknown when the VM is recreated, and the user
+                // had to wait for the next refreshPane before the terminal
+                // appeared. If the session turns out to be dead, the next
+                // poll will flip paneStatus and we'll switch to the
+                // placeholder. tmux attach's own error message ("can't find
+                // session") is also reasonable to show transiently.
+                //
                 // .id(threadId) recreates the NSViewRepresentable when focus
                 // moves to a different topic. SwiftTerm's terminate() runs
                 // via dismantleNSView, so the old tmux client is released
@@ -138,8 +150,6 @@ struct WatchLiveView: View {
                 placeholderText("No mount for this thread.\n\nDetails: \(stderr)")
             case .error(let msg):
                 placeholderText("Error checking topic status:\n\n\(msg)")
-            case .unknown:
-                placeholderText("Loading…", muted: true)
             }
         } else {
             placeholderText("Select a topic from the sidebar.", muted: true)

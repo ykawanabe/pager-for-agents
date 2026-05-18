@@ -31,12 +31,20 @@ swift build -c release
 say "Assembling app bundle at $APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 
-# Stop any running instance before overwriting the binary inside the bundle.
-launchctl unload "$PLIST_PATH" 2>/dev/null || true
-pkill -f "Claude Pager.app/Contents/MacOS/ClaudePager" 2>/dev/null || true
-pkill -f "claude-pager$" 2>/dev/null || true
-sleep 1
-
+# Replace the binary while the old one may still be running.
+#
+# Why no `launchctl unload` here: the previous version of this script called
+# unload right before doing the cp. That forced the `launchctl print` check
+# below to always fall into the `load` branch (because we'd just unloaded),
+# which triggers macOS's "is now running in the background" notification on
+# every install — exactly the "毎回 load 走ってる" problem we're solving.
+#
+# Why this rm+cp is safe even with the old binary running: macOS keeps the
+# mmapped binary alive via its old inode as long as the process is running.
+# `rm` only removes the directory entry, not the inode. `cp` then writes a
+# fresh file at the path. The running process keeps executing from the old
+# inode until kickstart -k kills it; the respawn picks up the new inode.
+rm -f "$APP_BUNDLE/Contents/MacOS/ClaudePager"
 cp ".build/release/ClaudePager" "$APP_BUNDLE/Contents/MacOS/ClaudePager"
 chmod +x "$APP_BUNDLE/Contents/MacOS/ClaudePager"
 
