@@ -13,7 +13,38 @@ Today, "Watch live" in Pager's menu bar opens Terminal.app and runs `tmux attach
 - No way to multi-watch (separate Terminal windows clutter quickly).
 - Mobile-style observability (just see what's happening) requires full terminal literacy.
 
-Goal: a native Pager window that shows the live state of a topic's claude session, with optional message input.
+Goal: **a single native Pager window that shows the live state of ALL active topics at a glance**, with optional message input to the focused topic.
+
+### Layout decision (2026-05-18)
+
+Sidebar + main pane (Slack/Discord pattern), NOT one-window-per-topic. Reasoning:
+- Watching N topics in detail simultaneously is impractical at typical screen real estate.
+- Users want both **overview** (which topics have activity right now?) and **detail** (what is IronFlow doing?). A sidebar with unread indicator + 1-line preview gives overview; the main pane gives detail.
+- Single-window scales to many topics. Per-topic windows clutter the dock and require the user to manage window state.
+- Familiar UX from Slack, Discord, Element — no learning curve.
+
+```
+┌──────────────┬─────────────────────────────────┐
+│ # IronFlow   │ ⏺ Bash(git status --short)      │
+│   ⏺ git st…  │   M IronFlow.xcodeproj/...      │
+│              │   M IronFlow/DesignSystem/...   │
+│ # Plans  ●   │ ❯ コミットしてmainにマージ        │
+│   ❯ コミッ.. │                                  │
+│              │ ⏺ Handoff prompt をTelegramに   │
+│ # claude-tg  │   送信しました。新セッションで    │
+│   ✓ Brewed.. │   そのまま使える形式で...         │
+│              │                                  │
+│ # General    │ ─────────────────────────────── │
+│   (idle 2h)  │ ❯ [    Reply to #Plans       ]  │
+└──────────────┴─────────────────────────────────┘
+
+Legend:
+ ● = unread / active recently
+ ✓ = idle, last activity was claude completing
+ (idle Nh) = stale, no activity in N hours
+```
+
+Rejected alternatives: grid/mosaic (text too small with 4+ topics; expensive to render N tmux captures simultaneously), tabs (hides activity in inactive tabs — directly contradicts the "see everything" goal).
 
 ## Non-goals
 
@@ -24,17 +55,18 @@ Goal: a native Pager window that shows the live state of a topic's claude sessio
 ## Layered architecture (binds to `multi-topic-stability-plan.md` principles)
 
 ```
-                ┌───────────────────────────┐
-       user →   │ Pager WatchLive Window    │  SwiftUI, read-mostly
-                │ (display + optional input)│
-                └────────────┬──────────────┘
-                             │
-                             ↓ shells out
-                ┌───────────────────────────┐
-                │ cta watch <thread>        │  display source
-                │ cta send  <thread> <text> │  input sink
-                │ cta status --json         │  liveness
-                └────────────┬──────────────┘
+                ┌────────────────────────────────────┐
+       user →   │ Pager unified WatchLive window     │  SwiftUI, read-mostly
+                │  sidebar (all topics) + main pane  │
+                │  + optional input to focused topic │
+                └─────────────────┬──────────────────┘
+                                  │
+                                  ↓ shells out
+                ┌────────────────────────────────────┐
+                │ cta watch <thread> [--follow]      │  display source
+                │ cta send  <thread> <text>          │  input sink (focused)
+                │ cta status --json                  │  liveness + mount list
+                └────────────────────┬───────────────┘
                              │
                              ↓ owns
               ┌────────────────────────────────┐
@@ -92,40 +124,58 @@ The smallest version that demonstrates value. Polls tmux capture-pane on a timer
   - Dead tmux → exit 2 + stderr.
   - `--lines 50` returns ≤50 lines.
 
-- [ ] **A.2 — Pager WatchLive window controller (one window per topic)**
+- [ ] **A.2 — Pager unified WatchLive window**
 
   Location: `pager/WatchLiveWindowController.swift` (new file).
 
-  Behavior:
-  - Opens a window titled `Watch: <topic_name>` sized 800×500 (resizable).
-  - Polls `cta watch <thread> --lines 500` every 500 ms.
-  - Renders in a SwiftUI `ScrollView` with `Text` in monospaced font (e.g., `SF Mono 12`).
+  Single window across all topics — sidebar lists every mount, main pane renders the selected topic.
+
+  Window:
+  - Title: `Pager — Watch live`, size 1000×600 (resizable, min 700×400).
+  - Singleton: opening "Watch live" from the menu bar focuses the existing window if open, otherwise creates it.
+  - Closes only when user explicitly closes it. Empty mounts list ≠ close (sidebar just shows a "no topics yet" placeholder).
+
+  Sidebar (left, ~240pt):
+  - One row per mount from `cta status --json` (P3.3 — see Cross-plan integration; for v1 read `mounts.json` directly).
+  - Row content (top→bottom):
+    - Topic label (`#IronFlow`, `#General`, `DM` for dm key).
+    - Activity indicator: `●` (active, latest log line in last 60s), `✓` (idle but green), `(idle Nh)` (stale).
+    - 1-line preview: last non-empty line from the topic log, truncated to fit (`⏺ git status..`).
+  - Selection: clicking a row makes it the focused topic. Selection persists in memory until Pager quits; not persisted across restarts (E.3).
+  - Default selection on open: most recently active topic.
+
+  Main pane (right, flex):
+  - Renders the selected topic's stream. Polled `cta watch <thread> --lines 500` every 500ms in Phase A; switches to streamed in Phase B.
+  - SwiftUI `ScrollView` with `Text` in `SF Mono 12`.
   - Auto-scrolls to bottom unless the user has manually scrolled up (detect via `ScrollViewReader`).
   - Strips ANSI codes (basic regex `\x1B\[[0-9;]*[a-zA-Z]` — Phase D adds color rendering).
+  - Header shows the focused topic name + status pill (A.3).
+  - On focus change: cancel the previous topic's poll/stream, start the new one.
 
-  Lifecycle:
-  - One window per `thread_id`. If user clicks "Watch live" for a topic already open, focus the existing window.
-  - Window closes when user closes it OR when the topic's mount is removed (observe via `cta status --json` polled every 2s).
+  Polling cost: sidebar previews need 1-line tail from each mount every ~2s. Cheap as long as Phase B (per-topic log files) is in place — then it's `tail -n 1` of a static file, not a `tmux capture-pane` per row. In Phase A the sidebar previews are derived from the same `cta watch <id> --lines 1` call piggy-backing on whatever polling is happening; refresh rate degraded to ~5s for sidebar to keep cost down.
 
   Wiring:
-  - Add a "Watch live in Pager" menu item under each mount in the existing menu bar `WatchLiveSubmenu`, alongside the existing "Open in Terminal" item.
+  - Existing menu bar "Watch live" submenu collapses to a single "Open Watch live window…" item (replaces the per-topic Terminal-launching items). Power users keep Terminal access via `cta attach <id>` from the shell.
 
   Test (Pager unit test):
-  - Mock `cta watch` to return a fixed buffer; assert window renders.
-  - Mock `cta watch` to error; assert window shows "topic not running" state, not crash.
-  - Mock status change (mount removed); assert window auto-closes.
+  - Mock `cta watch` to return a fixed buffer; assert main pane renders.
+  - Mock sidebar data (3 mounts); assert 3 rows + preview lines + correct activity indicators.
+  - Click a sidebar row; assert main pane switches to that topic.
+  - Mock `cta watch` error for selected topic; assert main pane shows "topic not running" state, not crash.
+  - Mock mount removal: assert row disappears from sidebar; if it was selected, focus shifts to next active row.
 
-- [ ] **A.3 — Status indicator in window header**
+- [ ] **A.3 — Status pill in main-pane header**
 
-  Location: `WatchLiveWindowController.swift` header bar.
+  Location: `WatchLiveWindowController.swift` main pane header (above the stream).
 
   Behavior:
-  - Show a small status pill: `● Live` (green) when `cta status --json` reports the topic's tmux session alive, `● Dead` (red) when not, `● Restarting…` (yellow) when alive but `--lines 1` capture is empty (cold start).
+  - Show a small status pill for the **selected** topic: `● Live` (green) when `cta status --json` reports the topic's tmux session alive, `● Dead` (red) when not, `● Restarting…` (yellow) when alive but `--lines 1` capture is empty (cold start).
+  - Sidebar activity indicators (●/✓/idle) are a coarser real-time view; the pill is the authoritative liveness signal for the focused topic.
 
   Test:
-  - Mock each status; assert pill renders correctly.
+  - Mock each status; assert pill renders correctly when each topic is focused.
 
-**Gate A:** can open a window from Pager menu, see claude's TUI output update every 500ms, status pill reflects liveness. Manual sign-off acceptable for Phase A only.
+**Gate A:** can open the unified window from Pager menu, sidebar lists all mounts with previews + activity dots, clicking a row swaps the main pane to that topic's stream, status pill reflects liveness. Manual sign-off acceptable for Phase A only.
 
 ### Phase B — Streamed display via per-topic log file
 
@@ -174,13 +224,17 @@ Side benefit: enables `cta logs <thread>` to return the topic's specific log (to
 
   Location: `WatchLiveWindowController.swift`.
 
-  Change A.2's polled `cta watch` call to a long-lived `cta watch --follow <id>` subprocess. Read stdout line-by-line, append to the text buffer. Cancel the subprocess when the window closes.
+  Change A.2's polled `cta watch` for the **focused** topic to a long-lived `cta watch --follow <id>` subprocess. Read stdout line-by-line, append to that topic's in-memory buffer. Cancel the subprocess when the user switches to a different topic (focus change → cancel old subprocess + start new) or when the window closes.
 
-  Bound the in-memory buffer to last N=500 lines (drop oldest on push).
+  Sidebar previews ALSO switch off polling: each row reads the last line of `$STATE_DIR/topics/<id>.log` directly (cheap `tail -n 1` via FileHandle, no subprocess). Refresh on log file mtime change via FSEvents.
+
+  Bound the in-memory buffer per topic to last N=500 lines (drop oldest on push). Non-focused topics' buffers are NOT kept in memory — only the last preview line, fetched on-demand from the file. (Keeping all N topics' full buffers in memory would balloon Pager's RSS for high-traffic topics.)
 
   Test:
-  - Mock `cta watch --follow` to emit lines on a timer; assert window appends in order.
-  - Close window; assert subprocess receives SIGTERM and exits.
+  - Mock `cta watch --follow` to emit lines on a timer; assert main pane appends in order.
+  - Switch focus to another topic; assert the first subprocess receives SIGTERM and the new one starts.
+  - Close window; assert all subprocesses exit.
+  - Touch a non-focused topic's log file; assert that sidebar row's preview updates within 1s.
 
 **Gate B:** Pager no longer polls. Stream is near-real-time. Topic log files are available via `cta watch --follow` from CLI too.
 
@@ -274,22 +328,30 @@ Make the window robust to topic respawn / unmount.
   - Kill topic-42 tmux + respawn.
   - Assert window shows respawn boundary (e.g., a separator), then resumes.
 
-- [ ] **E.2 — Window auto-closes on mount removal**
+- [ ] **E.2 — Sidebar row disappears on mount removal**
 
-  Already in A.2 but verify the path: Pager observes `cta status --json` (every 2s). When the watched mount is gone (umount, unpair), window shows a brief "Mount removed" message and auto-closes after 5s.
+  Pager observes `cta status --json` (every 2s). When a mount is gone (umount, unpair):
+  - That topic's row disappears from the sidebar.
+  - If the removed topic was the focused one, the main pane briefly shows "Mount removed — switched to <next-active>", focus shifts to the most recently active remaining mount, stream restarts.
+  - If no mounts remain, sidebar shows the empty-state placeholder; main pane shows "No topics paired yet — pair the bot from Telegram to begin."
+  - The window itself does NOT auto-close. Closing is always explicit by the user.
 
   Test:
-  - Open watch window.
-  - Run `cta umount <id>`.
-  - Assert window closes within 7s.
+  - Open window with 3 mounts; focus #2.
+  - `cta umount #2` → assert row disappears, focus shifts to a remaining row, no crash.
+  - `cta umount` the other two → assert empty-state placeholder, window still open.
 
 - [ ] **E.3 — Window persistence across Pager restarts**
 
-  Open question: should re-opening Pager restore previously-open watch windows?
+  Open question: should re-opening Pager restore the watch window state?
 
-  Recommendation: NO for v1. Each Pager launch starts with no watch windows. Reasoning: watch is an attention-focused activity ("what's happening NOW") — automatic re-open after restart implies persistence the user may not intend.
+  Two sub-questions now that the window is unified:
+  1. Was the watch window open when Pager last quit? Reopen if yes.
+  2. Which topic was selected? Restore selection if yes.
 
-  If user demand surfaces, add a `~/.pager/pager-state.json` Pager-only state file with last-open-window thread_ids. Out of scope for v1.
+  Recommendation v1: **NO to (1), YES to (2)**. Don't auto-open the window — watch-live is an attention-focused activity. But if the user does open it, default-select their last-selected topic (falling back to most-recently-active if that mount is gone). Store as a single key in `~/.pager/pager-state.json` (Pager-only). This avoids "where am I?" friction without the boldness of auto-popping a window at login.
+
+  If user demand for full restore surfaces later, add a `watch_window_open: bool` flag in the same state file.
 
 ## Test strategy
 
@@ -306,8 +368,9 @@ All Pager tests run on the macOS CI runner (Pager's existing CI lane). Shell tes
 - **tmux `pipe-pane` from inside the wrapper:** does it work from a process running inside the same pane it's piping? Most likely yes (tmux pipe-pane is a tmux server call, not a pane-internal action), but verify in Task B.1 with a smoke test before relying on it.
 - **`tail -F` behavior on truncation:** `tail -F` (capital F) follows by name and survives truncation / recreation. Verify on macOS specifically — `tail -f` (lowercase) does not.
 - **ANSI parser scope creep:** claude TUI may use cursor positioning, screen clearing, alternative screen buffer. Phase D's parser must handle these gracefully (drop them, or render as-is) — don't try to emulate cursor positioning, that's terminal-emulator territory.
-- **Helper mode visibility:** should helper-mode topics appear in the watch menu? Probably yes — the user benefits from seeing helper conversation progress. Treat helper mounts the same as topic mounts for watch purposes.
-- **Provisional row display:** the status pill for a provisional row says what? Suggest: `● Helper (mid-conversation)` distinct color, to make the helper lifecycle observable.
+- **Helper mode visibility:** should helper-mode (provisional) mounts appear in the sidebar? Probably yes — the user benefits from seeing helper conversation progress while it's still mid-pairing. Treat provisional rows the same as regular rows for sidebar inclusion.
+- **Provisional row display:** how does the sidebar distinguish a provisional row from a regular one? Suggest: prepend `(helper)` to the label, and use the yellow `● Helper (mid-conversation)` pill in the main pane when focused, to make the helper lifecycle observable.
+- **Sidebar with many topics:** at 10+ active mounts the sidebar gets long. Out of scope for v1 (works fine with vertical scroll), but a future iteration may add grouping (`#chat-group / #IronFlow`) or pinning.
 
 ## Cross-plan integration
 
@@ -320,5 +383,6 @@ All Pager tests run on the macOS CI runner (Pager's existing CI lane). Shell tes
 - **Scope discipline:** each phase has a clear gate; can ship A alone, A+B alone, etc.
 - **Layer purity:** Pager only ever shells `cta` commands — never `tmux` directly. Every tmux interaction is owned by cta/agent layer.
 - **Test coverage:** every step has a test or explicit "manual sign-off acceptable" note (only Gate A allows manual).
-- **Future robustness:** ANSI parsing isolated; per-topic logs are reusable beyond Pager (CLI, future web UI); lifecycle integration ensures windows track real state.
-- **What this plan does NOT do:** terminal emulation, cross-host streaming (F3), embedded web UI, persistent window state. Each is a deliberate non-goal.
+- **Future robustness:** ANSI parsing isolated; per-topic logs are reusable beyond Pager (CLI, future web UI); single-window model scales to many topics without dock clutter; lifecycle integration ensures sidebar tracks real state.
+- **Layout choice rationale:** sidebar + main pane was picked over per-topic windows / mosaic grid / tabs — see "Layout decision" in Context. Trade-off: only one topic in detail at a time, but sidebar previews give the at-a-glance overview that motivated the unified-window request.
+- **What this plan does NOT do:** terminal emulation, cross-host streaming (F3), embedded web UI, auto-opening the window at Pager launch, multiple simultaneous detail panes. Each is a deliberate non-goal. (E.3 *does* persist the last-selected topic — a narrow exception explained there.)
