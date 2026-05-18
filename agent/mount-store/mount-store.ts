@@ -394,6 +394,19 @@ export async function removeMount(
   });
 }
 
+/**
+ * Atomically clear ALL mounts. Used by `cta unpair` (and the poller's
+ * /unpair confirm handler) to wipe state on chat reset without bypassing
+ * the lock. `rm -f mounts.json` worked but raced with concurrent `cta
+ * mount` (mount mid-rename + unpair unlink → torn read). Writing an empty
+ * file under withLock is atomic.
+ */
+export async function clearMounts(): Promise<void> {
+  return withLock(() => {
+    writeMountsAtomic({ version: 2, mounts: [] });
+  });
+}
+
 export function findMount(channel: Channel, thread_id: ThreadId): Mount | null {
   return readMounts().mounts.find((m) => sameTarget(m, channel, thread_id)) ?? null;
 }
@@ -501,8 +514,13 @@ async function main(): Promise<void> {
       process.stdout.write(`${JSON.stringify({ dropped })}\n`);
       return;
     }
+    case "clear": {
+      await clearMounts();
+      process.stdout.write(`${JSON.stringify({ cleared: true })}\n`);
+      return;
+    }
     default:
-      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, replace, remove, gc-provisional`);
+      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, replace, remove, gc-provisional, clear`);
   }
 }
 

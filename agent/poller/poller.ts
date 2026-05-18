@@ -1099,9 +1099,16 @@ async function handleUnpair(msg: TgMessage, args: string): Promise<void> {
     );
     return;
   }
-  // Release.
+  // Release. paired.json is owned solely by the poller, so unlink is safe;
+  // mounts.json is shared with cta — use the mount-store `clear` op so the
+  // wipe goes through the file lock (no torn writes if a concurrent
+  // `cta mount` is mid-rename).
   try { unlinkSync(PAIRED_STATE_FILE); } catch { /* already gone */ }
-  try { unlinkSync(MOUNTS_JSON); } catch { /* already gone */ }
+  try {
+    spawnSync("bun", ["run", installMountStoreTs(), "clear"], { encoding: "utf8" });
+  } catch (e) {
+    process.stderr.write(`poller: handleUnpair clearMounts failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
   pairedCache = null;
   pairedMtimeMs = 0;
   refreshMountsIfChanged();
