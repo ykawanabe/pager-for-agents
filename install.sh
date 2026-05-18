@@ -165,6 +165,12 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
   cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
   chmod +x "$AGENT_DIR/topic-wrapper.sh"
+  # mount-helper (auto-mount) artifacts: read by topic-wrapper.sh when invoked
+  # in helper mode (4th positional arg). Without these files in $INSTALL_DIR/
+  # agent/, a fresh install would `exit 1` on the first message to an
+  # unmounted topic. Read-only; no chmod +x.
+  cp "$REPO_DIR/agent/helper-prompt.md" "$AGENT_DIR/helper-prompt.md"
+  cp "$REPO_DIR/agent/helper-permissions.json" "$AGENT_DIR/helper-permissions.json"
 
   # Bot-scoped Claude Code hooks: PreCompact/PostCompact/Notification fire
   # status messages to Telegram during otherwise-silent windows. Passed to
