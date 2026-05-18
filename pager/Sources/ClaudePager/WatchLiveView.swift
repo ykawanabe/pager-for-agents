@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Unified Watch-Live window: sidebar lists every active mount with a 1-line
 /// preview + activity dot; main pane renders the focused topic's tmux pane.
@@ -16,7 +17,13 @@ struct WatchLiveView: View {
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 700, minHeight: 400)
         .onAppear { vm.start() }
-        .onDisappear { vm.stop() }
+        .onDisappear {
+            vm.stop()
+            // Restore accessory mode so Pager doesn't keep a Dock icon
+            // after the user closes the watch window. MenuView's open
+            // handler bumped us to .regular so the window could take focus.
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     // MARK: - Sidebar
@@ -74,13 +81,20 @@ struct WatchLiveView: View {
     private func activityDot(_ a: WatchLiveViewModel.Activity) -> some View {
         switch a {
         case .live:
-            Circle().fill(.green).frame(width: 8, height: 8)
+            // Filled green circle = content moved since last refresh.
+            Image(systemName: "circle.fill")
+                .foregroundColor(.green)
+                .font(.system(size: 10))
         case .idle:
-            Circle().stroke(.secondary, lineWidth: 1).frame(width: 8, height: 8)
+            // Green check = alive and healthy, just not currently producing
+            // output. Distinct from .live (still moving) and from .dead.
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundColor(.green.opacity(0.7))
+                .font(.system(size: 11))
         case .dead:
             Image(systemName: "xmark.circle.fill")
                 .foregroundColor(.red)
-                .font(.system(size: 10))
+                .font(.system(size: 11))
         }
     }
 

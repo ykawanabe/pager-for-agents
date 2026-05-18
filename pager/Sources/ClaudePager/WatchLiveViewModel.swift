@@ -94,6 +94,11 @@ final class WatchLiveViewModel: ObservableObject {
 
         var newRows: [Row] = []
         for mount in mounts {
+            // The "*" wildcard mount is a routing fallback for unmounted
+            // topics — its tmux session isn't pre-spawned, so it always
+            // shows as dead in the sidebar even when nothing's broken.
+            // Hide it; user knows their actual topics by name.
+            if mount.threadId.stringValue == "*" { continue }
             let key = mount.threadId.stringValue
             let preview: String
             let activity: Activity

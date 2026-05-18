@@ -43,6 +43,12 @@ struct MenuView: View {
         // topic's tmux pane. See docs/plans/pager-watch-live.md.
         // Power users can still drop to Terminal: `tmux attach -t topic-<id>`.
         Button("Watch live…") {
+            // Pager is LSUIElement (accessory) — openWindow alone creates the
+            // window off-screen / behind everything. Promote to .regular so
+            // the window can take focus, then activate. We revert to
+            // .accessory on window close (see WatchLiveView.onDisappear).
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "watch-live")
         }
         Button("Watch poller log") {
