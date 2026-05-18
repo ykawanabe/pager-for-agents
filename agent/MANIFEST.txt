@@ -42,6 +42,9 @@ lib/paths.ts	agent	644
 # Per-topic supervisor (executable shell)
 topic-wrapper.sh	agent	755
 
+# Picker watcher — surfaces claude's alt-screen TUI pickers to Telegram
+picker-watcher.ts	agent	644
+
 # Mount-helper (auto-mount) artifacts
 helper-prompt.md	agent	644
 helper-permissions.json	agent	644

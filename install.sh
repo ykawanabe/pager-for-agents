@@ -165,6 +165,10 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
   cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
   chmod +x "$AGENT_DIR/topic-wrapper.sh"
+  # picker-watcher: bun script spawned by topic-wrapper to surface claude's
+  # interactive TUI pickers (/effort, /model, etc.) to Telegram as a
+  # snapshot — the bot can't deliver arrow-key picker input on its own.
+  cp "$REPO_DIR/agent/picker-watcher.ts" "$AGENT_DIR/picker-watcher.ts"
   # mount-helper (auto-mount) artifacts: read by topic-wrapper.sh when invoked
   # in helper mode (4th positional arg). Without these files in $INSTALL_DIR/
   # agent/, a fresh install would `exit 1` on the first message to an

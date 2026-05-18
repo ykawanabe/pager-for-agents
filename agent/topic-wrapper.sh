@@ -335,6 +335,26 @@ main_loop() {
   # requires holding Option, which is the standard tmux+mouse idiom.
   tmux set-option -t "$TMUX_SESSION" mouse on 2>/dev/null || true
 
+  # Spawn the picker-watcher in the background. It polls this session's
+  # `#{alternate_on}` to detect when claude opens an interactive picker
+  # (/effort, /model, file picker, etc.) and pushes a snapshot to the
+  # paired Telegram chat — because Telegram itself can't deliver arrow-
+  # key TUI input back to claude. EXIT trap below kills the watcher when
+  # topic-wrapper unwinds.
+  local wrapper_dir
+  wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  local picker_watcher_script="$wrapper_dir/picker-watcher.ts"
+  PICKER_WATCHER_PID=""
+  if [[ -f "$picker_watcher_script" ]] && command -v bun >/dev/null 2>&1 && [[ -n "$MAIN_CHAT_ID" ]]; then
+    bun "$picker_watcher_script" \
+      --session "$TMUX_SESSION" \
+      --chat-id "$MAIN_CHAT_ID" \
+      --thread-id "$THREAD_ID" \
+      >> "$STATE_DIR/picker-watcher.log" 2>&1 &
+    PICKER_WATCHER_PID=$!
+    trap 'if [[ -n "$PICKER_WATCHER_PID" ]]; then kill "$PICKER_WATCHER_PID" 2>/dev/null || true; fi' EXIT
+  fi
+
   local append_prompt
   append_prompt=$(resolve_append_prompt "${BOT_APPEND_SYSTEM_PROMPT:-}" "$DEFAULT_BOT_APPEND_SYSTEM_PROMPT")
 
