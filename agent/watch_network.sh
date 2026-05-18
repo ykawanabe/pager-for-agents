@@ -32,6 +32,12 @@ MCP_FAILURE_THRESHOLD=3
 WATCHDOG_STARTUP_GRACE_SECS=60
 
 STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
+INSTALL_DIR="${CTA_INSTALL_DIR:-$HOME/.local/share/pager}"
+
+# Heartbeat staleness threshold in seconds. Poller touches heartbeat every
+# getUpdates cycle (~25-30s under normal long-poll). 120s = ~4 missed cycles,
+# unambiguous "dead poller" rather than a flaky network.
+POLLER_STALE_THRESHOLD_SECS=120
 
 load_env() {
   local env_file="$STATE_DIR/.env"
@@ -62,6 +68,89 @@ kick_claude_session() {
     return 0
   fi
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ kick failed — session not present after restart" >&2
+  return 1
+}
+
+# MULTI_TOPIC: respawn the `poller` tmux session in place. Used when the
+# poller's bun process has died (heartbeat went stale) — the v0 LaunchAgent
+# only watches start_agents.sh, which exits successfully after spawning, so
+# launchd's KeepAlive never fires for a poller death. Without this, a dead
+# poller stays dead until the next login (no inbound messages reach any
+# topic). The respawn is targeted: it touches only the `poller` session, not
+# the per-topic claudes — those have their own restart loop via
+# topic-wrapper.sh and are likely still running mid-conversation.
+# MULTI_TOPIC: respawn dead per-topic tmux sessions. The wrapper's restart
+# loop only recovers crashes WITHIN a tmux session — if the session itself
+# is gone (manual kill, OOM, system reboot mid-day), nothing brings it back
+# until the next inbound message AND a fresh `cta start`. That makes "I sent
+# a message to topic X and got nothing" the canonical user-visible failure.
+# Iterate mounts.json on every loop tick; for each numeric/dm mount whose
+# tmux_session has no tmux pane, respawn via topic-wrapper.sh. Wildcard ("*")
+# entries are routing fallbacks, not standalone sessions — skip them.
+kick_dead_topic_sessions() {
+  local mounts_file="$STATE_DIR/mounts.json"
+  [[ -f "$mounts_file" ]] || return 0
+  local wrapper="$INSTALL_DIR/agent/topic-wrapper.sh"
+  [[ -x "$wrapper" ]] || return 0
+  local entries
+  entries=$(jq -r '.mounts[] | select(.thread_id != "*") | [(.thread_id|tostring), .path, .tmux_session] | @tsv' "$mounts_file" 2>/dev/null) || return 0
+  [[ -z "$entries" ]] && return 0
+  while IFS=$'\t' read -r thread_id project_path tmux_session; do
+    [[ -z "$thread_id" ]] && continue
+    [[ -d "$project_path" ]] || continue
+    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+      continue
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] respawning dead topic session: $tmux_session (thread $thread_id)"
+    local quoted_cmd
+    quoted_cmd=$(printf '%q ' "$wrapper" "$thread_id" "$project_path" "$tmux_session")
+    tmux new-session -d -s "$tmux_session" "$quoted_cmd" 2>/dev/null || {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ failed to respawn $tmux_session" >&2
+      continue
+    }
+    sleep 0.2
+    tmux pipe-pane -t "$tmux_session" -o "cat >> $STATE_DIR/agent.log" 2>/dev/null || true
+  done <<< "$entries"
+}
+
+kick_poller_session() {
+  local reason="$1"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $reason — restarting poller session"
+  # Pull token from the plugin .env, same source start_agents.sh uses. Done
+  # at kick time rather than cached at boot so a rotated token is picked up.
+  local plugin_env="$HOME/.claude/channels/telegram/.env"
+  local token=""
+  if [[ -f "$plugin_env" ]]; then
+    token=$(grep '^TELEGRAM_BOT_TOKEN=' "$plugin_env" | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//')
+  fi
+  if [[ -z "$token" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick aborted — TELEGRAM_BOT_TOKEN missing in $plugin_env" >&2
+    return 1
+  fi
+  if [[ -z "${MAIN_CHAT_ID:-}" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick aborted — MAIN_CHAT_ID missing in env" >&2
+    return 1
+  fi
+  local poller_path="$INSTALL_DIR/agent/poller/poller.ts"
+  if [[ ! -f "$poller_path" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick aborted — $poller_path missing" >&2
+    return 1
+  fi
+  tmux kill-session -t poller 2>/dev/null || true
+  sleep 1
+  tmux new-session -d -s poller \
+    -e "TELEGRAM_BOT_TOKEN=$token" \
+    -e "MAIN_CHAT_ID=$MAIN_CHAT_ID" \
+    "bun $poller_path" || true
+  # Brief settle before pipe-pane attach — start_agents.sh hit an intermittent
+  # "can't find pane: poller" without this on first launch.
+  sleep 0.2
+  tmux pipe-pane -t poller -o "cat >> $STATE_DIR/agent.log" 2>/dev/null || true
+  if tmux has-session -t poller 2>/dev/null; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] poller kick complete — session active"
+    return 0
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick failed — session not present after restart" >&2
   return 1
 }
 
@@ -134,21 +223,43 @@ main_loop() {
         WAS_TG_DOWN=0
         MCP_FAILS=0
       elif [[ "${MULTI_TOPIC:-0}" == "1" ]]; then
-        # MULTI_TOPIC mode owns its own per-topic restart loops via
-        # topic-wrapper.sh. The v0 `claude` tmux session does not exist and
-        # should not be recreated — recreating it spawns the official plugin's
-        # own getUpdates poller, which fights ours and silently drops messages
-        # (409 Conflict). Just ping the poller's heartbeat; if it's dead,
-        # launchd respawns start_agents.sh via the LaunchAgent's KeepAlive.
+        # MULTI_TOPIC mode owns per-topic restart loops via topic-wrapper.sh.
+        # The poller itself, however, has no auto-recover: the LaunchAgent
+        # watches start_agents.sh (which exits successfully after spawning),
+        # so KeepAlive never fires for a dead poller. A bun crash inside the
+        # `poller` tmux session is terminal — no inbound message reaches any
+        # topic until the next login. Detect via stale heartbeat and respawn
+        # the poller session in place. Per-topic claudes are untouched (their
+        # tmux sessions stay alive, mid-conversation state preserved).
+        #
+        # We still must NOT recreate the v0 `claude` session — that boots the
+        # official plugin's own getUpdates poller and races ours (409 Conflict
+        # → silent message drops).
         if [[ -f "$STATE_DIR/heartbeat-poller" ]]; then
           local hb_age=$(( $(date +%s) - $(stat -f %m "$STATE_DIR/heartbeat-poller" 2>/dev/null || echo 0) ))
-          if [[ "$hb_age" -gt 120 ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat stale (${hb_age}s)"
+          if [[ "$hb_age" -gt "$POLLER_STALE_THRESHOLD_SECS" ]]; then
+            if past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
+              kick_poller_session "poller heartbeat stale (${hb_age}s)"
+            else
+              echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat stale (${hb_age}s, in startup grace)"
+            fi
           else
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online (MULTI_TOPIC)"
           fi
+        elif past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
+          # Heartbeat file absent past startup grace — poller never spawned
+          # or its first touchHeartbeat() call hasn't landed. Either way, a
+          # respawn is the correct recovery.
+          kick_poller_session "poller heartbeat absent"
         else
-          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat absent (MULTI_TOPIC)"
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat absent (MULTI_TOPIC, in startup grace)"
+        fi
+        # Independent of poller health: respawn any per-topic tmux session
+        # that has gone missing. Topic sessions can die without taking the
+        # poller down (manual kill, OOM inside one claude, etc.); without
+        # this loop they stay dead until the next `cta start`.
+        if past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
+          kick_dead_topic_sessions
         fi
       elif ! tmux has-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null; then
         # v0 orphan-session recovery (single-topic mode only).
