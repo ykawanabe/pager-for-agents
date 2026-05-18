@@ -345,50 +345,21 @@ final class WatchLiveViewModel: ObservableObject {
         // we just let the polling path take over on the next tick.
     }
 
-    /// Default streaming spawner — shells `cta watch <id> --follow --lines
-    /// 500 --ansi`, reads stdout line-buffered, and routes chunks + exit
-    /// to the callbacks. nonisolated so it can be referenced from the
-    /// default-arg position on init.
-    nonisolated static let defaultStreamSpawner: StreamSpawner? = { thread, onContent, onExit in
-        guard let cta = CTAClient.executablePath else { return nil }
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: cta)
-        p.arguments = ["watch", thread, "--follow", "--lines", "500", "--ansi"]
-
-        let stdout = Pipe()
-        let stderr = Pipe()
-        p.standardOutput = stdout
-        p.standardError = stderr
-
-        stdout.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            if let s = String(data: data, encoding: .utf8) {
-                onContent(s)
-            }
-        }
-        p.terminationHandler = { proc in
-            // Drain any final pipe data — terminationHandler can fire
-            // before readabilityHandler picks up the last chunk.
-            stdout.fileHandleForReading.readabilityHandler = nil
-            onExit(proc.terminationStatus)
-        }
-
-        do {
-            try p.run()
-        } catch {
-            onExit(-1)
-            return nil
-        }
-
-        return {
-            // SIGTERM is friendlier than SIGKILL — tail -F exits cleanly
-            // and any buffered output flushes to the readabilityHandler.
-            p.terminate()
-        }
-    }
+    /// Default streaming spawner is DISABLED.
+    ///
+    /// Why nil: `tmux pipe-pane` writes claude's raw output stream — every
+    /// byte claude printed, including cursor-positioning escapes (ESC[H,
+    /// ESC[2J), screen clears, and the bytes from in-place TUI updates.
+    /// Stripping SGR codes leaves all that movement chaos behind, which
+    /// renders as "怪しい" (garbled) text in the WatchLive pane.
+    ///
+    /// `tmux capture-pane`, by contrast, returns the RENDERED pane content
+    /// — what's actually on screen after claude finished updating. That's
+    /// what the polling path uses (cta watch without --follow). Clean.
+    ///
+    /// The streaming infrastructure (typealias + handle code paths + tests)
+    /// stays in the codebase; it's still useful for CLI users who want raw
+    /// output via `cta watch --follow`, and for a future Pager iteration
+    /// that overlays a terminal emulator. For now, polling wins.
+    nonisolated static let defaultStreamSpawner: StreamSpawner? = nil
 }
