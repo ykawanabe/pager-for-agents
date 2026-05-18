@@ -684,7 +684,7 @@ cmd_pair_code() {
 }
 
 # ─── Phase 2 mount management ───────────────────────────────────────────────
-# `cta mount/umount/list` write to ~/.claude-telegram-agent/mounts.json via
+# `cta mount/umount/list` write to $STATE_DIR/mounts.json (~/.pager/...) via
 # the mount-store TS lib (single source of truth for concurrency). Per-topic
 # tmux sessions are spawned/killed inline so users don't need to run
 # `cta start` again after a mount edit. The poller hot-reloads mounts.json
