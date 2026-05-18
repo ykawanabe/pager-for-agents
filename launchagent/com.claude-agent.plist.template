@@ -38,9 +38,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>__HOME__/.claude-telegram-agent/agent.log</string>
+    <string>__STATE_DIR__/agent.log</string>
 
     <key>StandardErrorPath</key>
-    <string>__HOME__/.claude-telegram-agent/agent.err.log</string>
+    <string>__STATE_DIR__/agent.err.log</string>
 </dict>
 </plist>

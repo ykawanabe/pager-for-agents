@@ -18,8 +18,8 @@ launchctl load   ~/Library/LaunchAgents/com.claude-agent.plist
 Then inspect the log:
 
 ```sh
-tail -n 100 ~/.claude-telegram-agent/agent.log
-tail -n 100 ~/.claude-telegram-agent/agent.err.log
+tail -n 100 ~/.pager/agent.log
+tail -n 100 ~/.pager/agent.err.log
 ```
 
 ## `claude: command not found` inside the LaunchAgent

@@ -50,7 +50,7 @@ Quit Claude Pager  ⌘Q
 When the bot is degraded or offline the top line changes to `Degraded` / `Offline` and the menu lists the specific broken components (e.g. `Bot not running`, `Plugin not polling`).
 
 - **Watch bot live** — opens Terminal attached to the bot's tmux session. You see exactly what messages Claude is receiving and replying with, in real time.
-- **Show recent activity** — tails the agent log (`~/.claude-telegram-agent/agent.log`).
+- **Show recent activity** — tails the agent log (`~/.pager/agent.log`).
 - **Restart bot** — kicks the underlying `start_agents.sh` to restart both tmux sessions.
 - **Run diagnostics…** — walks the full pipeline (token → Telegram `getMe` → send a test message → local processes) and reports which step failed.
 

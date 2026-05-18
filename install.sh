@@ -332,6 +332,7 @@ fi
 mkdir -p "$LAUNCH_AGENTS_DIR"
 sed -e "s|__BIN_DIR__|$BIN_DIR|g" \
     -e "s|__HOME__|$HOME|g" \
+    -e "s|__STATE_DIR__|$STATE_DIR|g" \
     "$REPO_DIR/launchagent/com.claude-agent.plist.template" > "$PLIST_PATH"
 say "Wrote $PLIST_PATH"
 
