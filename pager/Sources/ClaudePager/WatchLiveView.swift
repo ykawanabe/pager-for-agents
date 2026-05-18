@@ -109,16 +109,51 @@ struct WatchLiveView: View {
         VStack(spacing: 0) {
             mainPaneHeader
             Divider()
-            ScrollView {
-                paneContent
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .padding(10)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    paneContent
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(10)
+                        .id("watch-live-pane-bottom")
+                }
+                .background(Color(NSColor.textBackgroundColor))
+                // Auto-scroll to bottom whenever content changes — user wants
+                // to see the LATEST claude output, which is at the end of
+                // capture-pane's output. Without this the ScrollView starts
+                // at the top (oldest scrollback) and the user has to scroll
+                // every refresh.
+                .onChange(of: paneStatusContentSignal) { _, _ in
+                    withAnimation(.easeOut(duration: 0.1)) {
+                        proxy.scrollTo("watch-live-pane-bottom", anchor: .bottom)
+                    }
+                }
+                .onAppear {
+                    proxy.scrollTo("watch-live-pane-bottom", anchor: .bottom)
+                }
+                .onChange(of: vm.focusedThreadId) { _, _ in
+                    // Topic switch — jump to bottom of new content immediately.
+                    proxy.scrollTo("watch-live-pane-bottom", anchor: .bottom)
+                }
             }
-            .background(Color(NSColor.textBackgroundColor))
             Divider()
             inputArea
+        }
+    }
+
+    /// Cheap change-detection signal for the .onChange modifier — using the
+    /// full content string as the comparison key would be expensive for
+    /// long pane buffers. Tuple of (case-tag, length) is enough to fire on
+    /// any update.
+    private var paneStatusContentSignal: String {
+        switch vm.paneStatus {
+        case .unknown: return "unknown"
+        case .starting: return "starting"
+        case .live(let c): return "live:\(c.count)"
+        case .sessionDead: return "dead"
+        case .noMount: return "nomount"
+        case .error: return "error"
         }
     }
 
