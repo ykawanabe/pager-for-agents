@@ -161,10 +161,15 @@ main_multi_topic() {
     exit 1
   fi
 
-  tmux new-session -d -s poller \
-    -e "TELEGRAM_BOT_TOKEN=$token" \
-    -e "MAIN_CHAT_ID=$MAIN_CHAT_ID" \
-    "bun $poller_path"
+  # Source project + plugin .env at spawn time. tmux's `-e` flag forwards
+  # only explicitly-listed vars, dropping operator settings like
+  # PAGER_DISABLE_HELPER. Sourcing in the wrapper keeps the spawned poller
+  # in sync with start_agents.sh's own environment AND with kick_poller_session
+  # (watch_network.sh) so the two spawn paths are environmentally consistent.
+  local env_file="$STATE_DIR/.env"
+  local poller_wrapper_cmd
+  poller_wrapper_cmd="set -a; [ -f '$env_file' ] && . '$env_file'; [ -f '$plugin_env' ] && . '$plugin_env'; set +a; exec bun '$poller_path'"
+  tmux new-session -d -s poller "$poller_wrapper_cmd"
   # Brief settle before pipe-pane — the live install showed an intermittent
   # "can't find pane: poller" when pipe_to_log ran immediately after new-
   # session before the pane was fully attached.
