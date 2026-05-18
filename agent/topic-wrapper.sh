@@ -191,19 +191,25 @@ resolve_append_prompt() {
 
 session_arg_flag() {
   local cwd="$1" uuid="$2"
-  # claude encodes both `/` and `.` as `-` when naming the project dir under
-  # ~/.claude/projects. We MUST match that exactly — a mismatch makes the
-  # function think the jsonl doesn't exist, return `--session-id` instead of
-  # `--resume`, and claude then rejects with "already in use" (because it
-  # finds the real jsonl via its own encoding). Crash-loop bug observed
-  # 2026-05-17 on github.com paths.
-  local encoded="${cwd//\//-}"
-  encoded="${encoded//./-}"
+  local encoded
+  encoded=$(claude_project_dir_encode "$cwd")
   if [[ -f "$HOME/.claude/projects/${encoded}/${uuid}.jsonl" ]]; then
     echo "--resume"
   else
     echo "--session-id"
   fi
+}
+
+# Mirror of agent/restart_claude.sh claude_project_dir_encode — keep in
+# sync (tests/test_path_encoding.sh asserts both implementations agree).
+# Encoding rule observed from ~/.claude/projects/ entries on macOS:
+#   any character not in [a-zA-Z0-9-] → `-`
+# Covers `/`, `.`, `_`, space, `@`, `+`, `,`, `:`, and any unicode/punct.
+# The old "just / and ." form missed underscore — paths under
+# /var/folders/_v/... encoded incorrectly and claude crashed with
+# "Session ID already in use" on --resume.
+claude_project_dir_encode() {
+  printf '%s' "$1" | LC_ALL=C sed 's/[^a-zA-Z0-9-]/-/g'
 }
 
 # claude maintains a per-session lock at ~/.claude/tasks/<uuid>/.lock and

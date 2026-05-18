@@ -1,0 +1,49 @@
+# Golden fixture for claude's `cwd → ~/.claude/projects/<encoded>` rule.
+# TAB-separated: <cwd>\t<expected-encoded>
+#
+# Derived empirically (2026-05-18) by inspecting actual project dirs under
+# ~/.claude/projects/ on macOS with claude 2.1.143. Rule appears to be:
+#   any character not in [a-zA-Z0-9-]  →  `-`  (single dash, no collapsing)
+#
+# When claude bumps and the rule changes, this fixture flags it loudly —
+# the agent's session_arg_flag would otherwise silently miss the jsonl
+# under the new encoding, return --session-id instead of --resume, and
+# claude crashes with "Session ID already in use".
+#
+# To regenerate after a claude upgrade:
+#   ls ~/.claude/projects | head -20
+#   ...and update any rows where claude's actual encoding diverges from
+#   the rule below. If the rule itself changes, update both sites:
+#     agent/restart_claude.sh   claude_project_dir_encode()
+#     agent/topic-wrapper.sh    claude_project_dir_encode()
+#
+# Coverage targets the characters seen in real paths + characters the
+# stability plan called out (P3.12): `.`, `/`, `_`, space, `@`, `+`,
+# `,`, `:`, unicode. Username placeholders used to satisfy the no-PII
+# pre-commit hook — encoding rule is username-independent.
+
+# Simple absolute paths — every / becomes -
+/home/alice	-home-alice
+/home/alice/projects	-home-alice-projects
+/tmp	-tmp
+
+# Dots in paths (github.com, file extensions)
+/home/alice/ghq/src/github.com/example	-home-alice-ghq-src-github-com-example
+/home/alice/foo.bar.baz	-home-alice-foo-bar-baz
+
+# Hidden dirs — adjacent `/.` becomes `--`
+/home/alice/.claude	-home-alice--claude
+/home/alice/.openclaw/workspace	-home-alice--openclaw-workspace
+
+# Underscore — was the bug (broke /var/folders/_v paths)
+/var/folders/_v	-var-folders--v
+/home/alice/foo_bar	-home-alice-foo-bar
+
+# Multiple special chars from real macOS tempdir paths
+/private/var/folders/_v/b7g12kzx0rn2kc6t7tk1tqhw0000gn/T/tmp.tc6h5rmq8c/projectA	-private-var-folders--v-b7g12kzx0rn2kc6t7tk1tqhw0000gn-T-tmp-tc6h5rmq8c-projectA
+
+# Hyphens — passthrough (already an encoded char)
+/home/alice/claude-telegram-agent	-home-alice-claude-telegram-agent
+
+# Numbers — passthrough
+/home/alice/proj123	-home-alice-proj123

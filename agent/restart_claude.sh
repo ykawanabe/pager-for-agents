@@ -64,18 +64,32 @@ compute_next_delay() {
 #   $2 = session UUID
 session_arg_flag() {
   local cwd="$1" uuid="$2"
-  # claude encodes both `/` and `.` as `-` when naming the project dir under
-  # ~/.claude/projects. Match that exactly — a `/` only translation makes
-  # github.com paths miss the jsonl, fall through to --session-id, and crash
-  # claude with "already in use" (it finds the file via its own encoding).
   local encoded
-  encoded="${cwd//\//-}"
-  encoded="${encoded//./-}"
+  encoded=$(claude_project_dir_encode "$cwd")
   if [[ -f "$HOME/.claude/projects/${encoded}/${uuid}.jsonl" ]]; then
     echo "--resume"
   else
     echo "--session-id"
   fi
+}
+
+# claude encodes the project cwd into ~/.claude/projects/<encoded>/ by
+# replacing every non-`[a-zA-Z0-9-]` character with a single `-`. Observed
+# rules (verified against actual project dirs 2026-05-18):
+#   /  → -
+#   .  → -
+#   _  → -    (was missed by the old "just / and ." form — broke paths
+#               under /var/folders/_v/... causing claude to crash on
+#               resume with "Session ID is already in use" because the
+#               file existed under a name we couldn't construct.)
+#   space / @ / + / , / : → -
+#   letters, digits, hyphen → passthrough
+#
+# Pinned by tests/fixtures/claude-path-encoding.tsv + test_path_encoding.sh.
+# When claude bumps and the encoding rule changes, that test fails loudly
+# (P3.12 / Principle 9: encoding from upstream, not re-implemented).
+claude_project_dir_encode() {
+  printf '%s' "$1" | LC_ALL=C sed 's/[^a-zA-Z0-9-]/-/g'
 }
 
 # Return the prompt text to pass to --append-system-prompt, or empty if the
