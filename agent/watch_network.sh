@@ -141,10 +141,16 @@ kick_poller_session() {
   fi
   tmux kill-session -t poller 2>/dev/null || true
   sleep 1
-  tmux new-session -d -s poller \
-    -e "TELEGRAM_BOT_TOKEN=$token" \
-    -e "MAIN_CHAT_ID=$MAIN_CHAT_ID" \
-    "bun $poller_path" || true
+  # Source both project and plugin .env files at spawn time so the poller's
+  # bun process inherits the full project env — PAGER_DISABLE_HELPER,
+  # MULTI_TOPIC, custom path overrides, plus the canonical TELEGRAM_BOT_TOKEN
+  # from the plugin .env (freshly read, picks up rotations). Previously only
+  # two vars were forwarded via `-e`, dropping every other operator setting
+  # on each watchdog kick (D12 in docs/plans/multi-topic-stability-plan.md).
+  local env_file="$STATE_DIR/.env"
+  local wrapper_cmd
+  wrapper_cmd="set -a; [ -f '$env_file' ] && . '$env_file'; [ -f '$plugin_env' ] && . '$plugin_env'; set +a; exec bun '$poller_path'"
+  tmux new-session -d -s poller "$wrapper_cmd" || true
   # Brief settle before pipe-pane attach — start_agents.sh hit an intermittent
   # "can't find pane: poller" without this on first launch.
   sleep 0.2
