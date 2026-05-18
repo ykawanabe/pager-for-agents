@@ -89,9 +89,15 @@ final class WatchLiveViewModel: ObservableObject {
     init(
         mountsProvider: @escaping MountsProvider = { try CTAClient.listMounts() },
         // ansi:false → cta watch strips escape codes via tmux capture-pane
-        // (default behavior). The Pager renders plain text — color is more
-        // complexity than value for the "watch what claude's doing" goal.
-        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 500, ansi: false) },
+        // (default behavior). lines:20 is the SwiftTerm-era minimum: the
+        // terminal owns content rendering now, so refreshPane only needs to
+        // know if the session is alive, and refreshSidebar only needs the
+        // last non-empty line for the preview. Was 500 (full scrollback)
+        // back when refreshPane fed the main pane Text view — that's a
+        // 25× cost reduction per poll. Combined with the 2s paneTask
+        // interval (was 500ms), the overall watch-live polling cost drops
+        // by ~100×.
+        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 20, ansi: false) },
         streamSpawner: StreamSpawner? = WatchLiveViewModel.defaultStreamSpawner,
         focusRestore: FocusRestore = {
             UserDefaults.standard.string(forKey: WatchLiveViewModel.lastFocusedKey)
@@ -125,7 +131,12 @@ final class WatchLiveViewModel: ObservableObject {
         paneTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refreshPane()
-                try? await Task.sleep(for: .milliseconds(500))
+                // 2s (was 500ms) — refreshPane only drives the status pill
+                // and the terminal-vs-placeholder gate now that SwiftTerm
+                // renders content directly. 2s of stale "Live" pill after
+                // session death is acceptable; before, polling was content
+                // delivery and needed sub-second latency.
+                try? await Task.sleep(for: .seconds(2))
             }
         }
         // Try streaming for whatever's focused now (might be restored from
