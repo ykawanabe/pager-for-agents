@@ -228,6 +228,24 @@ DELAY_MIN=3
 DELAY_MAX=60
 HEALTHY_RUN_SECS=30
 
+# ─── pane-output piping (watch-live B.1) ────────────────────────────────────
+# Pipe our own pane's output to $STATE_DIR/topics/<thread_id>.log so the
+# Pager WatchLive window (and `cta watch --follow`) can tail it instead of
+# polling tmux capture-pane. Idempotent via tmux's `-O -o`; truncates the
+# log file on each spawn (size-rotation is a v2 concern — long-running
+# topics rarely produce >MBs of pane output between respawns).
+setup_pane_log() {
+  local session="$1" thread_id="$2" state_dir="$3"
+  local log_dir="$state_dir/topics"
+  local log_file="$log_dir/$thread_id.log"
+  mkdir -p "$log_dir" || return 0
+  : > "$log_file"  # truncate on each (re)spawn
+  # -O = pipe output only (no input keystrokes leak to log).
+  # -o = open only if not already piping (idempotent on respawn).
+  # Quote inside the shell command so spaces / specials in log_file survive.
+  tmux pipe-pane -O -o -t "$session" "cat >> '$log_file'" 2>/dev/null || true
+}
+
 compute_next_delay() {
   local current=$1 ran_for=$2 healthy=$3 dmin=$4 dmax=$5
   if [[ "$ran_for" -ge "$healthy" ]]; then echo "$dmin"; return; fi
@@ -290,6 +308,8 @@ main_loop() {
   # process; hook scripts inherit claude's env, not the MCP server's.
   export TELEGRAM_CHAT_ID="$MAIN_CHAT_ID"
   export TELEGRAM_THREAD_ID="$THREAD_ID"
+
+  setup_pane_log "$TMUX_SESSION" "$THREAD_ID" "$STATE_DIR"
 
   local append_prompt
   append_prompt=$(resolve_append_prompt "${BOT_APPEND_SYSTEM_PROMPT:-}" "$DEFAULT_BOT_APPEND_SYSTEM_PROMPT")

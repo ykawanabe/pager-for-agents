@@ -958,7 +958,7 @@ cmd_bind() {
 #   1  no mount for thread, or usage/internal error.
 #   2  mount exists but the tmux session is not alive.
 cmd_watch() {
-  local thread_id="" lines=200 keep_ansi=0
+  local thread_id="" lines=200 keep_ansi=0 follow=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -972,6 +972,10 @@ cmd_watch() {
         ;;
       --ansi)
         keep_ansi=1
+        shift
+        ;;
+      --follow|-f)
+        follow=1
         shift
         ;;
       --)
@@ -1030,6 +1034,24 @@ cmd_watch() {
   if [[ "$keep_ansi" == "1" ]]; then
     capture_args=(-e "${capture_args[@]}")
   fi
+
+  # --follow path: print last $lines from the per-topic log file, then
+  # tail -F (capital — survives truncate/recreate on respawn). Falls
+  # back to snapshot mode if the log doesn't exist yet (topic-wrapper
+  # hasn't set up pipe-pane, e.g. older session predating B.1).
+  if [[ "$follow" == "1" ]]; then
+    local topic_log="$STATE_DIR/topics/$thread_id.log"
+    if [[ -f "$topic_log" ]]; then
+      # tail -F follows by name + survives truncation (rotated on respawn).
+      # Don't strip ANSI here — caller can pipe through their own filter.
+      tail -n "$lines" -F "$topic_log"
+      return
+    fi
+    echo "cta watch --follow: per-topic log not yet available at $topic_log" >&2
+    echo "  (topic-wrapper sets it up on next claude respawn — try 'cta start' to refresh)" >&2
+    exit 2
+  fi
+
   tmux capture-pane "${capture_args[@]}"
 }
 
@@ -1209,8 +1231,8 @@ Usage:
   cta umount <thread>             Unmount; kill the topic's tmux session
   cta list [--json]               List current mounts
   cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
-  cta watch <thread> [--lines N] [--ansi]
-                                  Print the current pane content of a topic (Pager watch-live)
+  cta watch <thread> [--lines N] [--ansi] [--follow|-f]
+                                  Print the current pane content of a topic; --follow tails the per-topic log
   cta send <thread> <text...>     Deliver text into a topic's tmux pane (Pager watch-live input)
   cta pair-code [--init|--reset]  Show / generate the one-time Telegram pairing code
   cta pair <chat_id> [user_id]    Host-driven pairing (skip the Telegram round-trip)
