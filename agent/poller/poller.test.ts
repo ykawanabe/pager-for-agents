@@ -553,9 +553,11 @@ describe("claude built-in interception (post-pair)", () => {
     expect(sent[0].text).toContain("/status");
   });
 
-  test("/clear, /model, /agents are all intercepted", async () => {
+  test("/model, /agents are intercepted with TUI-only message", async () => {
+    // /clear was removed from the blocklist (now has its own handler);
+    // /model and /agents stay as TUI-only intercepts.
     pair({ chat_id: -1001, user_id: 99 });
-    for (const cmd of ["/clear", "/model", "/agents"]) {
+    for (const cmd of ["/model", "/agents"]) {
       sent.length = 0;
       const handled = await poller.tryHandleCommand(
         msg({ text: cmd, chat_id: -1001, from_id: 99 }),
@@ -581,5 +583,121 @@ describe("claude built-in interception (post-pair)", () => {
     );
     expect(handled).toBe(true);
     expect(sent.length).toBe(1);
+  });
+});
+
+describe("/clear (D14 — TUI command translated, not delegated)", () => {
+  // /clear in claude TUI is caught by the TUI layer, never reaches the model
+  // — so forwarding it via send-keys would clear claude's context but never
+  // produce a send_telegram reply, leaving the user staring at the typing-
+  // keepalive indicator until its 10-minute hard cap. We own the semantic:
+  // rotate the per-topic session UUID, kill the tmux session, ack the user.
+  // The watchdog (kick_dead_topic_sessions) respawns the topic with the
+  // new UUID → fresh claude session.
+
+  function pair(opts?: { chat_id?: number; user_id?: number }): void {
+    const state: poller.PairedState = {
+      version: 1,
+      chat_id: opts?.chat_id ?? -1001,
+      user_id: opts?.user_id ?? 99,
+      paired_at: new Date().toISOString(),
+    };
+    writeFileSync(PAIRED_STATE_FILE, JSON.stringify(state, null, 2));
+    poller.refreshPairedIfChanged();
+  }
+
+  function seedMount(args: {
+    thread_id: number | "dm";
+    provisional?: boolean;
+    tmux_session?: string;
+  }): void {
+    const tid = args.thread_id;
+    const mount = {
+      channel: "telegram",
+      thread_id: tid,
+      path: STATE,
+      label: "test",
+      session_id: "test-session-id",
+      tmux_session: args.tmux_session ?? (typeof tid === "number" ? `topic-${tid}` : "topic-dm"),
+      created_at: new Date().toISOString(),
+      ...(args.provisional ? { provisional: true } : {}),
+    };
+    writeFileSync(MOUNTS_JSON, JSON.stringify({ version: 2, mounts: [mount] }, null, 2));
+    poller.refreshMountsIfChanged();
+  }
+
+  function seedSessionUuid(thread_id: number | "dm", uuid: string): string {
+    const sessDir = join(STATE, "sessions");
+    mkdirSync(sessDir, { recursive: true });
+    const path = join(sessDir, String(thread_id));
+    writeFileSync(path, uuid + "\n");
+    return path;
+  }
+
+  beforeEach(() => { sent.length = 0; });
+
+  test("/clear on real mount: rotates session UUID + acks", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    seedMount({ thread_id: 42 });
+    const sessionFile = seedSessionUuid(42, "old-uuid-aaaa");
+
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/clear", chat_id: -1001, thread_id: 42, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+
+    // UUID must be rotated to something other than "old-uuid-aaaa".
+    const newContent = readFileSync(sessionFile, "utf8").trim();
+    expect(newContent.length).toBeGreaterThan(0);
+    expect(newContent).not.toBe("old-uuid-aaaa");
+
+    // Ack reply explains what happened.
+    expect(sent.length).toBe(1);
+    expect(sent[0].text.toLowerCase()).toMatch(/clear|new session/);
+    expect(sent[0].chat_id).toBe(-1001);
+    expect(sent[0].message_thread_id).toBe(42);
+  });
+
+  test("/clear on provisional (helper-mode) mount: refuses, directs to /cancel", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    seedMount({ thread_id: 88, provisional: true, tmux_session: "helper-88" });
+    const sessionFile = seedSessionUuid(88, "helper-uuid-xxxx");
+
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/clear", chat_id: -1001, thread_id: 88, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+
+    // UUID must NOT be rotated — we don't kill the helper mid-flight.
+    expect(readFileSync(sessionFile, "utf8").trim()).toBe("helper-uuid-xxxx");
+
+    // Reply points the user at /cancel (the helper's own teardown).
+    expect(sent.length).toBe(1);
+    expect(sent[0].text.toLowerCase()).toMatch(/cancel|helper/);
+  });
+
+  test("/clear on unmounted topic: friendly nothing-to-clear reply", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    // No seedMount — topic 7777 is unmounted.
+
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/clear", chat_id: -1001, thread_id: 7777, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0].text.toLowerCase()).toMatch(/nothing|not mounted|no mount/);
+  });
+
+  test("/clear from a non-paired user is silently dropped (no reply, no rotation)", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    seedMount({ thread_id: 42 });
+    const sessionFile = seedSessionUuid(42, "owner-only-uuid");
+
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/clear", chat_id: -1001, thread_id: 42, from_id: 8888 }), // wrong user
+    );
+    expect(handled).toBe(true); // consumed so claude doesn't see it
+    expect(sent.length).toBe(0); // no reply leak
+    expect(readFileSync(sessionFile, "utf8").trim()).toBe("owner-only-uuid"); // unchanged
   });
 });
