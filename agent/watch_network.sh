@@ -92,8 +92,11 @@ kick_dead_topic_sessions() {
   [[ -f "$mounts_file" ]] || return 0
   local wrapper="$INSTALL_DIR/agent/topic-wrapper.sh"
   [[ -x "$wrapper" ]] || return 0
+  # Filter out provisional rows: those are helper-mode placeholders whose
+  # lifecycle is owned by gcOrphanedProvisionals (poller-side). Respawning
+  # a dead helper-<id> as a topic-mode claude in $HOME is the D11 bug.
   local entries
-  entries=$(jq -r '.mounts[] | select(.thread_id != "*") | [(.thread_id|tostring), .path, .tmux_session] | @tsv' "$mounts_file" 2>/dev/null) || return 0
+  entries=$(jq -r '.mounts[] | select(.thread_id != "*") | select((.provisional // false) == false) | [(.thread_id|tostring), .path, .tmux_session] | @tsv' "$mounts_file" 2>/dev/null) || return 0
   [[ -z "$entries" ]] && return 0
   while IFS=$'\t' read -r thread_id project_path tmux_session; do
     [[ -z "$thread_id" ]] && continue
