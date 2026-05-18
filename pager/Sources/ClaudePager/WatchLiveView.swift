@@ -130,6 +130,9 @@ struct WatchLiveView: View {
         switch vm.paneStatus {
         case .live(let content):
             Text(ANSIParser.attributed(content))
+        case .starting:
+            Text("Topic just started — waiting for claude to print.\n\n(this is normal for ~5–15s after a restart or fresh mount)")
+                .foregroundColor(.secondary)
         case .sessionDead(let stderr):
             Text("Topic's tmux session is not running.\n\nStart it with:\n  cta start\n\nDetails: \(stderr)")
         case .noMount(let stderr):
@@ -230,6 +233,10 @@ struct WatchLiveView: View {
             Label("…", systemImage: "circle.dotted")
                 .font(.caption)
                 .foregroundColor(.secondary)
+        case .starting:
+            Label("Starting…", systemImage: "circle.fill")
+                .font(.caption)
+                .foregroundColor(.yellow)
         case .live:
             Label("Live", systemImage: "circle.fill")
                 .font(.caption)
