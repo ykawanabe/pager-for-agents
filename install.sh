@@ -1,7 +1,7 @@
 #!/bin/bash
 # Interactive installer for claude-telegram-agent on macOS.
 #
-# Copies scripts into ~/.local/bin, writes ~/.claude-telegram-agent/.env,
+# Copies scripts into ~/.local/bin, writes ~/.pager/.env (state dir),
 # registers a LaunchAgent to start everything at login, and (optionally)
 # provisions the Claude Code Telegram plugin secrets at the canonical
 # location the plugin reads from automatically:
