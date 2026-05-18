@@ -1,0 +1,51 @@
+# agent/MANIFEST.txt — the canonical list of files under agent/ that
+# install.sh must ship. Each row:
+#
+#   <relative-path-under-agent/>	<install-prefix>	<perms>
+#
+# install-prefix legend:
+#   bin    — copied to $BIN_DIR (executables on $PATH)
+#   agent  — copied to $INSTALL_DIR/agent/...
+#   hooks  — copied to $INSTALL_DIR/hooks/... (read by bot-hooks.json)
+#   tpl    — templated by install.sh (sed substitution at install time)
+#
+# CI test tests/test_install_manifest.sh asserts:
+#   1. Every file under agent/ (excluding tests/ and dotfiles) appears here.
+#   2. Every entry in this file exists on disk.
+#   3. Every entry except `bin` is referenced in install.sh's cp commands.
+#
+# When you add a new file under agent/ that should ship, add the row HERE
+# AND add the cp line in install.sh. The CI test fails fast if either is
+# missing.
+
+# Long-running daemons (BIN_DIR)
+start_agents.sh	bin	755
+restart_claude.sh	bin	755
+watch_network.sh	bin	755
+
+# Poller (TypeScript / bun)
+poller/poller.ts	agent	644
+poller/typing-keepalive.ts	agent	644
+poller/package.json	agent	644
+
+# Outbound MCP server
+mcp-telegram/server.ts	agent	644
+mcp-telegram/package.json	agent	644
+
+# Mount-store library + CLI entrypoint
+mount-store/mount-store.ts	agent	644
+mount-store/package.json	agent	644
+
+# Shared path resolver
+lib/paths.ts	agent	644
+
+# Per-topic supervisor (executable shell)
+topic-wrapper.sh	agent	755
+
+# Mount-helper (auto-mount) artifacts
+helper-prompt.md	agent	644
+helper-permissions.json	agent	644
+
+# Claude Code hooks
+hooks/pager-notify.sh	hooks	755
+bot-hooks.json	tpl	644
