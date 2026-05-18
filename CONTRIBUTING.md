@@ -5,7 +5,7 @@ Thanks for your interest. This project is small and opinionated; here's how to l
 ## Before you start
 
 - File an issue describing the change *before* sending a PR for anything non-trivial. Saves both of us from a rejected diff.
-- Bug reports: include `sw_vers`, Mac arch (`uname -m`), `claude --version`, `bun --version`, `tmux -V`, and the relevant lines from `~/.claude-telegram-agent/agent.log`.
+- Bug reports: include `sw_vers`, Mac arch (`uname -m`), `claude --version`, `bun --version`, `tmux -V`, and the relevant lines from `~/.pager/agent.log`.
 
 ## Local development
 
