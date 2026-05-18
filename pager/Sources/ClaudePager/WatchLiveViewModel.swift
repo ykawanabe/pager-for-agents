@@ -62,7 +62,15 @@ final class WatchLiveViewModel: ObservableObject {
     private var sidebarTask: Task<Void, Never>?
     private var paneTask: Task<Void, Never>?
     private var streamCancel: (() -> Void)?
-    private var streamActiveThread: String?
+    /// Thread the current stream subprocess targets. Set on attach,
+    /// cleared on teardown / exit. Not enough to gate polling — see
+    /// `streamHasContent` for the "stream is actually producing" signal.
+    private var streamThread: String?
+    /// True once the stream subprocess has delivered at least one chunk.
+    /// Polling defers (skips its work) only when this is true; otherwise
+    /// polling fills paneStatus while the stream warms up (defense-in-
+    /// depth against the empty-log + tail -F blocks forever failure mode).
+    private var streamHasContent: Bool = false
     private var streamBuffer: String = ""
     /// Threads that returned exit 2 (no per-topic log) — don't retry
     /// streaming for them; polling takes over. Reset only when the ViewModel
@@ -199,10 +207,12 @@ final class WatchLiveViewModel: ObservableObject {
     }
 
     /// Single pane refresh for the currently-focused topic. Public for tests.
-    /// Skipped when a stream is active — stream owns paneStatus updates and
-    /// polling would race against it.
+    /// Skipped when a stream is producing content — stream owns paneStatus
+    /// updates and polling would race against it. While stream is still
+    /// warming up (subprocess started but no chunks yet), polling fills
+    /// paneStatus so the user isn't stuck on "unknown"/.starting forever.
     func refreshPane() async {
-        if streamActiveThread != nil { return }
+        if streamThread != nil && streamHasContent { return }
         guard let id = focusedThreadId else {
             paneStatus = .unknown
             return
@@ -243,12 +253,18 @@ final class WatchLiveViewModel: ObservableObject {
     // MARK: - Streaming (Phase B.3)
 
     /// Start a streaming subprocess for the currently-focused topic when
-    /// possible. Idempotent — tearing down any previous stream first.
+    /// possible. Idempotent — tears down any previous stream first.
     /// Falls through silently when:
     ///   - no streamSpawner is configured (tests pass nil)
     ///   - the focused thread is in failedStreamThreads (exit 2 last time)
     ///   - the spawner returns nil (cta path not resolvable)
     /// In all those cases polling (refreshPane) keeps the pane up to date.
+    ///
+    /// Importantly, `streamHasContent` flips to true only when the first
+    /// chunk actually arrives. Until then, polling continues to fill
+    /// paneStatus. Defense-in-depth against the "stream subprocess starts
+    /// but tail -F blocks because the log is empty" failure mode (which
+    /// the original pipe-pane -O -o bug exposed).
     func attachStreamIfPossible() {
         teardownStream()
         guard let id = focusedThreadId,
@@ -256,15 +272,15 @@ final class WatchLiveViewModel: ObservableObject {
               let spawner = streamSpawner
         else { return }
 
-        streamActiveThread = id
+        streamThread = id
+        streamHasContent = false
         streamBuffer = ""
-        paneStatus = .starting
 
         streamCancel = spawner(
             id,
             { [weak self] chunk in
                 Task { @MainActor [weak self] in
-                    self?.appendStream(chunk, forThread: id)
+                    self?.handleStreamChunk(chunk, forThread: id)
                 }
             },
             { [weak self] code in
@@ -273,25 +289,27 @@ final class WatchLiveViewModel: ObservableObject {
                 }
             }
         )
-        // Spawner may return nil if it failed to launch. Treat as
-        // "stream unavailable" and let polling take over.
         if streamCancel == nil {
-            streamActiveThread = nil
+            // Spawner failed to launch — drop pending state so polling
+            // is the only active path.
+            streamThread = nil
         }
     }
 
     func teardownStream() {
         streamCancel?()
         streamCancel = nil
-        streamActiveThread = nil
+        streamThread = nil
+        streamHasContent = false
         streamBuffer = ""
     }
 
-    private func appendStream(_ chunk: String, forThread thread: String) {
-        // Ignore chunks from a stream that's been superseded by a focus
-        // change (the previous spawn's terminationHandler races with the
-        // new spawn).
-        guard streamActiveThread == thread else { return }
+    /// First-chunk + subsequent-chunk handler. Marks the stream as producing
+    /// (streamHasContent = true) on first chunk, which is when polling
+    /// defers.
+    private func handleStreamChunk(_ chunk: String, forThread thread: String) {
+        guard streamThread == thread, focusedThreadId == thread else { return }
+        streamHasContent = true
         streamBuffer.append(chunk)
         if streamBuffer.utf8.count > WatchLiveViewModel.streamMaxBytes {
             // Drop oldest bytes to bring back under the cap. Find a safe
@@ -312,9 +330,10 @@ final class WatchLiveViewModel: ObservableObject {
     }
 
     private func streamTerminated(code: Int32, forThread thread: String) {
-        // Same race-guard as appendStream — ignore if we've moved on.
-        guard streamActiveThread == thread else { return }
-        streamActiveThread = nil
+        // Ignore if focus moved on — old subprocess exit is irrelevant.
+        guard streamThread == thread else { return }
+        streamThread = nil
+        streamHasContent = false
         streamCancel = nil
         if code == 2 {
             // No per-topic log file yet for this topic — record so future

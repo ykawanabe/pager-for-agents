@@ -185,10 +185,18 @@ final class WatchLiveViewModelTests: XCTestCase {
             capture: { _ in .ok("polled") },
             streamSpawner: spawner
         )
-        await vm.refreshSidebar()    // sets focus → attachStreamIfPossible
-        XCTAssertEqual(vm.paneStatus, .starting,
-                       "fresh stream + no chunks yet → starting")
+        await vm.refreshSidebar()    // sets focus → attach (pending, no content yet)
+        await vm.refreshPane()       // polling fills paneStatus while stream warms up
+        // That's the new robustness contract — user never sees a stuck pane
+        // even when the stream subprocess starts but tail -F blocks.
+        if case .live(let pre) = vm.paneStatus {
+            XCTAssertEqual(pre, "polled",
+                           "polling should fill while stream is still pending")
+        } else {
+            return XCTFail("expected polling .live before stream chunks, got \(vm.paneStatus)")
+        }
 
+        // Now the stream produces — should take over from polling.
         onContent?("first line\n")
         onContent?("second line\n")
         await Task.yield()
@@ -198,6 +206,26 @@ final class WatchLiveViewModelTests: XCTestCase {
         }
         XCTAssertTrue(content.contains("first line"))
         XCTAssertTrue(content.contains("second line"))
+    }
+
+    func test_polling_keeps_running_until_stream_produces() async {
+        // Defense in depth: stream subprocess starts but tail -F blocks
+        // (empty log). User shouldn't be stuck — polling fills paneStatus.
+        let mounts = [makeMount(thread: 42, label: nil, topic: "T")]
+        let spawner: WatchLiveViewModel.StreamSpawner = { _, _, _ in
+            return { /* cancel */ }   // never emits content, never exits
+        }
+        let vm = makeVM(
+            mounts: { mounts },
+            capture: { _ in .ok("polled snapshot") },
+            streamSpawner: spawner
+        )
+        await vm.refreshSidebar()
+        await vm.refreshPane()
+        guard case let .live(content) = vm.paneStatus else {
+            return XCTFail("expected polling .live, got \(vm.paneStatus)")
+        }
+        XCTAssertEqual(content, "polled snapshot")
     }
 
     func test_stream_exit2_falls_back_to_polling() async {

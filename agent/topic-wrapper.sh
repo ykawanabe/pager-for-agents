@@ -229,21 +229,30 @@ DELAY_MAX=60
 HEALTHY_RUN_SECS=30
 
 # ─── pane-output piping (watch-live B.1) ────────────────────────────────────
-# Pipe our own pane's output to $STATE_DIR/topics/<thread_id>.log so the
-# Pager WatchLive window (and `cta watch --follow`) can tail it instead of
-# polling tmux capture-pane. Idempotent via tmux's `-O -o`; truncates the
-# log file on each spawn (size-rotation is a v2 concern — long-running
-# topics rarely produce >MBs of pane output between respawns).
+# Pipe our pane's output to $STATE_DIR/topics/<thread_id>.log so the Pager
+# WatchLive window (and `cta watch --follow`) can tail it.
+#
+# Two parts:
+#   1. Seed the log with the current pane scrollback via `tmux capture-pane`.
+#      pipe-pane only captures FUTURE output — without the seed, an idle
+#      pane produces an empty log file and `tail -F` blocks forever, so
+#      Pager would sit on "Starting…" until the user types something.
+#   2. Set up `tmux pipe-pane` for ongoing output. Empirically (macOS tmux
+#      3.5), the `-O -o` flag combination silently produces a no-op pipe
+#      (0 bytes piped). Plain `pipe-pane <cmd>` works. `-O` is documented
+#      as the default anyway, so dropping it is safe.
 setup_pane_log() {
   local session="$1" thread_id="$2" state_dir="$3"
   local log_dir="$state_dir/topics"
   local log_file="$log_dir/$thread_id.log"
   mkdir -p "$log_dir" || return 0
-  : > "$log_file"  # truncate on each (re)spawn
-  # -O = pipe output only (no input keystrokes leak to log).
-  # -o = open only if not already piping (idempotent on respawn).
-  # Quote inside the shell command so spaces / specials in log_file survive.
-  tmux pipe-pane -O -o -t "$session" "cat >> '$log_file'" 2>/dev/null || true
+  # Seed: capture full scrollback + escapes so the Pager sees existing
+  # state immediately. `|| true` because capture-pane can fail on a
+  # just-spawned pane that has no content yet.
+  tmux capture-pane -p -S - -e -t "$session" > "$log_file" 2>/dev/null || : > "$log_file"
+  # Stop any existing pipe (idempotent on respawn) then start a fresh one.
+  tmux pipe-pane -t "$session" 2>/dev/null || true
+  tmux pipe-pane -t "$session" "cat >> '$log_file'" 2>/dev/null || true
 }
 
 compute_next_delay() {
