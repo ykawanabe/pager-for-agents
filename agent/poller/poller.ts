@@ -348,20 +348,33 @@ async function startTypingKeepalive(chat_id: number, thread_id?: number): Promis
 // ─── tmux dispatch ───────────────────────────────────────────────────────────
 
 /**
- * Deliver text to a tmux pane. `load-buffer -` reads from stdin; `paste-buffer
- * -d` pastes the buffer into the target pane and deletes it from the buffer
- * stack so successive messages don't pile up. Trailing `send-keys Enter`
- * submits the prompt — claude's TUI treats Enter as "send."
+ * Deliver text to a tmux pane. `load-buffer -b <name> -` reads from stdin into
+ * a NAMED buffer; `paste-buffer -b <name> -d -t <session>` pastes it into the
+ * target pane and deletes the named buffer afterward.
  *
- * Multiline content is pasted as-is (newlines remain newlines, not multiple
- * submits). Code blocks survive. Emoji survives. Quotes survive.
+ * Why named: the default (unnamed) tmux buffer is server-wide. Two concurrent
+ * dispatches targeting different sessions race — call B's load-buffer can
+ * overwrite the default before call A's paste-buffer fires, so A's pane
+ * receives B's text. A unique buffer name per call eliminates the race
+ * structurally regardless of which processes might race (poller, watchdog
+ * kick, cta send, helper spawn).
+ *
+ * Trailing `send-keys Enter` submits the prompt — claude's TUI treats Enter
+ * as "send." Multiline content, code blocks, emoji, quotes all survive the
+ * paste-buffer transport (it preserves bytes verbatim).
  */
 function tmuxDispatch(session: string, text: string): { ok: boolean; stderr: string } {
-  const load = spawnSync("tmux", ["load-buffer", "-"], { input: text, encoding: "utf8" });
+  const buf = `pager-${session}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  const load = spawnSync("tmux", ["load-buffer", "-b", buf, "-"], { input: text, encoding: "utf8" });
   if (load.status !== 0) return { ok: false, stderr: `load-buffer: ${load.stderr}` };
 
-  const paste = spawnSync("tmux", ["paste-buffer", "-d", "-t", session], { encoding: "utf8" });
-  if (paste.status !== 0) return { ok: false, stderr: `paste-buffer: ${paste.stderr}` };
+  const paste = spawnSync("tmux", ["paste-buffer", "-b", buf, "-d", "-t", session], { encoding: "utf8" });
+  if (paste.status !== 0) {
+    // Cleanup the orphaned named buffer if paste failed (load already created it).
+    spawnSync("tmux", ["delete-buffer", "-b", buf], { encoding: "utf8" });
+    return { ok: false, stderr: `paste-buffer: ${paste.stderr}` };
+  }
 
   const enter = spawnSync("tmux", ["send-keys", "-t", session, "Enter"], { encoding: "utf8" });
   if (enter.status !== 0) return { ok: false, stderr: `send-keys Enter: ${enter.stderr}` };
