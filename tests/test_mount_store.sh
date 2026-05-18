@@ -279,6 +279,38 @@ GC_DEFAULT=$(bun run "$STORE" gc-provisional)
   && ok "gc-provisional: default (no grace) still drops dead provisional" \
   || ng "gc-provisional default behavior changed (got $GC_DEFAULT)"
 
+# ─── clear op (P2.5) ────────────────────────────────────────────────────────
+# `cta unpair` historically `rm -f mounts.json` which bypassed the mount-store
+# lock. A concurrent `cta mount` mid-rename could see the file vanish under
+# it. The `clear` op writes an empty mounts list under withLock for atomicity.
+
+rm -rf "$STATE" && mkdir -p "$STATE"
+bun run "$STORE" add 11 /tmp/a a >/dev/null
+bun run "$STORE" add 22 /tmp/b b >/dev/null
+bun run "$STORE" clear >/dev/null
+[[ -f "$STATE/mounts.json" ]] \
+  && ok "clear: mounts.json STILL exists (not unlinked)" \
+  || ng "clear: mounts.json was unlinked instead of emptied"
+[[ "$(jq '.mounts | length' "$STATE/mounts.json")" == "0" ]] \
+  && ok "clear: mounts array is empty" \
+  || ng "clear: mounts array not empty (got $(jq '.mounts | length' "$STATE/mounts.json"))"
+[[ "$(jq -r '.version' "$STATE/mounts.json")" == "2" ]] \
+  && ok "clear: preserves schema version 2" \
+  || ng "clear: version field not 2 (got $(jq -r '.version' "$STATE/mounts.json"))"
+
+# clear is idempotent.
+bun run "$STORE" clear >/dev/null
+[[ "$(jq '.mounts | length' "$STATE/mounts.json")" == "0" ]] \
+  && ok "clear: idempotent (already empty stays empty)" \
+  || ng "clear: idempotent failure"
+
+# clear on a never-existed file creates an empty one.
+rm -rf "$STATE" && mkdir -p "$STATE"
+bun run "$STORE" clear >/dev/null
+[[ -f "$STATE/mounts.json" ]] \
+  && ok "clear: creates mounts.json if absent" \
+  || ng "clear: did not create mounts.json"
+
 # ─── result ─────────────────────────────────────────────────────────────────
 
 echo

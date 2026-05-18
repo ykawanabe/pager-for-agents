@@ -634,13 +634,11 @@ cmd_unpair() {
   echo "Unpaired (was: chat=$chat_id user=$user_id)."
 
   if [[ "$keep_mounts" -eq 0 ]]; then
-    # Wipe mounts.json so the new pair starts clean. Wildcard from install
-    # is regenerated next time install.sh runs; for now, just remove all
-    # entries. User can re-mount via Telegram /mount or terminal cta mount.
+    # Wipe mounts under the mount-store lock so a concurrent `cta mount`
+    # doesn't tear (previously this was `rm -f` which raced the lock).
+    # Wildcard from install is regenerated next time install.sh runs.
     if [[ -f "$MOUNT_STORE_TS" ]]; then
-      # Build a fresh empty mounts.json by removing the file (mount-store
-      # creates it on first add).
-      rm -f "$MOUNTS_FILE"
+      bun run "$MOUNT_STORE_TS" clear >/dev/null
       echo "Cleared mounts.json (use --keep-mounts to preserve next time)."
     fi
   fi
