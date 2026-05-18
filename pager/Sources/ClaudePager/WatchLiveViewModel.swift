@@ -47,7 +47,9 @@ final class WatchLiveViewModel: ObservableObject {
 
     init(
         mountsProvider: @escaping MountsProvider = { try CTAClient.listMounts() },
-        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 200) }
+        // ansi:true preserves escape codes so the View can render colors via
+        // ANSIParser. The default lines=200 matches the cta CLI default.
+        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 200, ansi: true) }
     ) {
         self.mountsProvider = mountsProvider
         self.captureProvider = captureProvider
@@ -104,7 +106,12 @@ final class WatchLiveViewModel: ObservableObject {
             let activity: Activity
             switch await captureProvider(key) {
             case .ok(let content):
-                let last = WatchLiveViewModel.lastNonEmptyLine(content)
+                // captureProvider returns content with ANSI codes (ansi:true)
+                // so the main pane can color it. Sidebar previews want plain
+                // text — strip via ANSIParser to stay consistent with the
+                // renderer used by the main pane.
+                let plain = ANSIParser.strip(content)
+                let last = WatchLiveViewModel.lastNonEmptyLine(plain)
                 preview = last
                 let previous = lastPreviewByThread[key]
                 activity = (previous != nil && previous != last) ? .live : .idle

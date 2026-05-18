@@ -260,6 +260,24 @@ enum CTAClient {
         case error(String)
     }
 
+    /// `cta send <thread> <text>` — deliver text + Enter into a topic's
+    /// tmux pane. Mirrors the watch result enum since the same exit codes
+    /// apply (no mount → noMount, tmux dead → sessionDead).
+    static func send(thread: String, text: String) -> WatchResult {
+        do {
+            let data = try run(args: ["send", thread, text])
+            return .ok(String(data: data, encoding: .utf8) ?? "")
+        } catch CTAError.nonZeroExit(let code, let stderr) {
+            switch code {
+            case 1: return .noMount(stderr: stderr)
+            case 2: return .sessionDead(stderr: stderr)
+            default: return .error(stderr)
+            }
+        } catch {
+            return .error("\(error)")
+        }
+    }
+
     /// `cta watch <thread> [--lines N] [--ansi]` — snapshot of the topic's
     /// tmux pane content. Single-shot (Phase A of pager-watch-live.md);
     /// streaming variant lands in Phase B.

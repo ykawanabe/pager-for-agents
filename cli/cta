@@ -1033,6 +1033,76 @@ cmd_watch() {
   tmux capture-pane "${capture_args[@]}"
 }
 
+# `cta send <thread> <text...>` — deliver text into a topic's tmux pane,
+# followed by Enter (claude's TUI submit). Used by Pager's WatchLive input
+# field (Phase C.2 of watch-live plan); also handy for scripted prompts.
+#
+# Dispatch primitive: `tmux load-buffer -b <name>` + `paste-buffer -d` +
+# `send-keys Enter`. Same approach as poller.ts tmuxDispatch — per-call
+# named buffer eliminates the default-buffer race when poller, watchdog,
+# and cta send run concurrently (D3 fix).
+#
+# Exit codes mirror cta watch:
+#   0  delivered
+#   1  no mount, usage error, or load-buffer/paste failure
+#   2  mount exists but tmux session is not alive
+cmd_send() {
+  local thread_id="${1:-}"
+  shift 2>/dev/null || true
+  local text="$*"
+
+  if [[ -z "$thread_id" || -z "$text" ]]; then
+    echo "Usage: cta send <thread_id|dm> <text...>" >&2
+    exit 1
+  fi
+
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta send: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+
+  local mount_json
+  mount_json=$(bun run "$store" get "$thread_id" 2>/dev/null || echo "null")
+  if [[ -z "$mount_json" || "$mount_json" == "null" ]]; then
+    echo "cta send: no mount for thread '$thread_id'" >&2
+    exit 1
+  fi
+
+  local tmux_session
+  tmux_session=$(echo "$mount_json" | jq -r '.tmux_session // empty')
+  if [[ -z "$tmux_session" ]]; then
+    echo "cta send: mount for '$thread_id' has no tmux_session field" >&2
+    exit 1
+  fi
+
+  if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+    echo "cta send: tmux session '$tmux_session' is not alive" >&2
+    exit 2
+  fi
+
+  # Per-call named buffer — see poller.ts tmuxDispatch for the race
+  # explanation. RANDOM gives 0..32767; combined with the millisecond clock
+  # the collision space is comfortably below realistic concurrent dispatch
+  # rates (the poller + this CLI + the watchdog).
+  local buf="pager-cta-${tmux_session}-$(date +%s)-${RANDOM}"
+
+  if ! printf '%s' "$text" | tmux load-buffer -b "$buf" - 2>&1; then
+    echo "cta send: tmux load-buffer failed" >&2
+    exit 1
+  fi
+  if ! tmux paste-buffer -b "$buf" -d -t "$tmux_session" 2>&1; then
+    tmux delete-buffer -b "$buf" 2>/dev/null || true
+    echo "cta send: tmux paste-buffer failed" >&2
+    exit 1
+  fi
+  if ! tmux send-keys -t "$tmux_session" Enter 2>&1; then
+    echo "cta send: tmux send-keys Enter failed" >&2
+    exit 1
+  fi
+}
+
 cmd_migrate_state() {
   # Move v0.1 state + install dirs to the v0.2 layout. Refuses to run while
   # the poller is alive — partial writes during migration would corrupt
@@ -1141,6 +1211,7 @@ Usage:
   cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
   cta watch <thread> [--lines N] [--ansi]
                                   Print the current pane content of a topic (Pager watch-live)
+  cta send <thread> <text...>     Deliver text into a topic's tmux pane (Pager watch-live input)
   cta pair-code [--init|--reset]  Show / generate the one-time Telegram pairing code
   cta pair <chat_id> [user_id]    Host-driven pairing (skip the Telegram round-trip)
   cta pair --auto                 Show chats the bot has been seen in recently
@@ -1176,6 +1247,7 @@ main() {
     list)  cmd_list "$@" ;;
     bind) cmd_bind "$@" ;;
     watch) cmd_watch "$@" ;;
+    send) cmd_send "$@" ;;
     pair-code) cmd_pair_code "$@" ;;
     pair) cmd_pair "$@" ;;
     unpair) cmd_unpair "$@" ;;

@@ -6,6 +6,10 @@ import AppKit
 /// See docs/plans/pager-watch-live.md (Phase A).
 struct WatchLiveView: View {
     @StateObject private var vm = WatchLiveViewModel()
+    @State private var inputText: String = ""
+    @State private var sendInFlight: Bool = false
+    @State private var sendError: String?
+    @FocusState private var inputFocused: Bool
 
     var body: some View {
         NavigationSplitView {
@@ -106,13 +110,96 @@ struct WatchLiveView: View {
             mainPaneHeader
             Divider()
             ScrollView {
-                Text(paneRenderedText)
+                paneContent
                     .font(.system(size: 12, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .padding(10)
             }
             .background(Color(NSColor.textBackgroundColor))
+            Divider()
+            inputArea
+        }
+    }
+
+    /// Render the focused topic's pane. For .live we delegate to
+    /// ANSIParser.attributed so colors/bold/underline survive; for the
+    /// error states we render plain text — those messages don't have ANSI.
+    @ViewBuilder
+    private var paneContent: some View {
+        switch vm.paneStatus {
+        case .live(let content):
+            Text(ANSIParser.attributed(content))
+        case .sessionDead(let stderr):
+            Text("Topic's tmux session is not running.\n\nStart it with:\n  cta start\n\nDetails: \(stderr)")
+        case .noMount(let stderr):
+            Text("No mount for this thread.\n\nDetails: \(stderr)")
+        case .error(let msg):
+            Text("Error fetching pane:\n\n\(msg)")
+        case .unknown:
+            Text("Loading…")
+        }
+    }
+
+    @ViewBuilder
+    private var inputArea: some View {
+        VStack(spacing: 4) {
+            TextEditor(text: $inputText)
+                .font(.system(size: 13))
+                .frame(minHeight: 44, maxHeight: 120)
+                .scrollContentBackground(.hidden)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+                .focused($inputFocused)
+
+            HStack(spacing: 8) {
+                if let err = sendError {
+                    Label(err, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                Text("⌘↩ to send")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Button("Send") { submitInput() }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(canSend == false)
+            }
+        }
+        .padding(8)
+        .background(.bar)
+    }
+
+    private var canSend: Bool {
+        !sendInFlight
+            && vm.focusedThreadId != nil
+            && !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func submitInput() {
+        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let id = vm.focusedThreadId else { return }
+        sendInFlight = true
+        sendError = nil
+        Task.detached {
+            let result = CTAClient.send(thread: id, text: text)
+            await MainActor.run {
+                sendInFlight = false
+                switch result {
+                case .ok:
+                    inputText = ""
+                    inputFocused = true
+                case .noMount(let s):
+                    sendError = "No mount: \(s.trimmingCharacters(in: .whitespacesAndNewlines))"
+                case .sessionDead(let s):
+                    sendError = "Topic not running: \(s.trimmingCharacters(in: .whitespacesAndNewlines))"
+                case .error(let m):
+                    sendError = m.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
         }
     }
 
@@ -162,29 +249,4 @@ struct WatchLiveView: View {
         }
     }
 
-    private var paneRenderedText: String {
-        switch vm.paneStatus {
-        case .live(let content):
-            return WatchLiveView.stripAnsi(content)
-        case .sessionDead(let stderr):
-            return "Topic's tmux session is not running.\n\nStart it with:\n  cta start\n\nDetails: \(stderr)"
-        case .noMount(let stderr):
-            return "No mount for this thread.\n\nDetails: \(stderr)"
-        case .error(let msg):
-            return "Error fetching pane:\n\n\(msg)"
-        case .unknown:
-            return "Loading…"
-        }
-    }
-
-    /// Minimal ANSI-CSI strip: removes `ESC [ ... letter` sequences. Phase D
-    /// adds proper color rendering; for now plain text matches the existing
-    /// Pager menu-bar log views and is easier to read in a sidebar context.
-    static func stripAnsi(_ s: String) -> String {
-        s.replacingOccurrences(
-            of: "\u{001B}\\[[0-9;]*[a-zA-Z]",
-            with: "",
-            options: .regularExpression
-        )
-    }
 }
