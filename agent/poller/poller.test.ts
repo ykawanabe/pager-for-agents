@@ -542,15 +542,19 @@ describe("claude built-in interception (post-pair)", () => {
 
   beforeEach(() => { sent.length = 0; });
 
-  test("/status is intercepted with explanation, NOT passed to claude", async () => {
+  test("/status is intercepted with per-command reason, NOT passed to claude", async () => {
     pair({ chat_id: -1001, user_id: 99 });
     const handled = await poller.tryHandleCommand(
       msg({ text: "/status", chat_id: -1001, from_id: 99 }),
     );
     expect(handled).toBe(true);
     expect(sent.length).toBe(1);
-    expect(sent[0].text.toLowerCase()).toContain("local ui");
+    // P3.10 framework: each hidden command surfaces a per-command reason
+    // (was: a generic "local ui" message that gave no actionable hint).
+    expect(sent[0].text.toLowerCase()).toContain("tui command");
     expect(sent[0].text).toContain("/status");
+    // /status's specific reason directs the user to `cta status`.
+    expect(sent[0].text).toContain("cta status");
   });
 
   test("/model, /agents are intercepted with TUI-only message", async () => {
@@ -583,6 +587,27 @@ describe("claude built-in interception (post-pair)", () => {
     );
     expect(handled).toBe(true);
     expect(sent.length).toBe(1);
+  });
+
+  test("/model surfaces the model-specific reason (not /status's reason)", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/model", chat_id: -1001, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    // Per-command reason, not the generic blocklist message.
+    expect(sent[0].text).toContain("CLAUDE_MODEL");
+  });
+
+  test("/agents surfaces the agents-specific reason", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/agents", chat_id: -1001, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0].text).toContain(".claude/agents");
   });
 });
 
