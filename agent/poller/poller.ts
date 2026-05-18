@@ -30,6 +30,7 @@ import { spawnSync } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { addMount, gcProvisional, mountKey, readMounts, removeMount, type Mount, type ThreadId } from "../mount-store/mount-store";
 
 // Poller-side cache key for Telegram updates. Hardcoded "telegram" because
@@ -39,7 +40,7 @@ function tgKey(thread_id: ThreadId): string {
   return mountKey("telegram", thread_id);
 }
 import { markTypingActive, runTypingKeepalive } from "./typing-keepalive";
-import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, installAgentDir, installMountStoreTs } from "../lib/paths";
+import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs } from "../lib/paths";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
@@ -756,6 +757,67 @@ async function gcOrphanedProvisionals(): Promise<void> {
   }
 }
 
+// /clear over Telegram: rotate the per-topic session UUID and kill the
+// topic's tmux session. The watchdog (kick_dead_topic_sessions) and the
+// wrapper's restart loop respawn claude with the new UUID, so the next
+// message starts a fresh conversation.
+//
+// Why we own this rather than forwarding to claude TUI: /clear is caught
+// by the TUI layer, never reaches the model. Forwarding via tmux send-keys
+// would clear claude's context but produce no send_telegram call — typing-
+// keepalive would run to its 10-min cap with no user-visible feedback.
+// We own the semantic so the user gets an explicit ack.
+async function handleClear(msg: TgMessage): Promise<void> {
+  const chat_id = msg.chat.id;
+  const thread_id_raw = msg.message_thread_id;
+  const key: number | "dm" = thread_id_raw != null ? thread_id_raw : "dm";
+  const mount = mountsCache.get(tgKey(key));
+
+  if (!mount) {
+    await reply(
+      { chat_id, thread_id: thread_id_raw },
+      "Nothing to clear — no mount in this topic. Send a message to start a mount-helper session, or `cta mount` from your Mac.",
+    );
+    return;
+  }
+
+  if (mount.provisional) {
+    await reply(
+      { chat_id, thread_id: thread_id_raw },
+      "This topic is in mount-helper mode (no project session running yet). Send `/cancel` to abort the helper instead.",
+    );
+    return;
+  }
+
+  // Rotate per-topic session UUID. topic-wrapper.sh reads this file at
+  // each restart and resumes whatever UUID is there — a fresh UUID means
+  // no --resume → fresh claude session.
+  const sessFile = join(sessionsDir(), String(key));
+  const newUuid = randomUUID();
+  try {
+    mkdirSync(sessionsDir(), { recursive: true });
+    writeFileSync(sessFile, newUuid + "\n");
+  } catch (e) {
+    process.stderr.write(`poller: handleClear UUID rotate failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    await reply(
+      { chat_id, thread_id: thread_id_raw },
+      "Couldn't rotate the session UUID. Run `cta start` from your Mac to recover.",
+    );
+    return;
+  }
+
+  // Kill the topic tmux session. kick_dead_topic_sessions (watchdog) or
+  // the wrapper's own restart loop will respawn it; new claude reads the
+  // rotated UUID file and starts fresh.
+  const targetSession = mount.tmux_session ?? `topic-${key}`;
+  spawnSync("tmux", ["kill-session", "-t", targetSession], { encoding: "utf8" });
+
+  await reply(
+    { chat_id, thread_id: thread_id_raw },
+    "Cleared. New session starting — first reply may take 5–15s while claude cold-starts.",
+  );
+}
+
 async function handleCancel(msg: TgMessage): Promise<void> {
   const chat_id = msg.chat.id;
   const thread_id_raw = msg.message_thread_id;
@@ -1062,9 +1124,13 @@ async function handleHelp(msg: TgMessage): Promise<void> {
 // subsequent input or silently change session state. Intercept here and
 // tell the user. Unknown `/foo` not in this set still falls through —
 // that's how user skills (e.g. `/qa`, `/codex`) work over Telegram.
+// `/clear` is intentionally NOT here — it has a dedicated handler
+// (handleClear) that rotates the session UUID and respawns the topic.
+// See D14 in docs/plans/multi-topic-stability-plan.md for why blocklist-
+// only handling is unsafe (typing-keepalive runs to 10min cap).
 const CLAUDE_BUILTIN_BLOCKLIST = new Set([
   "/status", "/config", "/agents", "/permissions", "/model",
-  "/output-style", "/init", "/clear",
+  "/output-style", "/init",
   "/exit", "/quit", "/logout", "/login",
 ]);
 
@@ -1117,6 +1183,7 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
     case "/dm":    await handleDm(msg, args); return true;
     case "/unmount": await handleUnmount(msg); return true;
     case "/cancel": await handleCancel(msg); return true;
+    case "/clear":  await handleClear(msg); return true;
     case "/list":  await handleList(msg); return true;
     case "/help":  await handleHelp(msg); return true;
     default:
