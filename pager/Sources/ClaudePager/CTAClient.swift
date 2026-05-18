@@ -247,6 +247,39 @@ enum CTAClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    // MARK: - Watch
+
+    /// Result of `cta watch <thread>`. Exit codes 1/2 are surfaced as
+    /// distinct states rather than thrown errors so the UI can render
+    /// "no mount" vs "tmux dead" vs "live content" without try/catch
+    /// gymnastics per render.
+    enum WatchResult: Equatable {
+        case ok(String)
+        case noMount(stderr: String)
+        case sessionDead(stderr: String)
+        case error(String)
+    }
+
+    /// `cta watch <thread> [--lines N] [--ansi]` — snapshot of the topic's
+    /// tmux pane content. Single-shot (Phase A of pager-watch-live.md);
+    /// streaming variant lands in Phase B.
+    static func watch(thread: String, lines: Int = 200, ansi: Bool = false) -> WatchResult {
+        var args = ["watch", thread, "--lines", String(lines)]
+        if ansi { args.append("--ansi") }
+        do {
+            let data = try run(args: args)
+            return .ok(String(data: data, encoding: .utf8) ?? "")
+        } catch CTAError.nonZeroExit(let code, let stderr) {
+            switch code {
+            case 1: return .noMount(stderr: stderr)
+            case 2: return .sessionDead(stderr: stderr)
+            default: return .error(stderr)
+            }
+        } catch {
+            return .error("\(error)")
+        }
+    }
+
     // MARK: - Pairing
 
     /// `cta pair-code [--reset]` — returns the current code or a freshly
