@@ -2,14 +2,16 @@ import SwiftUI
 import AppKit
 
 /// Unified Watch-Live window: sidebar lists every active mount with a 1-line
-/// preview + activity dot; main pane renders the focused topic's tmux pane.
-/// See docs/plans/pager-watch-live.md (Phase A).
+/// preview + activity dot; main pane embeds a real terminal that's attached
+/// to the focused topic's tmux session. See docs/plans/pager-watch-live.md.
+///
+/// Main pane uses SwiftTerm's LocalProcessTerminalView (WatchLiveTerminalView)
+/// rather than a polling+Text rendering. This eliminates the 500ms refresh
+/// jitter, ANSI parsing complexity, and the multi-hop input path. The VM is
+/// still used for sidebar mounts/activity dots and for gating: we only spawn
+/// the terminal when paneStatus says the tmux session is alive.
 struct WatchLiveView: View {
     @StateObject private var vm = WatchLiveViewModel()
-    @State private var inputText: String = ""
-    @State private var sendInFlight: Bool = false
-    @State private var sendError: String?
-    @FocusState private var inputFocused: Bool
 
     var body: some View {
         NavigationSplitView {
@@ -109,137 +111,49 @@ struct WatchLiveView: View {
         VStack(spacing: 0) {
             mainPaneHeader
             Divider()
-            ScrollViewReader { proxy in
-                ScrollView {
-                    paneContent
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                        .padding(10)
-                        .id("watch-live-pane-bottom")
-                }
+            paneBody
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(NSColor.textBackgroundColor))
-                // Auto-scroll to bottom whenever content changes — user wants
-                // to see the LATEST claude output, which is at the end of
-                // capture-pane's output. Without this the ScrollView starts
-                // at the top (oldest scrollback) and the user has to scroll
-                // every refresh.
-                .onChange(of: paneStatusContentSignal) { _, _ in
-                    withAnimation(.easeOut(duration: 0.1)) {
-                        proxy.scrollTo("watch-live-pane-bottom", anchor: .bottom)
-                    }
-                }
-                .onAppear {
-                    proxy.scrollTo("watch-live-pane-bottom", anchor: .bottom)
-                }
-                .onChange(of: vm.focusedThreadId) { _, _ in
-                    // Topic switch — jump to bottom of new content immediately.
-                    proxy.scrollTo("watch-live-pane-bottom", anchor: .bottom)
-                }
-            }
-            Divider()
-            inputArea
         }
     }
 
-    /// Cheap change-detection signal for the .onChange modifier — using the
-    /// full content string as the comparison key would be expensive for
-    /// long pane buffers. Tuple of (case-tag, length) is enough to fire on
-    /// any update.
-    private var paneStatusContentSignal: String {
-        switch vm.paneStatus {
-        case .unknown: return "unknown"
-        case .starting: return "starting"
-        case .live(let c): return "live:\(c.count)"
-        case .sessionDead: return "dead"
-        case .noMount: return "nomount"
-        case .error: return "error"
-        }
-    }
-
-    /// Render the focused topic's pane as plain text. Stripped of ANSI —
-    /// the user wanted "そのまま" (as-is) and the AttributedString color
-    /// path adds complexity without clearer information for the "is this
-    /// topic alive + what's happening" goal.
+    /// Switches between the embedded terminal and a placeholder based on the
+    /// VM's paneStatus. We only spawn `tmux attach` when the session is
+    /// believed alive — otherwise tmux just prints "can't find session" and
+    /// exits, which is worse UX than a clean placeholder.
     @ViewBuilder
-    private var paneContent: some View {
-        switch vm.paneStatus {
-        case .live(let content):
-            Text(ANSIParser.strip(content))
-        case .starting:
-            Text("Topic just started — waiting for claude to print.\n\n(this is normal for ~5–15s after a restart or fresh mount)")
-                .foregroundColor(.secondary)
-        case .sessionDead(let stderr):
-            Text("Topic's tmux session is not running.\n\nStart it with:\n  cta start\n\nDetails: \(stderr)")
-        case .noMount(let stderr):
-            Text("No mount for this thread.\n\nDetails: \(stderr)")
-        case .error(let msg):
-            Text("Error fetching pane:\n\n\(msg)")
-        case .unknown:
-            Text("Loading…")
+    private var paneBody: some View {
+        if let threadId = vm.focusedThreadId {
+            switch vm.paneStatus {
+            case .live, .starting:
+                // .id(threadId) recreates the NSViewRepresentable when focus
+                // moves to a different topic. SwiftTerm's terminate() runs
+                // via dismantleNSView, so the old tmux client is released
+                // before the new one attaches.
+                WatchLiveTerminalView(threadId: threadId)
+                    .id(threadId)
+            case .sessionDead(let stderr):
+                placeholderText("Topic's tmux session is not running.\n\nStart it with:\n  cta start\n\nDetails: \(stderr)")
+            case .noMount(let stderr):
+                placeholderText("No mount for this thread.\n\nDetails: \(stderr)")
+            case .error(let msg):
+                placeholderText("Error checking topic status:\n\n\(msg)")
+            case .unknown:
+                placeholderText("Loading…", muted: true)
+            }
+        } else {
+            placeholderText("Select a topic from the sidebar.", muted: true)
         }
     }
 
     @ViewBuilder
-    private var inputArea: some View {
-        VStack(spacing: 4) {
-            TextEditor(text: $inputText)
-                .font(.system(size: 13))
-                .frame(minHeight: 44, maxHeight: 120)
-                .scrollContentBackground(.hidden)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
-                .focused($inputFocused)
-
-            HStack(spacing: 8) {
-                if let err = sendError {
-                    Label(err, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundColor(.red)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer()
-                Text("⌘↩ to send")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                Button("Send") { submitInput() }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(canSend == false)
-            }
-        }
-        .padding(8)
-        .background(.bar)
-    }
-
-    private var canSend: Bool {
-        !sendInFlight
-            && vm.focusedThreadId != nil
-            && !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private func submitInput() {
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let id = vm.focusedThreadId else { return }
-        sendInFlight = true
-        sendError = nil
-        Task.detached {
-            let result = CTAClient.send(thread: id, text: text)
-            await MainActor.run {
-                sendInFlight = false
-                switch result {
-                case .ok:
-                    inputText = ""
-                    inputFocused = true
-                case .noMount(let s):
-                    sendError = "No mount: \(s.trimmingCharacters(in: .whitespacesAndNewlines))"
-                case .sessionDead(let s):
-                    sendError = "Topic not running: \(s.trimmingCharacters(in: .whitespacesAndNewlines))"
-                case .error(let m):
-                    sendError = m.trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            }
-        }
+    private func placeholderText(_ msg: String, muted: Bool = false) -> some View {
+        Text(msg)
+            .font(.system(size: 12, design: .monospaced))
+            .textSelection(.enabled)
+            .foregroundColor(muted ? .secondary : .primary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(10)
     }
 
     @ViewBuilder
