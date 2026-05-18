@@ -58,13 +58,45 @@ case "$EVENT" in
   notification)
     msg=$(extract message)
     tool_name=$(extract tool_name)
-    [[ -z "$msg" ]] && msg="Claude is waiting for your input — reply in this thread to continue."
 
-    # Best-effort topic name lookup. Multi-topic users see notifications
-    # from N topics; including the human-readable name disambiguates
-    # which session is waiting. Falls back to no-prefix when the topic
-    # isn't in topics.json yet (forum-topic-created service message
-    # hasn't arrived, or this is a DM).
+    # Holistic notification filter:
+    #
+    # Claude Code fires `notification` for THREE distinct things, which the
+    # generic "Claude is waiting for your input" message doesn't distinguish:
+    #
+    #   (a) Permission prompt — claude is BLOCKED waiting for y/n on a tool
+    #       call (Bash, Write, etc.). Identified by a non-empty `tool_name`.
+    #       Always notify — user MUST respond or claude stalls.
+    #
+    #   (b) End-of-turn idle — claude finished its response and is awaiting
+    #       the user's next message. No `tool_name`. The user already saw
+    #       claude's response over the Telegram channel; a separate "I'm
+    #       waiting" ping is pure noise. Suppress entirely.
+    #
+    #   (c) Custom message — claude (or an MCP server) called the
+    #       notification API with a specific message_text. Non-generic msg
+    #       OR explicit tool_name → forward as-is.
+    #
+    # The case statement below collapses (b) into exit 0 and leaves (a)+(c)
+    # falling through to the Telegram send.
+    case "$msg" in
+      ""|"Claude is waiting for your input"|"Claude is waiting for your input.")
+        # No tool_name → end-of-turn idle (b). Suppress.
+        if [[ -z "$tool_name" ]]; then
+          exit 0
+        fi
+        # Tool present → permission prompt (a). Replace the generic text
+        # with something actionable so the user knows WHY they were paged.
+        msg="Permission needed for $tool_name — reply yes/no in this thread."
+        ;;
+    esac
+
+    # Topic label. Multi-topic users see notifications from N topics;
+    # including the human-readable name disambiguates which session is
+    # waiting. Lookup order:
+    #   1. topics.json — Telegram forum-topic name (from service msgs)
+    #   2. mounts.json — operator-supplied label (cta mount ... <label>)
+    #   3. raw thread_id — at least the user knows WHICH topic
     topic_label=""
     if [[ -n "$THREAD_ID" && "$THREAD_ID" != "0" ]]; then
       topics_json="${CTA_STATE_DIR:-$HOME/.pager}/topics.json"
@@ -78,6 +110,23 @@ except Exception:
     pass
 " 2>/dev/null)
       fi
+      if [[ -z "$topic_label" ]]; then
+        mounts_json="${CTA_STATE_DIR:-$HOME/.pager}/mounts.json"
+        if [[ -f "$mounts_json" ]]; then
+          topic_label=$(python3 -c "
+import json
+try:
+    d = json.load(open('$mounts_json'))
+    for m in d.get('mounts', []):
+        if str(m.get('thread_id')) == '${THREAD_ID}':
+            print(m.get('label') or '')
+            break
+except Exception:
+    pass
+" 2>/dev/null)
+        fi
+      fi
+      [[ -z "$topic_label" ]] && topic_label="topic #$THREAD_ID"
     fi
 
     # Compose: [topic] [tool:Bash] message

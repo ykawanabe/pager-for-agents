@@ -41,6 +41,23 @@ cat > "$SANDBOX/state/topics.json" <<'EOF'
 }
 EOF
 
+# mounts.json with a label-only entry (no topics.json name yet). Verifies
+# the lookup order: topics.json → mounts.json label → "topic #N" fallback.
+cat > "$SANDBOX/state/mounts.json" <<'EOF'
+{
+  "version": 2,
+  "mounts": [
+    {
+      "thread_id": 555,
+      "path": "/tmp/proj",
+      "label": "mount-labeled",
+      "tmux_session": "topic-555",
+      "created_at": "2026-05-18T00:00:00Z"
+    }
+  ]
+}
+EOF
+
 # PATH shim — a fake `curl` captures the data-urlencode args into CURL_LOG
 # so the test can introspect the message body.
 SHIM_DIR="$SANDBOX/bin"
@@ -89,31 +106,63 @@ else
   ng "message field missing from notification"
 fi
 
-# ─── Test: empty message falls back to a sensible default ─────────────────
+# ─── Test: empty message + no tool_name → SUPPRESSED ──────────────────────
+# This is the end-of-turn idle case. User already saw claude's response via
+# the Telegram channel; a separate "I'm waiting" ping is pure noise.
 
 run_hook notification '{}' 42
-if grep -qE 'waiting|input' "$CURL_LOG"; then
-  ok "empty message falls back to 'waiting/input' text"
+if [[ ! -s "$CURL_LOG" ]]; then
+  ok "empty message + no tool_name → notification suppressed (no Telegram send)"
 else
-  ng "fallback message missing for empty payload"
+  ng "expected suppression, got: $(cat "$CURL_LOG" | head -c 200)"
 fi
 
-# ─── Test: unknown topic (not in topics.json) still ships ─────────────────
+# ─── Test: generic 'waiting for input' + no tool_name → SUPPRESSED ───────
+# Same suppression rule applies to the verbatim string Claude Code emits.
+
+run_hook notification '{"message": "Claude is waiting for your input"}' 42
+if [[ ! -s "$CURL_LOG" ]]; then
+  ok "generic 'waiting' message + no tool_name → suppressed"
+else
+  ng "expected suppression of generic msg, got: $(cat "$CURL_LOG" | head -c 200)"
+fi
+
+# ─── Test: generic message + tool_name → REPLACED with actionable text ───
+# Permission prompts block claude — must page the user. The generic
+# "Claude is waiting for your input" gets rewritten to name the tool.
+
+run_hook notification '{"message": "Claude is waiting for your input", "tool_name": "Bash"}' 42
+if grep -q 'Permission needed for Bash' "$CURL_LOG"; then
+  ok "generic msg + tool_name → 'Permission needed for <tool>' text"
+else
+  ng "expected 'Permission needed for Bash', got: $(cat "$CURL_LOG" | head -c 200)"
+fi
+
+# ─── Test: specific message + tool_name → preserved verbatim ─────────────
+
+run_hook notification '{"message": "Approve rm -rf /tmp/foo?", "tool_name": "Bash"}' 42
+if grep -q 'Approve rm -rf' "$CURL_LOG" && grep -q 'Bash' "$CURL_LOG"; then
+  ok "specific msg + tool_name → both preserved"
+else
+  ng "expected verbatim msg + tool_name, got: $(cat "$CURL_LOG" | head -c 200)"
+fi
+
+# ─── Test: unknown topic (not in topics.json, has mounts.json label) ─────
+
+run_hook notification '{"message": "Quick question"}' 555
+if grep -q 'mount-labeled' "$CURL_LOG"; then
+  ok "topic label falls back to mounts.json when topics.json misses"
+else
+  ng "mounts.json label fallback missing: $(cat "$CURL_LOG" | head -c 200)"
+fi
+
+# ─── Test: unknown topic everywhere → 'topic #N' final fallback ──────────
 
 run_hook notification '{"message": "Quick question"}' 999
-if grep -q 'Quick question' "$CURL_LOG"; then
-  ok "unknown topic: message still delivered"
+if grep -q 'topic #999' "$CURL_LOG"; then
+  ok "unknown-everywhere topic gets 'topic #N' label fallback"
 else
-  ng "unknown topic: message dropped"
-fi
-
-# ─── Test: tool_name (permission events) included if present ─────────────
-
-run_hook notification '{"message": "Permission needed", "tool_name": "Bash"}' 42
-if grep -q 'Bash' "$CURL_LOG"; then
-  ok "tool_name surfaced when payload has one (permission context)"
-else
-  ng "tool_name not surfaced in notification (Bash tool permission case)"
+  ng "expected 'topic #999' fallback, got: $(cat "$CURL_LOG" | head -c 200)"
 fi
 
 # ─── Test: precompact / postcompact still work ─────────────────────────────
