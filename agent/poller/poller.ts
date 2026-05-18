@@ -745,9 +745,19 @@ async function spawnHelper(thread_id: number | "dm"): Promise<string | null> {
   return tmuxSession;
 }
 
+// Grace window for cold-boot resilience (D15): after a host reboot every
+// helper-<id> tmux is dead, but provisional rows may have been written
+// seconds ago by spawnHelper before the reboot. Without grace, the user's
+// in-progress helper conversation gets wiped at poller startup. 10 min
+// is a balance: long enough to survive a normal reboot cycle (login,
+// LaunchAgent startup, mount of $HOME, etc.) but short enough that
+// genuinely abandoned helpers don't accumulate forever. Override via
+// PAGER_PROVISIONAL_GRACE_MS env if needed.
+const PROVISIONAL_GRACE_MS = Number(process.env.PAGER_PROVISIONAL_GRACE_MS ?? `${10 * 60_000}`);
+
 async function gcOrphanedProvisionals(): Promise<void> {
   try {
-    const dropped = await gcProvisional((s) => tmuxHasSession(s));
+    const dropped = await gcProvisional((s) => tmuxHasSession(s), PROVISIONAL_GRACE_MS);
     if (dropped > 0) {
       process.stdout.write(`[${new Date().toISOString()}] poller: gc dropped ${dropped} orphaned provisional mount(s)\n`);
       refreshMountsIfChanged();
