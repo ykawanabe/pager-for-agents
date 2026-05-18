@@ -349,14 +349,28 @@ export async function replaceMount(args: {
  * poller at startup to clean up state left behind when a helper crashed,
  * a host rebooted mid-conversation, or `cta umount` partially ran. Real
  * (non-provisional) mounts are never touched. Returns the number dropped.
+ *
+ * `graceMs` (optional): preserve provisional rows whose `created_at` is
+ * within this many ms of now, even if their tmux is dead. Closes D15
+ * (cold-boot wipe): after a host reboot every helper-<id> tmux is gone,
+ * but the row may have been written seconds ago by spawnHelper. Without
+ * a grace window, the user's in-progress helper conversation is wiped.
+ * The default (`undefined` / no grace) preserves the original behavior:
+ * dead tmux → drop, regardless of age.
  */
 export async function gcProvisional(
   isAlive: (tmuxSession: string) => boolean,
+  graceMs?: number,
 ): Promise<number> {
   return withLock(() => {
     const data = readMounts();
+    const now = Date.now();
     const kept = data.mounts.filter((m) => {
       if (!m.provisional) return true;
+      if (graceMs != null && m.created_at) {
+        const age = now - new Date(m.created_at).getTime();
+        if (Number.isFinite(age) && age >= 0 && age < graceMs) return true;
+      }
       if (!m.tmux_session) return false;
       return isAlive(m.tmux_session);
     });
@@ -471,6 +485,11 @@ async function main(): Promise<void> {
       return;
     }
     case "gc-provisional": {
+      // Optional --grace-ms <N> flag: preserve provisional rows whose
+      // created_at is within N ms of now, even if tmux is dead. Used by
+      // the poller to ride out cold-boot wipes (D15).
+      const graceIdx = rest.indexOf("--grace-ms");
+      const graceMs = graceIdx >= 0 ? Number(rest[graceIdx + 1]) : undefined;
       const dropped = await gcProvisional((s) => {
         try {
           const r = Bun.spawnSync(["tmux", "has-session", "-t", s]);
@@ -478,7 +497,7 @@ async function main(): Promise<void> {
         } catch {
           return false;
         }
-      });
+      }, graceMs);
       process.stdout.write(`${JSON.stringify({ dropped })}\n`);
       return;
     }

@@ -237,6 +237,48 @@ GC_OUT=$(bun run "$STORE" gc-provisional)
 GC_OUT_2=$(bun run "$STORE" gc-provisional)
 [[ "$(echo "$GC_OUT_2" | jq -r '.dropped')" == "0" ]] && ok "gc-provisional: idempotent (0 on second run)" || ng "gc-provisional: idempotent"
 
+# ─── gc-provisional grace period (P2.3 / D15) ───────────────────────────────
+# Cold-boot scenario: every helper-<id> tmux is dead after a Mac reboot,
+# but the provisional row was created seconds ago by spawnHelper. Without
+# a grace window, gc wipes the user's in-progress helper conversation.
+
+rm -rf "$STATE" && mkdir -p "$STATE"
+
+# A fresh provisional row + a long grace window → preserved despite dead tmux.
+bun run "$STORE" add 55 /tmp/fresh helper-fresh --provisional --tmux-session helper-55-DEAD >/dev/null
+GC_GRACE=$(bun run "$STORE" gc-provisional --grace-ms 60000)
+[[ "$(echo "$GC_GRACE" | jq -r '.dropped')" == "0" ]] \
+  && ok "gc-provisional --grace-ms: fresh provisional row preserved within grace" \
+  || ng "gc-provisional --grace-ms: fresh provisional should be preserved (got $GC_GRACE)"
+[[ "$(bun run "$STORE" get 55 | jq -r '.thread_id')" == "55" ]] \
+  && ok "gc-provisional --grace-ms: fresh row still present after gc" \
+  || ng "gc-provisional --grace-ms: fresh row missing"
+
+# An old provisional row (created_at backdated) + a short grace → still dropped.
+# We backdate by rewriting mounts.json directly (the only test-friendly way).
+jq '.mounts |= map(if .thread_id == 55 then .created_at = "2000-01-01T00:00:00Z" else . end)' \
+  "$STATE/mounts.json" > "$STATE/mounts.json.tmp" && mv "$STATE/mounts.json.tmp" "$STATE/mounts.json"
+GC_AGED=$(bun run "$STORE" gc-provisional --grace-ms 60000)
+[[ "$(echo "$GC_AGED" | jq -r '.dropped')" == "1" ]] \
+  && ok "gc-provisional --grace-ms: aged provisional (older than grace) dropped" \
+  || ng "gc-provisional --grace-ms: aged provisional should be dropped (got $GC_AGED)"
+
+# Real (non-provisional) rows untouched regardless of grace.
+rm -rf "$STATE" && mkdir -p "$STATE"
+bun run "$STORE" add 66 /tmp/real real-mount >/dev/null
+GC_REAL=$(bun run "$STORE" gc-provisional --grace-ms 60000)
+[[ "$(echo "$GC_REAL" | jq -r '.dropped')" == "0" ]] \
+  && ok "gc-provisional --grace-ms: real rows untouched" \
+  || ng "gc-provisional --grace-ms: real row was dropped (got $GC_REAL)"
+
+# Default (no --grace-ms) preserves current behavior: dead tmux → drop.
+rm -rf "$STATE" && mkdir -p "$STATE"
+bun run "$STORE" add 77 /tmp/x helper-x --provisional --tmux-session helper-77-DEAD >/dev/null
+GC_DEFAULT=$(bun run "$STORE" gc-provisional)
+[[ "$(echo "$GC_DEFAULT" | jq -r '.dropped')" == "1" ]] \
+  && ok "gc-provisional: default (no grace) still drops dead provisional" \
+  || ng "gc-provisional default behavior changed (got $GC_DEFAULT)"
+
 # ─── result ─────────────────────────────────────────────────────────────────
 
 echo
