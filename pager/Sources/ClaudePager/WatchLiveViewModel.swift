@@ -88,9 +88,10 @@ final class WatchLiveViewModel: ObservableObject {
 
     init(
         mountsProvider: @escaping MountsProvider = { try CTAClient.listMounts() },
-        // ansi:true preserves escape codes so the View can render colors via
-        // ANSIParser. The default lines=200 matches the cta CLI default.
-        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 200, ansi: true) },
+        // ansi:false → cta watch strips escape codes via tmux capture-pane
+        // (default behavior). The Pager renders plain text — color is more
+        // complexity than value for the "watch what claude's doing" goal.
+        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 500, ansi: false) },
         streamSpawner: StreamSpawner? = WatchLiveViewModel.defaultStreamSpawner,
         focusRestore: FocusRestore = {
             UserDefaults.standard.string(forKey: WatchLiveViewModel.lastFocusedKey)

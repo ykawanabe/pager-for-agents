@@ -157,14 +157,15 @@ struct WatchLiveView: View {
         }
     }
 
-    /// Render the focused topic's pane. For .live we delegate to
-    /// ANSIParser.attributed so colors/bold/underline survive; for the
-    /// error states we render plain text — those messages don't have ANSI.
+    /// Render the focused topic's pane as plain text. Stripped of ANSI —
+    /// the user wanted "そのまま" (as-is) and the AttributedString color
+    /// path adds complexity without clearer information for the "is this
+    /// topic alive + what's happening" goal.
     @ViewBuilder
     private var paneContent: some View {
         switch vm.paneStatus {
         case .live(let content):
-            Text(ANSIParser.attributed(content))
+            Text(ANSIParser.strip(content))
         case .starting:
             Text("Topic just started — waiting for claude to print.\n\n(this is normal for ~5–15s after a restart or fresh mount)")
                 .foregroundColor(.secondary)
