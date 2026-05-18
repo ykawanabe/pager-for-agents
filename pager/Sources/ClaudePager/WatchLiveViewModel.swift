@@ -26,6 +26,9 @@ final class WatchLiveViewModel: ObservableObject {
     /// What the main pane should render.
     enum PaneStatus: Equatable {
         case unknown
+        /// tmux is alive but capture is empty — claude is cold-starting,
+        /// or the pane just respawned and hasn't produced output yet.
+        case starting
         case live(content: String)
         case sessionDead(stderr: String)
         case noMount(stderr: String)
@@ -38,21 +41,42 @@ final class WatchLiveViewModel: ObservableObject {
 
     typealias MountsProvider = () async throws -> [CTAClient.MountJSON]
     typealias CaptureProvider = (String) async -> CTAClient.WatchResult
+    typealias FocusPersist = (String?) -> Void
+    typealias FocusRestore = () -> String?
 
     private let mountsProvider: MountsProvider
     private let captureProvider: CaptureProvider
+    private let persistFocus: FocusPersist
     private var lastPreviewByThread: [String: String] = [:]
     private var sidebarTask: Task<Void, Never>?
     private var paneTask: Task<Void, Never>?
+
+    /// UserDefaults key for the last-selected thread_id (Phase E.3).
+    /// Restored on init; persisted whenever focus changes. Survives Pager
+    /// restarts so the user doesn't lose their place. Nonisolated so the
+    /// default init closures can read it without crossing actor boundaries.
+    nonisolated static let lastFocusedKey = "watchLive.lastFocusedThreadId"
 
     init(
         mountsProvider: @escaping MountsProvider = { try CTAClient.listMounts() },
         // ansi:true preserves escape codes so the View can render colors via
         // ANSIParser. The default lines=200 matches the cta CLI default.
-        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 200, ansi: true) }
+        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 200, ansi: true) },
+        focusRestore: FocusRestore = {
+            UserDefaults.standard.string(forKey: WatchLiveViewModel.lastFocusedKey)
+        },
+        focusPersist: @escaping FocusPersist = { id in
+            if let id = id {
+                UserDefaults.standard.set(id, forKey: WatchLiveViewModel.lastFocusedKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: WatchLiveViewModel.lastFocusedKey)
+            }
+        }
     ) {
         self.mountsProvider = mountsProvider
         self.captureProvider = captureProvider
+        self.persistFocus = focusPersist
+        self.focusedThreadId = focusRestore()
     }
 
     /// Begin periodic refresh of both sidebar (every 5s) and focused pane
@@ -85,6 +109,7 @@ final class WatchLiveViewModel: ObservableObject {
         if focusedThreadId != thread {
             focusedThreadId = thread
             paneStatus = .unknown
+            persistFocus(thread)
         }
     }
 
@@ -137,8 +162,10 @@ final class WatchLiveViewModel: ObservableObject {
         // Auto-focus the most active row when nothing's focused, or when the
         // previously-focused mount is gone.
         if focusedThreadId == nil || !liveIds.contains(focusedThreadId!) {
-            focusedThreadId = WatchLiveViewModel.mostActive(newRows)?.threadId
+            let pick = WatchLiveViewModel.mostActive(newRows)?.threadId
+            focusedThreadId = pick
             paneStatus = .unknown
+            persistFocus(pick)
         }
     }
 
@@ -149,7 +176,14 @@ final class WatchLiveViewModel: ObservableObject {
             return
         }
         switch await captureProvider(id) {
-        case .ok(let content): paneStatus = .live(content: content)
+        case .ok(let content):
+            // E.1: tmux alive but no output yet → distinct "Starting" state
+            // so the pill shows yellow and the pane explains the gap.
+            // Stripped check because pure ANSI codes (color escapes with
+            // no payload) shouldn't count as content either.
+            let plain = ANSIParser.strip(content)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            paneStatus = plain.isEmpty ? .starting : .live(content: content)
         case .sessionDead(let s): paneStatus = .sessionDead(stderr: s)
         case .noMount(let s): paneStatus = .noMount(stderr: s)
         case .error(let m): paneStatus = .error(m)
