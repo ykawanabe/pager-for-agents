@@ -120,6 +120,11 @@ enum CTAClient {
     /// Returns true if `cta` is installed and executable. Cheap — no shell-out.
     static var isInstalled: Bool { resolvedPath != nil }
 
+    /// Resolved cta executable path, or nil when not installed. Exposed so
+    /// long-running streaming subprocesses (WatchLive --follow) can spawn
+    /// cta directly without re-implementing path resolution.
+    static var executablePath: String? { resolvedPath }
+
     /// Run `cta status --json`. Blocking. Caller should be off the main thread.
     static func status() throws -> AgentStatusJSON {
         let raw = try run(args: ["status", "--json"])
