@@ -1135,26 +1135,47 @@ async function handleHelp(msg: TgMessage): Promise<void> {
   );
 }
 
-// Claude Code's own slash commands that open modal UI, terminate the
-// session, or otherwise produce no chat reply. If we forward these to the
-// claude tmux pane, they either get stuck on a modal that swallows
-// subsequent input or silently change session state. Intercept here and
-// tell the user. Unknown `/foo` not in this set still falls through —
-// that's how user skills (e.g. `/qa`, `/codex`) work over Telegram.
-// `/clear` is intentionally NOT here — it has a dedicated handler
-// (handleClear) that rotates the session UUID and respawns the topic.
-// See D14 in docs/plans/multi-topic-stability-plan.md for why blocklist-
-// only handling is unsafe (typing-keepalive runs to 10min cap).
-const CLAUDE_BUILTIN_BLOCKLIST = new Set([
-  "/status", "/config", "/agents", "/permissions", "/model",
-  "/output-style", "/init",
-  "/exit", "/quit", "/logout", "/login",
-]);
+// TUI command registry (P3.10 / Principle 6).
+//
+// Three dispositions for Claude Code TUI commands that arrive over Telegram:
+//
+//   translated  — has a poller-side handler that implements the semantic
+//                 over Telegram. Pager owns the meaning; claude TUI's
+//                 internal behavior is irrelevant.
+//   hidden      — TUI-only command with no Telegram analog. Reply with a
+//                 per-command reason so the user knows where to go on
+//                 their Mac (vs. the previous generic "local UI command"
+//                 message that gave no actionable guidance).
+//   forwarded   — safe to forward to claude (default, no entry needed).
+//                 User-defined skills like `/qa`, `/codex` rely on this.
+//
+// Adding a new command is one row. Future Claude Code releases that add
+// commands need a one-line registry update — vs. the old hand-grown
+// CLAUDE_BUILTIN_BLOCKLIST that silently fell out of sync.
+type CommandSpec =
+  | { disposition: "translated"; handler: (msg: TgMessage) => Promise<void> }
+  | { disposition: "hidden"; reason: string };
 
-async function handleClaudeBuiltin(msg: TgMessage, command: string): Promise<void> {
+const TUI_COMMANDS: Record<string, CommandSpec> = {
+  "/clear": { disposition: "translated", handler: (m) => handleClear(m) },
+
+  "/status":      { disposition: "hidden", reason: "Use `cta status` on your Mac (or the Pager menu bar) for daemon health." },
+  "/config":      { disposition: "hidden", reason: "Edit `~/.pager/.env` directly, then `cta restart`." },
+  "/agents":      { disposition: "hidden", reason: "Project agents live in `.claude/agents/` on disk." },
+  "/permissions": { disposition: "hidden", reason: "Bot runs with `--dangerously-skip-permissions`; tools are constrained via `agent/helper-permissions.json`." },
+  "/model":       { disposition: "hidden", reason: "Set `CLAUDE_MODEL` in `~/.pager/.env`, then `cta restart`." },
+  "/output-style":{ disposition: "hidden", reason: "Telegram renders plain text — output styles are TUI-only." },
+  "/init":        { disposition: "hidden", reason: "Run on your Mac in the project directory." },
+  "/exit":        { disposition: "hidden", reason: "Use `/clear` to reset the conversation, or `cta stop` / `cta start` on your Mac." },
+  "/quit":        { disposition: "hidden", reason: "Use `/clear` to reset the conversation, or `cta stop` / `cta start` on your Mac." },
+  "/logout":      { disposition: "hidden", reason: "The Telegram bot has no logout. `cta unpair` releases the chat for re-pairing." },
+  "/login":       { disposition: "hidden", reason: "The Telegram bot has no login. Run `cta pair-code` on your Mac, then send `/pair <code>` here." },
+};
+
+async function handleHiddenTuiCommand(msg: TgMessage, command: string, reason: string): Promise<void> {
   await reply(
     { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
-    `\`${command}\` is a Claude Code local UI command and can't run over Telegram. Use the bot's commands (\`/help\`) or send any message to talk to Claude.`,
+    `\`${command}\` is a Claude Code TUI command — ${reason}`,
   );
 }
 
@@ -1200,15 +1221,22 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
     case "/dm":    await handleDm(msg, args); return true;
     case "/unmount": await handleUnmount(msg); return true;
     case "/cancel": await handleCancel(msg); return true;
-    case "/clear":  await handleClear(msg); return true;
     case "/list":  await handleList(msg); return true;
     case "/help":  await handleHelp(msg); return true;
-    default:
-      if (CLAUDE_BUILTIN_BLOCKLIST.has(command)) {
-        await handleClaudeBuiltin(msg, command);
+    default: {
+      // TUI command framework: translated → run handler, hidden → reply,
+      // forwarded (no entry) → fall through to claude.
+      const spec = TUI_COMMANDS[command];
+      if (spec?.disposition === "translated") {
+        await spec.handler(msg);
+        return true;
+      }
+      if (spec?.disposition === "hidden") {
+        await handleHiddenTuiCommand(msg, command, spec.reason);
         return true;
       }
       return false; // unknown /x → let claude see it (user skills etc.)
+    }
   }
 }
 
