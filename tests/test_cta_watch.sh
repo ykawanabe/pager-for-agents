@@ -165,6 +165,41 @@ else
   ng "cta watch (no arg): usage message (rc=$RC, out='$OUT')"
 fi
 
+# ─── --follow with no per-topic log file → exit 2 + hint ───────────────────
+
+# topic 42 mount exists, tmux is alive, but the per-topic log file
+# under $STATE/topics/42.log was never created (B.1 hasn't run yet).
+set +e
+OUT=$(cta watch 42 --follow 2>&1)
+RC=$?
+set -e
+if [[ "$RC" -eq 2 ]] && echo "$OUT" | grep -qi "log not yet available\|cta start"; then
+  ok "cta watch --follow (no log): exit 2 + actionable hint"
+else
+  ng "cta watch --follow (no log): rc=$RC out='$OUT'"
+fi
+
+# ─── --follow with log file present → streams from file ────────────────────
+# Pre-populate $STATE/topics/42.log with known content. tail -F doesn't
+# exit on its own (waits for more file writes), so we run cta watch in
+# the background, give it 500ms to flush the initial lines, then kill it.
+mkdir -p "$STATE/topics"
+echo "TAIL_FOLLOW_TEST_LINE_AAA" > "$STATE/topics/42.log"
+
+OUT_FILE=$(mktemp)
+cta watch 42 --follow --lines 100 > "$OUT_FILE" 2>&1 &
+WATCH_PID=$!
+sleep 0.5
+kill -TERM "$WATCH_PID" 2>/dev/null || true
+wait "$WATCH_PID" 2>/dev/null || true
+
+if grep -q "TAIL_FOLLOW_TEST_LINE_AAA" "$OUT_FILE"; then
+  ok "cta watch --follow: streams from per-topic log file"
+else
+  ng "cta watch --follow: expected tail output, got '$(cat "$OUT_FILE")'"
+fi
+rm -f "$OUT_FILE"
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then
   echo "✅ test_cta_watch.sh: $PASS passed"
