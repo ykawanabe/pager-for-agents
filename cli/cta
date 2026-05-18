@@ -725,11 +725,22 @@ cmd_mount() {
     exit 1
   fi
 
+  # Provisional rows (helper-mode placeholders written by the poller's
+  # spawnHelper path) must be atomically replaced, not added — addMount
+  # throws on duplicate. Real (non-provisional) rows still refuse the
+  # overwrite: cta mount is not a force command.
+  local existing op="add"
+  existing=$(bun run "$store" get "$thread_id" 2>/dev/null || echo "null")
+  if [[ "$existing" != "null" ]] \
+     && [[ "$(echo "$existing" | jq -r '.provisional // false')" == "true" ]]; then
+    op="replace"
+  fi
+
   local mount_json
   if [[ -n "$label" ]]; then
-    mount_json=$(bun run "$store" add "$thread_id" "$abs_path" "$label")
+    mount_json=$(bun run "$store" "$op" "$thread_id" "$abs_path" "$label")
   else
-    mount_json=$(bun run "$store" add "$thread_id" "$abs_path")
+    mount_json=$(bun run "$store" "$op" "$thread_id" "$abs_path")
   fi
   local rc=$?
   [[ "$rc" -ne 0 ]] && exit "$rc"
