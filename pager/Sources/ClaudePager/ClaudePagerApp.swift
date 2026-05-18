@@ -48,6 +48,15 @@ struct ClaudePagerApp: App {
             SettingsView(caffeinate: caffeinate, monitor: monitor)
                 .onAppear { syncCaffeinate() }
         }
+
+        // Singleton "watch live" window. Opened via openWindow(id:) from the
+        // menu bar. Closing it leaves the window registered with id —
+        // re-opening from the menu focuses or recreates the singleton.
+        Window("Watch live", id: "watch-live") {
+            WatchLiveView()
+        }
+        .defaultSize(width: 1000, height: 600)
+        .windowResizability(.contentMinSize)
     }
 
     /// Re-apply the two @AppStorage values to the controller. Cheap; safe to

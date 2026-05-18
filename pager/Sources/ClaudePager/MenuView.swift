@@ -4,6 +4,7 @@ struct MenuView: View {
     @ObservedObject var monitor: StatusMonitor
     @ObservedObject var caffeinate: CaffeinateController
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
     @AppStorage("caffeinateEnabled") private var caffeinateEnabled = false
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true
 
@@ -36,47 +37,13 @@ struct MenuView: View {
 
         Divider()
 
-        // MULTI_TOPIC has one claude session per topic (topic-dm + topic-<id>).
-        // Show a submenu listing every known mount so the user picks which
-        // conversation to attach to. Mounts come from cta — the single source
-        // of truth for "what topics exist." Topic names join via topics.json
-        // when the poller has cached them; missing names fall back to the
-        // thread_id so the menu is always actionable.
-        Menu("Watch bot live") {
-            let mounts = currentMounts
-            let pairedChatId = CTAClient.pairedState()?.chatId
-            if mounts.isEmpty {
-                Text("No topics running yet")
-                Text("Send a message in your paired chat first")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(mounts) { mount in
-                    Button(menuLabel(for: mount, pairedChatId: pairedChatId)) {
-                        let session = mount.tmuxSession
-                        // Quote the session name — Telegram topic IDs are numeric
-                        // but the fallback wildcard mount is `topic-*` which the
-                        // shell would glob otherwise.
-                        openTerminal(running: "tmux attach -t \"\(session)\" 2>/dev/null || { echo 'No tmux session \(session) — topic may be idle.'; read -n1 -s -r -p 'Press any key to close...'; }")
-                    }
-                }
-            }
-            Divider()
-            Button("Auto (most recent)") {
-                let pick = """
-                    LATEST=$(tmux list-sessions -F '#{session_activity} #{session_name}' 2>/dev/null \
-                      | awk '$2 ~ /^topic-/ {print $0}' | sort -rn | head -1 | awk '{print $2}')
-                    if [ -n "$LATEST" ]; then
-                      tmux attach -t "$LATEST"
-                    else
-                      tmux attach -t claude 2>/dev/null || { \
-                        echo "No claude conversation session is running yet."; \
-                        echo "Send a message in your paired Telegram chat to spawn one."; \
-                        read -n1 -s -r -p "Press any key to close..."; \
-                      }
-                    fi
-                    """
-                openTerminal(running: pick)
-            }
+        // MULTI_TOPIC has one claude session per topic. The unified Watch-Live
+        // window shows every active topic in one place — sidebar lists them
+        // with activity dots + 1-line previews; main pane renders the focused
+        // topic's tmux pane. See docs/plans/pager-watch-live.md.
+        // Power users can still drop to Terminal: `tmux attach -t topic-<id>`.
+        Button("Watch live…") {
+            openWindow(id: "watch-live")
         }
         Button("Watch poller log") {
             // Separate item for the dispatch / routing log (poller stdout).
@@ -149,65 +116,6 @@ struct MenuView: View {
         case .green:  return .accentColor   // honors the system accent in System Settings → Appearance
         case .yellow: return .orange
         case .red:    return .red
-        }
-    }
-
-    /// Pull the current mount list from `cta list --json`, then filter out
-    /// mounts that aren't reachable in the currently paired chat. Called at
-    /// menu-render time — SwiftUI re-renders the body when the user opens
-    /// the menu bar item, so we get a fresh snapshot on each open without
-    /// polling. Returns empty on any error (cta not installed, JSON parse
-    /// failure) so the menu degrades gracefully into a "no topics" hint.
-    ///
-    /// Reachability rule: a mount is reachable only if its `thread_id` shape
-    /// can carry inbound messages in the paired chat's type. Numeric
-    /// thread_ids are forum topics, which only exist in groups/supergroups
-    /// (chat_id < 0). "dm" is reachable in both chat types — in a DM it's
-    /// the root, and in a group it catches the General topic (Telegram
-    /// omits message_thread_id for General, so the poller routes those
-    /// messages to the "dm" fallback). "*" is the catch-all and always
-    /// shown. Hiding unreachable mounts keeps stale entries out of the
-    /// picker — clicking them would attach a tmux session that receives
-    /// no traffic.
-    private var currentMounts: [CTAClient.MountJSON] {
-        let all = (try? CTAClient.listMounts()) ?? []
-        let paired = CTAClient.pairedState()
-        return all.filter { isReachable($0, paired: paired) }
-    }
-
-    private func isReachable(
-        _ mount: CTAClient.MountJSON,
-        paired: CTAClient.PairedStateJSON?
-    ) -> Bool {
-        guard let paired else { return true }   // unpaired: show everything
-        let isGroup = paired.chatId < 0
-        switch mount.threadId {
-        case .string("dm"):  return true        // DM root (private) or General (group)
-        case .string("*"):   return true
-        case .number:        return isGroup
-        case .string:        return true        // unknown literal — fall back to visible
-        }
-    }
-
-    /// Format a mount for the Watch-live submenu. Prefer the human topic name
-    /// when the poller cached it (forum_topic_created/edited), otherwise show
-    /// the raw thread_id so the menu is still useful immediately after invite
-    /// (before the user posts in the topic and triggers a cache update).
-    private func menuLabel(for mount: CTAClient.MountJSON, pairedChatId: Int?) -> String {
-        // Prefer the topic_name joined in by `cta list --json` so the CLI is
-        // the single source of truth for labeling (handles "General" for the
-        // dm mount in groups, forum topic names for numeric thread_ids).
-        switch mount.threadId {
-        case .string("dm"):
-            if let name = mount.topicName, !name.isEmpty { return name }
-            return "DM"
-        case .string("*"):
-            return "Wildcard fallback"
-        case .number(let n):
-            if let name = mount.topicName, !name.isEmpty { return "\(name) (#\(n))" }
-            return "Topic #\(n)"
-        case .string(let s):
-            return s
         }
     }
 
