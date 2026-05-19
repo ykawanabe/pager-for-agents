@@ -96,50 +96,70 @@ _la_loaded() {
   launchctl list "$PLIST_LABEL" >/dev/null 2>&1
 }
 
-# Print "<pid> <rss_kb>" if claude is running, else empty line. Caller parses.
-# MULTI_TOPIC: any `claude --mcp-config` spawned by topic-wrapper.sh counts as
-# "claude alive" — there's no single canonical `claude --channels` process to
-# look for. Single-topic v0 keeps the old --channels grep.
+# Print "<pid> <rss_kb>" for the canonical always-on process, else empty line.
+# Phase 4 (daemon mode): the long-lived process is the POLLER (bun) — claude
+# spawns lazily inside it per topic and only exists during a turn, so grepping
+# for `claude --mcp-config` returns empty between turns and flickers the Pager
+# status to red. Match the poller bun process instead.
+# MULTI_TOPIC (legacy stream-json mode without daemons): same poller match.
+# Single-topic v0: the old `claude --channels` grep.
 _claude_ps_line() {
   local pat
-  if _multi_topic_enabled; then pat="claude --mcp-config"
-  else pat="claude --channels plugin:telegram"
+  if _multi_topic_enabled; then
+    # Anchored to `/poller.ts$` so a dev's `bun test agent/poller/poller.ts`
+    # doesn't get picked up. Same anchor as cmd_stop's pgrep.
+    pat="bun .*/agent/poller/poller\.ts$"
+  else
+    pat="claude --channels plugin:telegram"
   fi
   # Local `set +o pipefail`: the head -1 / grep chain can SIGPIPE the upstream
   # ps under load and flip pipefail to non-zero, which would empty out the
   # claude.pid field in cta status. Same family of bug as _la_loaded's old form.
-  # shellcheck disable=SC2009  # pgrep can't match multi-word patterns + we need rss
+  # shellcheck disable=SC2009  # pgrep doesn't expose rss + we need pid+rss in one shot
   ( set +o pipefail
     ps -Ao pid=,rss=,command= 2>/dev/null \
-      | grep "$pat" \
+      | grep -E "$pat" \
       | grep -v grep \
       | head -1 \
       | awk '{print $1, $2}'
   )
 }
 
-# MULTI_TOPIC: per-topic mcp-telegram process lives at .../agent/mcp-telegram/server.ts.
-# v0: the official plugin's bun server is also a server.ts; same grep matches both.
-# pgrep -f is atomic — no pipe, no pipefail-vs-SIGPIPE race window.
+# Outbound liveness: "can the bot send a message to Telegram right now?"
 #
-# Liveness-check vs kill-target distinction: this generic `bun.*server.ts`
-# match is intentional for "is _any_ MCP server alive?". A false-positive
-# (user runs their own unrelated bun + server.ts) is acceptable here. cmd_stop
-# uses a plugin-specific pattern instead, so we never kill the user's other
-# bun processes (see test_cta.sh "cmd_stop: did NOT pgrep for plugin-specific
-# pattern" regression test).
+# Phase 4 daemon mode: the poller sends plain-text replies directly via
+# Bot API HTTP — no persistent MCP server needed. mcp-telegram only spawns
+# transiently when a claude turn invokes `send_telegram(buttons=…)`, so
+# pgrep'ing for it would flicker false between turns and flap Pager status
+# red constantly. The semantic answer for "is outbound alive?" is "is the
+# poller alive?" — same liveness as claude.pid in this mode.
+#
+# v0 / pre-Phase-4: the official plugin's persistent bun server.ts was
+# the canonical outbound process; grep for it.
 _mcp_alive() {
-  pgrep -f "bun.*server.ts" >/dev/null 2>&1
+  if _multi_topic_enabled; then
+    pgrep -f 'bun .*/agent/poller/poller\.ts$' >/dev/null 2>&1
+  else
+    pgrep -f "bun.*server.ts" >/dev/null 2>&1
+  fi
 }
 
 _tmux_session_alive() {
   tmux has-session -t "$1" 2>/dev/null
 }
 
-# Returns ISO8601 mtime of bot.pid, or empty if missing.
+# Returns ISO8601 mtime of the most recent activity signal.
+# Phase 4: $STATE_DIR/heartbeat-poller is touched every getUpdates cycle
+# (~25-30s under normal long-poll). It's the right "last seen alive" signal
+# in daemon mode where there's no v0 bot.pid heartbeat.
+# v0 fallback: bot.pid mtime when the heartbeat file isn't there yet.
 _last_activity() {
+  local hb="$STATE_DIR/heartbeat-poller"
+  if [[ -f "$hb" ]]; then
+    TZ=UTC stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$hb" 2>/dev/null || true
+    return 0
+  fi
   [[ -f "$BOT_PID_FILE" ]] || return 0
-  # macOS stat differs from GNU; use BSD flags.
   TZ=UTC stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$BOT_PID_FILE" 2>/dev/null || true
 }
 
