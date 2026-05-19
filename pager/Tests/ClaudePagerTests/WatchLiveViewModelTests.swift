@@ -13,12 +13,17 @@ final class WatchLiveViewModelTests: XCTestCase {
         mounts: @escaping WatchLiveViewModel.MountsProvider,
         capture: @escaping WatchLiveViewModel.CaptureProvider,
         streamSpawner: WatchLiveViewModel.StreamSpawner? = nil,
+        // Default to a no-op so tests that don't care about JSONL don't
+        // accidentally invoke the production provider (which would shell
+        // out to `cta list`).
+        messages: @escaping WatchLiveViewModel.MessagesProvider = { _ in [] },
         restoredFocus: String? = nil
     ) -> WatchLiveViewModel {
         WatchLiveViewModel(
             mountsProvider: mounts,
             captureProvider: capture,
             streamSpawner: streamSpawner,
+            messagesProvider: messages,
             focusRestore: { restoredFocus },
             focusPersist: { _ in }
         )
@@ -42,7 +47,8 @@ final class WatchLiveViewModelTests: XCTestCase {
 
         await vm.refreshSidebar()
 
-        XCTAssertEqual(vm.rows.count, 3)
+        // 3 mounts + 1 synthetic Poller row appended at the tail.
+        XCTAssertEqual(vm.rows.count, 4)
         XCTAssertEqual(vm.rows[0].threadId, "42")
         XCTAssertEqual(vm.rows[0].label, "IronFlow")             // topic_name preferred
         XCTAssertEqual(vm.rows[0].preview, "fresh line")
@@ -50,6 +56,12 @@ final class WatchLiveViewModelTests: XCTestCase {
         XCTAssertEqual(vm.rows[1].preview, "only one line")
         XCTAssertEqual(vm.rows[2].activity, .dead)               // sessionDead
         XCTAssertEqual(vm.rows[2].preview, "")
+        // Poller row is always last, threadId == "_poller". captureProvider
+        // here returns .error for "_poller" (not in our test map) so it
+        // shows as dead — pins the contract that the row appears regardless
+        // of system-session liveness.
+        XCTAssertEqual(vm.rows[3].threadId, WatchLiveViewModel.pollerThreadId)
+        XCTAssertEqual(vm.rows[3].label, "Poller log")
     }
 
     func test_refreshSidebar_marksLiveWhenPreviewChanges() async {
@@ -116,8 +128,10 @@ final class WatchLiveViewModelTests: XCTestCase {
         mounts = [makeMount(thread: 8, label: nil, topic: "B")]
         await vm.refreshSidebar()
 
-        XCTAssertEqual(vm.rows.count, 1)
-        XCTAssertEqual(vm.focusedThreadId, "8")
+        // 1 mount + 1 synthetic Poller row.
+        XCTAssertEqual(vm.rows.count, 2)
+        XCTAssertEqual(vm.focusedThreadId, "8",
+                       "focus shifts to the surviving real mount, not the synthetic Poller row")
     }
 
     func test_lastNonEmptyLine_skipsTrailingBlanks() {
@@ -153,22 +167,41 @@ final class WatchLiveViewModelTests: XCTestCase {
         XCTAssertEqual(vm.paneStatus, .sessionDead(stderr: "topic-42 not alive"))
     }
 
-    func test_focus_clearsPaneStatusOnSwitch() async {
+    func test_focus_restoresCachedContentOnSwitch() async {
+        // refreshSidebar populates contentCache for ALL mounts as part of
+        // its preview poll (it captures every topic to fill activity dots).
+        // Once warmed, focus(thread:) should restore the cached content
+        // immediately instead of flashing "Loading…" — that's what
+        // contentCache exists for.
         let mounts = [
             makeMount(thread: 7, label: nil, topic: "A"),
             makeMount(thread: 8, label: nil, topic: "B"),
         ]
         let vm = makeVM(
             mounts: { mounts },
-            capture: { _ in .ok("any") }
+            capture: { _ in .ok("cached-payload") }
         )
-        await vm.refreshSidebar()
-        await vm.refreshPane()
-        guard case .live = vm.paneStatus else { return XCTFail("setup precondition") }
+        await vm.refreshSidebar() // warms contentCache for "7" AND "8"
 
         vm.focus(thread: "8")
+        guard case .live(let c) = vm.paneStatus else {
+            return XCTFail("focus(thread:) should restore cached .live, got \(vm.paneStatus)")
+        }
+        XCTAssertEqual(c, "cached-payload",
+                       "switching focus restores the per-thread cached content")
+    }
+
+    func test_focus_unknownWhenNoCachedContent() async {
+        // First-ever focus on a topic the cache has never seen falls back
+        // to .unknown (the Text view shows "Loading…" until refreshPane
+        // fills it). Pins the contract that cache-miss is still graceful.
+        let vm = makeVM(
+            mounts: { [] },
+            capture: { _ in .ok("never-seen") }
+        )
+        vm.focus(thread: "999")
         XCTAssertEqual(vm.paneStatus, .unknown,
-                       "switching focus clears stale content until next refresh")
+                       "fresh focus on uncached thread stays .unknown until refresh")
     }
 
     // MARK: - Streaming (Phase B.3)
@@ -327,5 +360,68 @@ final class WatchLiveViewModelTests: XCTestCase {
             CTAClient.MountJSON.self,
             from: json.data(using: .utf8)!
         )
+    }
+
+    // MARK: - Phase 3: JSONL message refresh
+
+    func test_refreshMessages_populatesFromProvider() async {
+        // Provider returns 2 messages keyed off the focused thread. After
+        // refreshMessages runs, vm.messages should mirror what the provider
+        // returned. focused thread is set via restoredFocus.
+        let stubMessages: [JsonlReader.Message] = [
+            .init(id: "u1", role: .user,      text: "hi",     toolNames: [],    timestamp: nil),
+            .init(id: "a1", role: .assistant, text: "hello",  toolNames: ["Read"], timestamp: nil),
+        ]
+        let vm = makeVM(
+            mounts: { [] },
+            capture: { _ in .ok("") },
+            messages: { thread in thread == "42" ? stubMessages : [] },
+            restoredFocus: "42"
+        )
+
+        await vm.refreshMessages()
+
+        XCTAssertEqual(vm.messages.count, 2)
+        XCTAssertEqual(vm.messages[0].text, "hi")
+        XCTAssertEqual(vm.messages[1].toolNames, ["Read"])
+    }
+
+    func test_refreshMessages_emptyWhenNoFocus() async {
+        let vm = makeVM(
+            mounts: { [] },
+            capture: { _ in .ok("") },
+            messages: { _ in
+                XCTFail("provider should not be called when nothing is focused")
+                return []
+            },
+            restoredFocus: nil
+        )
+
+        await vm.refreshMessages()
+
+        XCTAssertTrue(vm.messages.isEmpty)
+    }
+
+    func test_focusSwitch_clearsStaleMessagesImmediately() async {
+        let messagesByThread: [String: [JsonlReader.Message]] = [
+            "42": [.init(id: "u1", role: .user, text: "old topic", toolNames: [], timestamp: nil)],
+            "7":  [.init(id: "u2", role: .user, text: "new topic", toolNames: [], timestamp: nil)],
+        ]
+        let vm = makeVM(
+            mounts: { [] },
+            capture: { _ in .ok("") },
+            messages: { thread in messagesByThread[thread] ?? [] },
+            restoredFocus: "42"
+        )
+
+        await vm.refreshMessages()
+        XCTAssertEqual(vm.messages.first?.text, "old topic")
+
+        vm.focus(thread: "7")
+        // Synchronous part of focus() clears stale messages so the user
+        // doesn't see the previous topic's bubbles flash. Async refresh
+        // task then repopulates from the provider.
+        XCTAssertTrue(vm.messages.isEmpty,
+                      "focus should clear stale messages synchronously")
     }
 }

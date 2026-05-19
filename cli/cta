@@ -286,26 +286,51 @@ cmd_start() {
 }
 
 cmd_stop() {
-  # v0 sessions: harmless no-ops in MULTI_TOPIC mode (sessions don't exist).
+  # v0 sessions: harmless no-ops in Phase 4 (sessions don't exist).
   tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
   tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
 
-  # MULTI_TOPIC: kill the poller and every spawned topic-* session.
-  # Without this, `cta stop` left orphans that kept long-polling Telegram
-  # (poller) and consuming resources (topic-* claudes). Next `cta start` would
-  # race a second poller, half of inbound messages silently dropped — same
-  # shape as the v0 bun-orphan bug, just at a different layer.
+  # Phase 4 (2026-05-19): the poller owns one long-lived claude daemon per
+  # active topic via ClaudeDaemonRegistry. SIGTERM the poller process FIRST
+  # so its shutdown handler can send SIGTERM to each daemon — giving claude
+  # a chance to flush JSONL writes and release its per-session lock file at
+  # ~/.claude/tasks/<uuid>/.lock cleanly. Without this, the next `cta start`
+  # respawns daemons that crash with "Session ID X already in use" because
+  # the lock fd survived process kill via tmux teardown.
+  # Match only `bun … /agent/poller/poller.ts` as the LAST argv element so
+  # `bun test agent/poller/poller.ts` (a dev's running test) doesn't get
+  # SIGTERM'd. pgrep on macOS supports POSIX regex; anchor with `$`.
+  local poller_pids
+  poller_pids=$(pgrep -f 'bun .*/agent/poller/poller\.ts$' 2>/dev/null || true)
+  if [[ -n "$poller_pids" ]]; then
+    # SIGTERM signals our async handler. shutdown() awaits each daemon's
+    # close event with a 5s SIGKILL escalation, so 8s is the upper bound.
+    # Run kill in a subshell so a stray race doesn't fail the whole cmd.
+    while IFS= read -r pid; do
+      kill -TERM "$pid" 2>/dev/null || true
+    done <<< "$poller_pids"
+    # Brief poll: wait up to 8s for the poller(s) to exit gracefully.
+    local waited=0
+    while [[ "$waited" -lt 80 ]]; do
+      if ! pgrep -f 'bun .*/agent/poller/poller\.ts' >/dev/null 2>&1; then break; fi
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+  fi
+
   tmux kill-session -t "poller" 2>/dev/null || true
-  # Kill every topic-<id> session. tmux list-sessions exits non-zero when the
-  # server isn't running, so guard with 2>/dev/null; awk filters by name prefix.
-  local topic_sessions
-  topic_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | awk '/^topic-/' || true)
-  if [[ -n "$topic_sessions" ]]; then
+  # Kill any leftover helper-<id> or pre-Phase-4 topic-<id> sessions.
+  # tmux list-sessions exits non-zero when the server isn't running, so
+  # guard with 2>/dev/null.
+  local leftover_sessions
+  leftover_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+    | awk '/^topic-|^helper-/' || true)
+  if [[ -n "$leftover_sessions" ]]; then
     local sess
     while IFS= read -r sess; do
       [[ -z "$sess" ]] && continue
       tmux kill-session -t "$sess" 2>/dev/null || true
-    done <<< "$topic_sessions"
+    done <<< "$leftover_sessions"
   fi
 
   # Clean up the bun MCP grandchildren the official telegram plugin spawned.
@@ -746,23 +771,17 @@ cmd_mount() {
   local tmux_session
   tmux_session=$(echo "$mount_json" | jq -r '.tmux_session')
 
-  # If the poller is alive we want the topic immediately routable. Spawn
-  # the per-topic tmux now; topic-wrapper.sh handles UUID + claude launch.
-  #
-  # tmux new-session's second positional arg is passed to /bin/sh -c, so
-  # paths with spaces or shell metacharacters in $abs_path or $thread_id
-  # would split across args (or execute arbitrary commands). printf %q
-  # shell-escapes each before concatenation.
-  if tmux has-session -t poller 2>/dev/null; then
+  # Phase 4: no per-topic tmux session is spawned here. The poller hot-reloads
+  # mounts.json on mtime change and lazy-spawns the ClaudeDaemon on the topic's
+  # first inbound message. If the user replaced a provisional helper-* row,
+  # tear down the live helper tmux session so the daemon path takes over.
+  if [[ "$op" == "replace" ]] && [[ "$tmux_session" == helper-* || "$tmux_session" == topic-* ]]; then
     tmux kill-session -t "$tmux_session" 2>/dev/null || true
-    local wrapper
-    wrapper=$(_topic_wrapper_path)
-    local quoted_cmd
-    quoted_cmd=$(printf '%q ' "$wrapper" "$thread_id" "$abs_path" "$tmux_session")
-    tmux new-session -d -s "$tmux_session" "$quoted_cmd"
-    echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session, live)"
+  fi
+  if tmux has-session -t poller 2>/dev/null; then
+    echo "Mounted thread $thread_id at $abs_path (daemon spawns on next inbound)"
   else
-    echo "Mounted thread $thread_id at $abs_path (tmux: $tmux_session — will start on next 'cta start')"
+    echo "Mounted thread $thread_id at $abs_path (will route on next 'cta start')"
   fi
 }
 
@@ -1219,6 +1238,393 @@ cmd_migrate_state() {
   echo "  Restart the agent: cta start"
 }
 
+# ─── cta init — first-run onboarding wizard ─────────────────────────────────
+# Plan: project_onboarding_wizard_plan.md. Five steps, file-state-driven so
+# re-running is idempotent — the wizard reads where you are from disk and
+# resumes there. install.sh chains into `cta init` on fresh installs (when
+# the plugin .env has no BOT_TOKEN yet).
+#
+# Step state predicates: each returns 0 (done) or 1 (pending). The Pager UI
+# wizard reads the same files via _init_status output, so the two wizards
+# stay in lock-step without a shared progress file.
+
+_PLUGIN_ENV_FILE="$HOME/.claude/channels/telegram/.env"
+
+# step 1: token line is present AND non-empty in the plugin .env.
+# This is the "we have *a* token" predicate; getMe verify is separate.
+_init_step1_token_ready() {
+  [[ -f "$_PLUGIN_ENV_FILE" ]] || return 1
+  local val
+  val=$(grep '^TELEGRAM_BOT_TOKEN=' "$_PLUGIN_ENV_FILE" 2>/dev/null \
+    | head -1 | cut -d= -f2- | tr -d '"' | tr -d '\r\n')
+  [[ -n "$val" ]]
+}
+
+# step 2: no machine signal possible (Telegram /setprivacy is bot-side state
+# we can't query). We always show the nudge, and the user confirms manually.
+# For status reporting, we treat step 2 as "done" the moment step 1 is done —
+# the user has been shown the nudge or has chosen to skip it.
+_init_step2_privacy_acknowledged() {
+  _init_step1_token_ready
+}
+
+# step 3: first inbound has been received. Two signals, either suffices:
+#   - paired.json exists (means we already pulled past first inbound)
+#   - agent.log has a daemon-dispatch line (means an inbound message routed)
+_init_step3_inbound_seen() {
+  [[ -f "$CTA_STATE_DIR/paired.json" ]] && return 0
+  if [[ -f "$CTA_STATE_DIR/agent.log" ]]; then
+    grep -q 'daemon\[' "$CTA_STATE_DIR/agent.log" 2>/dev/null && return 0
+    # Fallback for pre-Phase-4 layouts: "update N → topic-" appears in
+    # legacy log shapes. Match defensively so a partially-migrated install
+    # still detects the milestone.
+    grep -q 'update [0-9]\+ →' "$CTA_STATE_DIR/agent.log" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+# step 4: paired.json has both a chat_id and a non-empty user_id.
+_init_step4_paired() {
+  local f="$CTA_STATE_DIR/paired.json"
+  [[ -f "$f" ]] || return 1
+  local chat_id
+  chat_id=$(jq -r '.chat_id // empty' "$f" 2>/dev/null)
+  [[ -n "$chat_id" && "$chat_id" != "null" ]]
+}
+
+# step 5: a wildcard "*" mount exists. This is the "any new topic auto-mounts
+# at $CLAUDE_CWD" default — the load-bearing UX guarantee that a fresh chat
+# starts working without per-topic configuration.
+_init_step5_default_mount() {
+  local f="$CTA_STATE_DIR/mounts.json"
+  [[ -f "$f" ]] || return 1
+  local n
+  n=$(jq '[.mounts[]? | select(.thread_id == "*")] | length' "$f" 2>/dev/null)
+  [[ "${n:-0}" -gt 0 ]]
+}
+
+# Pre-flight bot token shape check. Telegram tokens are <numeric>:<35+ char
+# base64-ish secret>. Catches obvious paste mistakes (no colon, truncated,
+# pasted username instead) before we burn a getMe network call.
+_init_validate_token_shape() {
+  local t="${1:-}"
+  [[ -n "$t" ]] || return 1
+  [[ "$t" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]
+}
+
+# Hit Bot API getMe and return the bot's username on success. Caller uses
+# the username for the "✓ paired to @yourbotname" status line. Times out at
+# 8s so a wifi drop during onboarding doesn't hang the wizard forever.
+_init_verify_bot_token() {
+  local token="${1:-}"
+  [[ -n "$token" ]] || return 1
+  local response
+  response=$(curl -sS --max-time 8 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null) || return 1
+  echo "$response" | jq -e '.ok == true' >/dev/null 2>&1 || return 1
+  echo "$response" | jq -r '.result.username'
+}
+
+# Atomic write of the plugin .env. Mirrors install.sh's behavior: 0600 mode,
+# tempfile + rename. Replaces the TELEGRAM_BOT_TOKEN line if present,
+# appends otherwise. Other lines (CLAUDE_CWD, BOT_SESSION_ID, etc.) are
+# preserved untouched so an init re-run doesn't wipe operator customizations.
+_init_write_plugin_token() {
+  local token="${1:-}"
+  [[ -n "$token" ]] || return 1
+  local dir
+  dir=$(dirname "$_PLUGIN_ENV_FILE")
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  local tmp="${_PLUGIN_ENV_FILE}.tmp.$$"
+  ( umask 077
+    if [[ -f "$_PLUGIN_ENV_FILE" ]]; then
+      # grep -v exits nonzero when every line matches (every line stripped)
+      # OR on read error — distinguish: count input lines first; if existing
+      # file is non-empty but grep produced zero non-token lines, that's the
+      # "all stripped" case (fine — empty preserve-set). Any other nonzero
+      # exit means a read error; we MUST NOT replace the existing file with
+      # a token-only file in that case (would destroy operator vars).
+      local input_lines
+      input_lines=$(wc -l < "$_PLUGIN_ENV_FILE" 2>/dev/null || echo 0)
+      if grep -v '^TELEGRAM_BOT_TOKEN=' "$_PLUGIN_ENV_FILE" > "$tmp" 2>/dev/null; then
+        : # grep ok (found non-token lines, wrote them)
+      else
+        local rc=$?
+        # rc=1 → no non-token lines (file was just the token line). Empty tmp
+        # is the correct preserve-set; proceed. rc>=2 → real error.
+        if [[ "$rc" -ne 1 ]]; then
+          rm -f "$tmp"
+          return 2
+        fi
+      fi
+      # Sanity: tmp must exist; if the original had non-token content, tmp
+      # must be non-empty too. Belt-and-suspenders against partial writes.
+      if [[ ! -f "$tmp" ]]; then
+        return 2
+      fi
+      if [[ "$input_lines" -gt 1 ]] && [[ ! -s "$tmp" ]]; then
+        # Original had multiple lines but tmp is empty — something stripped
+        # too much. Refuse the destructive overwrite.
+        rm -f "$tmp"
+        return 2
+      fi
+    else
+      : > "$tmp"
+    fi
+    printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token" >> "$tmp"
+  )
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$_PLUGIN_ENV_FILE"
+}
+
+# Machine-readable wizard status. One line per step:
+#   step <N> <done|pending> <human-readable label>
+# Used by `cta init` for the resume banner and by the Pager wizard's IPC.
+_init_status() {
+  local step_done
+  for step in 1 2 3 4 5; do
+    case "$step" in
+      1) "_init_step1_token_ready"           && step_done="done" || step_done="pending"
+         echo "step 1 $step_done token (Bot API getMe verified)" ;;
+      2) "_init_step2_privacy_acknowledged"  && step_done="done" || step_done="pending"
+         echo "step 2 $step_done /setprivacy disabled in @BotFather (group-mode visibility)" ;;
+      3) "_init_step3_inbound_seen"          && step_done="done" || step_done="pending"
+         echo "step 3 $step_done first inbound (a message reached the bot)" ;;
+      4) "_init_step4_paired"                && step_done="done" || step_done="pending"
+         echo "step 4 $step_done paired chat (only your chat can talk to the bot)" ;;
+      5) "_init_step5_default_mount"         && step_done="done" || step_done="pending"
+         echo "step 5 $step_done default mount (\"*\" wildcard set to your project dir)" ;;
+    esac
+  done
+}
+
+# Wait up to N seconds for the first inbound, polling agent.log + paired.json.
+# Returns 0 on detection, 1 on timeout. Prints animated dots so the user
+# doesn't think the wizard is dead.
+_init_wait_for_inbound() {
+  local timeout="${1:-300}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local frame=0
+  while [[ $(date +%s) -lt $deadline ]]; do
+    if _init_step3_inbound_seen; then
+      printf "\r✓ Inbound received.                              \n"
+      return 0
+    fi
+    frame=$(( (frame + 1) % 4 ))
+    local dots
+    case $frame in
+      0) dots="   " ;;
+      1) dots=".  " ;;
+      2) dots=".. " ;;
+      3) dots="..." ;;
+    esac
+    printf "\r  waiting for first message%s " "$dots"
+    sleep 1
+  done
+  printf "\r  ⚠ no inbound after %ds — abandoning wait.            \n" "$timeout"
+  return 1
+}
+
+# Wait up to N seconds for paired.json mtime change (or initial appearance).
+_init_wait_for_pair() {
+  local timeout="${1:-120}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local f="$CTA_STATE_DIR/paired.json"
+  local start_mtime=0
+  [[ -f "$f" ]] && start_mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+  local frame=0
+  while [[ $(date +%s) -lt $deadline ]]; do
+    if [[ -f "$f" ]]; then
+      local cur_mtime
+      cur_mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+      if [[ "$cur_mtime" -ne "$start_mtime" ]] && _init_step4_paired; then
+        printf "\r✓ Pairing complete.                                  \n"
+        return 0
+      fi
+    fi
+    frame=$(( (frame + 1) % 4 ))
+    local dots
+    case $frame in
+      0) dots="   " ;;
+      1) dots=".  " ;;
+      2) dots=".. " ;;
+      3) dots="..." ;;
+    esac
+    printf "\r  waiting for /pair from your chat%s " "$dots"
+    sleep 1
+  done
+  printf "\r  ⚠ no pair after %ds — try 'cta pair <chat_id>' manually.   \n" "$timeout"
+  return 1
+}
+
+cmd_init() {
+  # Hard requirements: bash, jq, curl. All are macOS-stock or already
+  # installed by the time `cta` runs (bash is the interpreter).
+  if ! command -v jq >/dev/null || ! command -v curl >/dev/null; then
+    echo "cta init: jq and curl are required (Homebrew: brew install jq curl)" >&2
+    exit 1
+  fi
+
+  echo
+  echo "── pager-for-agents setup ──"
+  echo
+  _init_status | sed 's/^/  /'
+  echo
+
+  # ─── Step 1: bot token ────────────────────────────────────────────────────
+  if _init_step1_token_ready; then
+    local existing
+    existing=$(grep '^TELEGRAM_BOT_TOKEN=' "$_PLUGIN_ENV_FILE" 2>/dev/null \
+      | head -1 | cut -d= -f2- | tr -d '"' | tr -d '\r\n')
+    local username
+    if username=$(_init_verify_bot_token "$existing"); then
+      echo "Step 1/5 ✓ token already saved (verified @${username})"
+      printf "Keep this bot or replace? [k/r] "
+      read -r choice
+      if [[ "$choice" == "r" || "$choice" == "R" ]]; then
+        _init_prompt_token
+      fi
+    else
+      echo "Step 1/5 ⚠ existing token failed getMe — re-prompt."
+      _init_prompt_token
+    fi
+  else
+    echo "Step 1/5  bot token"
+    echo "  Open Telegram → @BotFather → /newbot → follow prompts → copy the token."
+    _init_prompt_token
+  fi
+
+  # ─── Step 2: /setprivacy ──────────────────────────────────────────────────
+  echo
+  echo "Step 2/5  group-mode visibility (/setprivacy)"
+  echo "  In @BotFather: /setprivacy → select your bot → Disable."
+  echo "  Without this, the bot can't see non-command messages in groups."
+  printf "Press Enter when done (or 'skip' to continue): "
+  # -t 600: 10-min ceiling. Without it, the wizard hangs forever if invoked
+  # over an SSH connection that drops, or from a CI/CD pipeline that closes
+  # stdin without sending EOF. Exit code 142 (timeout) is benign — we just
+  # continue to the next step.
+  read -t 600 -r _ || true
+
+  # ─── Step 3: first inbound ────────────────────────────────────────────────
+  echo
+  echo "Step 3/5  first inbound message"
+  if ! tmux has-session -t poller 2>/dev/null \
+     && ! pgrep -f 'bun .*/agent/poller/poller\.ts$' >/dev/null 2>&1; then
+    echo "  starting the poller…"
+    if ! cmd_start >/dev/null 2>&1; then
+      echo "  ⚠ poller failed to start. Run 'cta start' manually and check logs:" >&2
+      echo "     tail -f $CTA_STATE_DIR/agent.log" >&2
+      echo "     Skipping the inbound-wait step." >&2
+      return 1
+    fi
+    sleep 3
+    # Verify the poller actually came up — cmd_start can succeed superficially
+    # (launchctl loaded) while bun never bound. Without this check the wizard
+    # spins for 5 minutes on _init_wait_for_inbound watching nothing happen.
+    if ! tmux has-session -t poller 2>/dev/null \
+       && ! pgrep -f 'bun .*/agent/poller/poller\.ts$' >/dev/null 2>&1; then
+      echo "  ⚠ poller didn't come up after cmd_start. Likely causes:" >&2
+      echo "     - missing TELEGRAM_BOT_TOKEN in ~/.claude/channels/telegram/.env" >&2
+      echo "     - bun not on PATH" >&2
+      echo "     - $CTA_INSTALL_DIR/agent/poller/poller.ts missing (rerun install.sh)" >&2
+      echo "     Check $CTA_STATE_DIR/agent.log and rerun 'cta init' to retry." >&2
+      return 1
+    fi
+  fi
+  if _init_step3_inbound_seen; then
+    echo "  ✓ already seen — skipping."
+  else
+    echo "  Send any message to your bot from your chat. (Group? Add the bot first.)"
+    _init_wait_for_inbound 300 || true
+  fi
+
+  # ─── Step 4: pair ─────────────────────────────────────────────────────────
+  echo
+  echo "Step 4/5  pair a chat (locks the bot to one chat + user)"
+  if _init_step4_paired; then
+    echo "  ✓ already paired — skipping. (Use 'cta unpair' to re-pair.)"
+  else
+    local code
+    code=$(cmd_pair_code --init 2>/dev/null || cmd_pair_code 2>/dev/null || true)
+    if [[ -n "$code" ]]; then
+      echo "  In your chat, send:  /pair $code"
+      echo "  Or run 'cta pair --auto' from another terminal to pick a chat by id."
+      _init_wait_for_pair 180 || true
+    else
+      echo "  ⚠ couldn't generate a pairing code. Run 'cta pair-code --reset' manually."
+    fi
+  fi
+
+  # ─── Step 5: default mount ────────────────────────────────────────────────
+  echo
+  echo "Step 5/5  default project directory"
+  if _init_step5_default_mount; then
+    local cur
+    cur=$(jq -r '[.mounts[]? | select(.thread_id == "*")][0].path' \
+      "$CTA_STATE_DIR/mounts.json" 2>/dev/null)
+    echo "  ✓ already set: $cur"
+  else
+    local default_cwd
+    default_cwd=$(grep '^CLAUDE_CWD=' "$CTA_STATE_DIR/.env" 2>/dev/null \
+      | head -1 | cut -d= -f2- | tr -d '"' || true)
+    [[ -z "$default_cwd" ]] && default_cwd="$HOME/claude-home"
+    printf "  Path for new topics [%s]: " "$default_cwd"
+    read -r path
+    path="${path:-$default_cwd}"
+    # Expand ~ before we test for directoryhood — the user is going to type
+    # ~/projects, not /Users/x/projects, and bash doesn't expand it inside
+    # a read-into variable.
+    path="${path/#\~/$HOME}"
+    if [[ ! -d "$path" ]]; then
+      printf "  '%s' doesn't exist — create it? [Y/n] " "$path"
+      read -r mk
+      if [[ "$mk" != "n" && "$mk" != "N" ]]; then
+        mkdir -p "$path" || { echo "  ⚠ mkdir failed — skipping default mount."; }
+      fi
+    fi
+    if [[ -d "$path" ]]; then
+      cmd_mount '*' "$path" default >/dev/null && echo "  ✓ default mount set"
+    fi
+  fi
+
+  # ─── Done ─────────────────────────────────────────────────────────────────
+  echo
+  echo "── setup complete ──"
+  _init_status | sed 's/^/  /'
+  echo
+  echo "  Try sending another message to your bot — it should reply now."
+  echo "  Re-run anytime with 'cta init' (it resumes where you left off)."
+}
+
+# Prompt for a bot token interactively. Reads with -s so terminal history /
+# screen recording doesn't capture it. Validates shape locally first, then
+# hits getMe for live verification before persisting.
+_init_prompt_token() {
+  while true; do
+    printf "  Paste the bot token (hidden): "
+    local token
+    read -rs token
+    echo
+    if [[ -z "$token" ]]; then
+      echo "  ⚠ empty — try again, or Ctrl-C to abort."
+      continue
+    fi
+    if ! _init_validate_token_shape "$token"; then
+      echo "  ⚠ doesn't look like a Telegram bot token (expected '<digits>:<chars>')."
+      continue
+    fi
+    local username
+    if username=$(_init_verify_bot_token "$token"); then
+      _init_write_plugin_token "$token"
+      echo "  ✓ verified — @${username}"
+      return 0
+    else
+      echo "  ⚠ getMe rejected this token. Check it in @BotFather and try again."
+    fi
+  done
+}
+
 cmd_help() {
   cat <<EOF
 cta — claude-telegram-agent CLI
@@ -1241,6 +1647,7 @@ Usage:
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta migrate-state               Move v0.1 ~/.claude-telegram-agent/ → ~/.pager/
+  cta init                        First-run setup wizard (token → pair → default mount)
   cta help                        This message
 
 Reads ~/.pager/.env (CTA_STATE_DIR-overridable) for configurable tmux session names.
@@ -1275,6 +1682,7 @@ main() {
     unpair) cmd_unpair "$@" ;;
     config) cmd_config "$@" ;;
     migrate-state) cmd_migrate_state "$@" ;;
+    init) cmd_init "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       echo "Unknown command: $cmd" >&2

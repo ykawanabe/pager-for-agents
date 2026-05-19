@@ -146,6 +146,25 @@ else
     say "Loaded LaunchAgent $PLIST_LABEL"
 fi
 
+# Reap orphan instances: any ClaudePager process that's NOT the one
+# launchctl just spawned. Older versions of this script used
+# `launchctl unload` to stop the running process before overwrite — that
+# detached the running instance from launchctl's bookkeeping, so a
+# subsequent `kickstart` only restarted the new bookkeeping while the old
+# orphan kept running. Result: two Pager menu bar icons. The fix below
+# catches anyone still surviving from that legacy path. After the
+# install.sh migration is complete on this machine, this block becomes a
+# no-op (nothing left to reap).
+sleep 1  # give launchctl a moment to settle its respawn
+TRACKED_PID=$(launchctl print "$LAUNCHCTL_TARGET" 2>/dev/null | awk '/^\s*pid =/ {print $3; exit}')
+if [[ -n "$TRACKED_PID" ]]; then
+    pgrep -f "Claude Pager.app/Contents/MacOS/ClaudePager" 2>/dev/null | while read -r pid; do
+        if [[ "$pid" != "$TRACKED_PID" ]]; then
+            kill "$pid" 2>/dev/null && say "Reaped orphan Pager pid=$pid (launchctl-tracked is $TRACKED_PID)"
+        fi
+    done
+fi
+
 # ---- Migrate legacy install (raw binary at ~/.local/bin/claude-pager) -------
 if [[ -f "$HOME/.local/bin/claude-pager" ]]; then
     rm -f "$HOME/.local/bin/claude-pager"

@@ -30,6 +30,9 @@ logs/
 # Pre-commit hook scratch
 /tmp/precommit-hit.*
 
+# Session scratchpads — prompts handed to other tools (Comet, etc.), never tracked.
+/.tmp/
+
 # ────────────────────────────────────────────────────────────────────────────
 # macOS — https://github.com/github/gitignore/blob/main/Global/macOS.gitignore
 # ────────────────────────────────────────────────────────────────────────────

@@ -174,6 +174,15 @@ When you need the user to choose between a small fixed set of options (Yes/No, A
 
 Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.
 
+Slash commands that open an interactive arrow-key picker do NOT work over Telegram — the bot cannot deliver arrow keys. This applies to ANY picker-mode slash command, known examples include but are not limited to `/effort`, `/model`, `/agents`, `/skills`, `/permissions`, `/ide`, `/plugins`, `/output-format`. Whenever you would run a slash command:
+
+  1. If the command accepts a value inline (`/effort high`, `/model opus`, `/agents writer`), use that form.
+  2. If the user issued the picker form (`/effort` with no arg) and the target is unambiguous from context, send the inline form yourself.
+  3. If the user wants to choose but you don't know the options offhand, reply via `send_telegram(buttons=[...])` listing the options. NEVER type the picker form and leave them stuck.
+  4. Some commands have NO inline form — in those cases, tell the user they must operate that one on the host via Pager → Open in Terminal.
+
+A safety-net watcher will auto-cancel any picker that does open and send the user a hint, but that's a fallback for slip-ups; the system prompt above is the primary contract.
+
 You also have access to ~/.pager/shared-context.md — a cross-session memory file shared with every other Pager-bot claude session on this host. Read it when the user references prior context, or near the start of substantive conversations. Append durable notes there (user preferences, ongoing concerns, decisions, recurring patterns) so future sessions across other topics/projects benefit. Keep entries short and avoid duplication. Do not log every interaction — only durable signal.
 
 IMPORTANT — Telegram pairing / access is handled by claude-telegram-agent, NOT by the official @claude-plugins-official/telegram plugin. If the user asks about pairing, unpair, allowlist, or access changes, DO NOT invoke skills named `telegram:access`, `telegram:configure`, or anything from `@claude-plugins-official/telegram` — those describe a different system and their advice is incorrect here. Instead:
@@ -314,79 +323,20 @@ helper_loop() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] helper for topic $THREAD_ID: exited"
 }
 
-main_loop() {
-  cd "$PROJECT_PATH" || { echo "topic-wrapper: cd to PROJECT_PATH=$PROJECT_PATH failed" >&2; exit 1; }
-
-  # Export the chat/thread targets so claude's hook subprocesses (PreCompact /
-  # PostCompact / Notification — see bot-hooks.json) can curl Bot API back to
-  # the right chat. The --mcp-config "env" map only scopes to the mcp-telegram
-  # process; hook scripts inherit claude's env, not the MCP server's.
-  export TELEGRAM_CHAT_ID="$MAIN_CHAT_ID"
-  export TELEGRAM_THREAD_ID="$THREAD_ID"
-
-  setup_pane_log "$TMUX_SESSION" "$THREAD_ID" "$STATE_DIR"
-
-  # Enable mouse mode on the topic session so wheel/trackpad scroll
-  # naturally enters tmux copy-mode and scrolls through pane history.
-  # Without this, Pager's Watch live (and any tmux client) is stuck on
-  # the visible pane — tmux's own scrollback is invisible. Per-session
-  # so we don't touch the user's global config or unrelated sessions
-  # (poller / watchdog). Tradeoff: text selection inside Pager now
-  # requires holding Option, which is the standard tmux+mouse idiom.
-  tmux set-option -t "$TMUX_SESSION" mouse on 2>/dev/null || true
-
-  # Spawn the picker-watcher in the background. It polls this session's
-  # `#{alternate_on}` to detect when claude opens an interactive picker
-  # (/effort, /model, file picker, etc.) and pushes a snapshot to the
-  # paired Telegram chat — because Telegram itself can't deliver arrow-
-  # key TUI input back to claude. EXIT trap below kills the watcher when
-  # topic-wrapper unwinds.
-  local wrapper_dir
-  wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-  local picker_watcher_script="$wrapper_dir/picker-watcher.ts"
-  PICKER_WATCHER_PID=""
-  if [[ -f "$picker_watcher_script" ]] && command -v bun >/dev/null 2>&1 && [[ -n "$MAIN_CHAT_ID" ]]; then
-    bun "$picker_watcher_script" \
-      --session "$TMUX_SESSION" \
-      --chat-id "$MAIN_CHAT_ID" \
-      --thread-id "$THREAD_ID" \
-      >> "$STATE_DIR/picker-watcher.log" 2>&1 &
-    PICKER_WATCHER_PID=$!
-    trap 'if [[ -n "$PICKER_WATCHER_PID" ]]; then kill "$PICKER_WATCHER_PID" 2>/dev/null || true; fi' EXIT
-  fi
-
-  local append_prompt
-  append_prompt=$(resolve_append_prompt "${BOT_APPEND_SYSTEM_PROMPT:-}" "$DEFAULT_BOT_APPEND_SYSTEM_PROMPT")
-
-  local delay=0
-  while true; do
-    local args=(--mcp-config "$MCP_CFG" --strict-mcp-config --dangerously-skip-permissions)
-    [[ -f "$BOT_HOOKS_PATH" ]] && args+=(--settings "$BOT_HOOKS_PATH")
-    [[ -n "$append_prompt" ]] && args+=(--append-system-prompt "$append_prompt")
-    local flag
-    flag=$(session_arg_flag "$PROJECT_PATH" "$SESSION_UUID")
-    args+=("$flag" "$SESSION_UUID")
-
-    local start_ts end_ts ran_for
-    start_ts=$(date +%s)
-    clear_stale_lock "$SESSION_UUID"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] topic $THREAD_ID: claude starting in $PROJECT_PATH ($flag $SESSION_UUID)"
-    claude "${args[@]}" || true
-    end_ts=$(date +%s)
-    ran_for=$(( end_ts - start_ts ))
-
-    delay=$(compute_next_delay "$delay" "$ran_for" "$HEALTHY_RUN_SECS" "$DELAY_MIN" "$DELAY_MAX")
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] topic $THREAD_ID: claude exited after ${ran_for}s, restarting in ${delay}s"
-    sleep "$delay"
-  done
-}
+# Phase 4 (2026-05-19): main_loop (per-topic claude TUI under tmux) deleted.
+# Regular topic dispatch now goes through poller.ts → ClaudeDaemonRegistry →
+# `claude -p --input-format stream-json`. tmux is only used for:
+#   - the poller process itself (process supervision)
+#   - the watchdog (network/heartbeat monitoring)
+#   - helper_loop (interactive mount-helper for unmounted topics)
+# topic-wrapper.sh is now only invoked with MODE=helper.
 
 # Sourcing for tests exposes the helpers (compute_next_delay,
 # session_arg_flag, resolve_append_prompt) without spawning claude.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  if [[ "$MODE" == "helper" ]]; then
-    helper_loop
-  else
-    main_loop
+  if [[ "$MODE" != "helper" ]]; then
+    echo "topic-wrapper: only MODE=helper is supported (Phase 4 retired the topic main loop)" >&2
+    exit 2
   fi
+  helper_loop
 fi
