@@ -619,6 +619,14 @@ export async function reacquireDaemonFromTerminal(threadId: number | "dm"): Prom
   await daemonRegistry.reacquireFromTerminal(String(threadId));
 }
 
+/** Public API: full reset for /clear — stop the running daemon and drop
+ *  the topic's registry entry so the next enqueue lazy-spawns fresh
+ *  (picking up the rotated session UUID written by handleClear). */
+export async function resetDaemonTopic(threadId: number | "dm"): Promise<void> {
+  if (!daemonRegistry) return;
+  await daemonRegistry.resetTopic(String(threadId));
+}
+
 // ─── β handoff (Open in Terminal) IPC ────────────────────────────────────────
 // Pager / `cta release-daemon` write flag files into $STATE_DIR/release-flags/
 // to request that a topic's daemon yield its claude session lock so the user
@@ -1144,14 +1152,17 @@ async function handleClear(msg: TgMessage): Promise<void> {
     return;
   }
 
-  // Phase 4 limitation (tracked): /clear rotates the UUID file but does NOT
-  // force the topic's running daemon to restart. The currently-alive daemon
-  // is still attached to the OLD UUID and continues using it until the
-  // poller restarts or the daemon crashes. To make /clear effective right
-  // now, the daemon needs a `resetTopic()` API on ClaudeDaemonRegistry that
-  // stops the daemon + clears the queue + clears the handle entry, so the
-  // next enqueue lazy-spawns with the new UUID. Not landed this session per
-  // "cleanup only" scope; see project_secretary_heartbeat_plan §6.1.
+  // Reset the registry entry so the running daemon stops and the next
+  // enqueue lazy-spawns a fresh one with the rotated UUID. Without this,
+  // the alive daemon keeps using the OLD UUID and /clear has no effect
+  // until the poller restarts.
+  if (daemonRegistry) {
+    try {
+      await daemonRegistry.resetTopic(String(key));
+    } catch (e) {
+      process.stderr.write(`poller: handleClear resetTopic failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
 
   await reply(
     { chat_id, thread_id: thread_id_raw },

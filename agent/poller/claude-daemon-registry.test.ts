@@ -173,6 +173,58 @@ describe("ClaudeDaemonRegistry terminal handoff (β)", () => {
   });
 });
 
+describe("ClaudeDaemonRegistry resetTopic (/clear semantics)", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
+
+  test("resetTopic stops the daemon, drops queue, removes handle (next enqueue lazy-spawns)", async () => {
+    let optsCalls = 0;
+    const sentToDaemon: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => {
+        optsCalls++;
+        return { cwd: "/tmp" };
+      },
+      onText: () => {},
+      onFlush: (_t, combinedText) => sentToDaemon.push(combinedText),
+    });
+
+    // Spawn the daemon for the topic.
+    reg.enqueue("topic-42", "first turn");
+    await waitFor(() => sentToDaemon.length >= 1, 5000);
+    expect(reg.daemonCount).toBe(1);
+    expect(optsCalls).toBe(1);
+
+    // Enqueue something that's still pending (in queue or in flight).
+    reg.enqueue("topic-42", "should be dropped by reset");
+
+    // Reset: daemon stopped, queue dropped, handle cleared.
+    await reg.resetTopic("topic-42");
+    expect(reg.getStatus("topic-42")).toBe("absent");
+    expect(reg.daemonCount).toBe(0);
+
+    // Next enqueue must lazy-spawn a NEW daemon — daemonOptsFor called again.
+    reg.enqueue("topic-42", "fresh start");
+    await waitFor(() => sentToDaemon.length >= 2, 5000);
+    expect(optsCalls).toBe(2);
+    expect(sentToDaemon[1]).toContain("fresh start");
+    expect(sentToDaemon[1]).not.toContain("should be dropped");
+  });
+
+  test("resetTopic on unknown thread is a no-op", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+    });
+    await reg.resetTopic("never-existed");
+    expect(reg.getStatus("never-existed")).toBe("absent");
+  });
+});
+
 describe("ClaudeDaemonRegistry crash recovery", () => {
   let reg: ClaudeDaemonRegistry | null = null;
   afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
