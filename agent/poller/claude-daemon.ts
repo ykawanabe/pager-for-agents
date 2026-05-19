@@ -262,7 +262,14 @@ export class ClaudeDaemon extends EventEmitter {
       "--dangerously-skip-permissions",
     ];
     if (opts.mcpConfigPath) {
-      args.push("--mcp-config", opts.mcpConfigPath, "--strict-mcp-config");
+      // Note: deliberately NOT passing --strict-mcp-config. We MERGE the
+      // per-topic telegram MCP with the user's own ~/.claude.json MCPs so
+      // the bot can use Notion, browser, gmail, etc. that the user has
+      // already installed for Claude Code. The pairing/user-id filter
+      // (poller routeMessage) is the real security boundary — once it
+      // holds, the daemon is "the user themselves typing on their phone"
+      // and inherits the same MCP authority as the user's CLI.
+      args.push("--mcp-config", opts.mcpConfigPath);
     }
     if (opts.settingsPath) {
       args.push("--settings", opts.settingsPath);

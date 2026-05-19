@@ -12,7 +12,7 @@
 #   3. Build the --mcp-config JSON that wires mcp-telegram with the right
 #      chat_id + thread_id pinned at spawn time (so claude itself can't
 #      redirect outbound).
-#   4. Run `claude --mcp-config '<json>' --strict-mcp-config --session-id
+#   4. Run `claude --mcp-config '<json>' --session-id
 #      <uuid>` (first launch) or `--resume <uuid>` (subsequent), with the
 #      Telegram-friendly --append-system-prompt.
 #   5. Restart on exit with exponential backoff — same compute_next_delay
@@ -305,7 +305,10 @@ helper_loop() {
   fi
   local append_prompt; append_prompt=$(cat "$helper_prompt_path")
 
-  local args=(--mcp-config "$MCP_CFG" --strict-mcp-config --dangerously-skip-permissions)
+  # No --strict-mcp-config: merge the per-topic telegram MCP with the user's
+  # ~/.claude.json MCPs so the helper inherits Notion/browser/etc. — same
+  # secretary-style "user's full MCP authority" model as the Phase 4 daemon.
+  local args=(--mcp-config "$MCP_CFG" --dangerously-skip-permissions)
   # Settings layering: bot-hooks gives us PreCompact/PostCompact/Notification
   # status pings; helper-permissions adds the deny list. claude code accepts
   # multiple --settings flags; later layers compose with earlier.

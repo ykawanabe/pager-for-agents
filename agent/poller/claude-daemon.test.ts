@@ -146,7 +146,7 @@ describe("ClaudeDaemon argv composition", () => {
     expect(argv).not.toContain("--session-id");
   });
 
-  test("buildArgv adds --mcp-config + --strict-mcp-config when path provided", () => {
+  test("buildArgv adds --mcp-config without --strict-mcp-config (merges user's ~/.claude.json MCPs)", () => {
     const argv = ClaudeDaemon.buildArgv({
       sessionUuid: "u",
       resumeExisting: false,
@@ -154,7 +154,11 @@ describe("ClaudeDaemon argv composition", () => {
     });
     expect(argv).toContain("--mcp-config");
     expect(argv).toContain("/tmp/cfg.json");
-    expect(argv).toContain("--strict-mcp-config");
+    // Regression guard: --strict-mcp-config must NOT be present. We
+    // intentionally merge the per-topic telegram MCP with the user's own
+    // MCPs (Notion, browser, gmail, etc.) so the secretary daemon has the
+    // same authority as `claude` invoked from the user's CLI.
+    expect(argv).not.toContain("--strict-mcp-config");
   });
 
   test("buildArgv adds --append-system-prompt when provided", () => {
