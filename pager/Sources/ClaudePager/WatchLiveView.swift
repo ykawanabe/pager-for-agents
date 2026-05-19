@@ -161,19 +161,18 @@ struct WatchLiveView: View {
     /// clicks "Open in Terminal" below.
     @ViewBuilder
     private var paneBody: some View {
-        if let _ = vm.focusedThreadId {
-            // Phase 3 (JSONL view): if claude has written messages to the
-            // session's JSONL transcript, render them as conversation
-            // bubbles instead of the raw tmux pane. The bubbles are
-            // Claude.app-style — paragraph-aligned, user vs. assistant
-            // distinguished by tint + alignment, tool calls noted inline
-            // as small italic tags. Falls back to the pane snapshot for
-            // synthetic rows (poller log) and topics whose transcript
-            // hasn't materialized yet (no claude turns completed).
-            if !vm.messages.isEmpty {
-                messagesPane
-            } else {
+        if let id = vm.focusedThreadId {
+            // System rows (Poller log) use tmuxPane — they're real tmux
+            // sessions and the capture-pane snapshot is the right view.
+            // Topic rows always use messagesPane (JSONL bubble view):
+            // Phase 4 has no per-topic tmux session so the old tmuxPane
+            // fallback would show a misleading "Topic's tmux session is
+            // not running" status. Empty-state when no claude turns yet
+            // is handled inside messagesPane.
+            if id == WatchLiveViewModel.pollerThreadId {
                 tmuxPane
+            } else {
+                messagesPane
             }
         } else {
             placeholderText("Select a topic from the sidebar.", muted: true)
@@ -208,28 +207,47 @@ struct WatchLiveView: View {
 
     /// Phase 3 JSONL-bubble renderer. Walks vm.messages, draws each as a
     /// roleColored chat bubble. Scrolls to the last message on append.
+    /// Shows an empty-state hint when the topic hasn't generated any turns
+    /// yet (no JSONL transcript yet — daemon hasn't been engaged).
     @ViewBuilder
     private var messagesPane: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(vm.messages) { msg in
-                        messageBubble(msg)
-                            .id(msg.id)
+        if vm.messages.isEmpty {
+            VStack(spacing: 12) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 36))
+                    .foregroundColor(.secondary)
+                Text("No messages yet")
+                    .font(.headline)
+                Text("Send a message in Telegram (or use the input below) to start a claude session for this topic. The first reply takes 5–15s while the daemon cold-starts.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 400)
+            }
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(vm.messages) { msg in
+                            messageBubble(msg)
+                                .id(msg.id)
+                        }
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .onChange(of: vm.messages.last?.id) { _, newId in
+                    guard let newId else { return }
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(newId, anchor: .bottom)
                     }
                 }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-            }
-            .onChange(of: vm.messages.last?.id) { _, newId in
-                guard let newId else { return }
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo(newId, anchor: .bottom)
-                }
-            }
-            .onAppear {
-                if let last = vm.messages.last?.id {
-                    proxy.scrollTo(last, anchor: .bottom)
+                .onAppear {
+                    if let last = vm.messages.last?.id {
+                        proxy.scrollTo(last, anchor: .bottom)
+                    }
                 }
             }
         }

@@ -348,18 +348,21 @@ final class WatchLiveViewModel: ObservableObject {
             contentCache[id] = content
         case .sessionDead(let s):
             // Phase 4 daemon mode: there's no per-topic tmux session anymore.
-            // `cta watch` returns sessionDead for every mounted topic that
-            // isn't currently in a turn — the daemon lives inside the poller
-            // process, not in tmux. Treat sessionDead+(has-transcript) as
-            // .live (with cached or last-known content) so the user doesn't
-            // see "Dead" on a perfectly healthy idle daemon topic. True
-            // "Dead" — mount exists but no JSONL transcript ever produced —
-            // still falls through to sessionDead.
-            if id != WatchLiveViewModel.pollerThreadId && !messages.isEmpty {
+            // `cta watch` returns sessionDead for every mounted topic because
+            // the daemon lives inside the poller process, not in tmux.
+            // Reinterpret for the UI:
+            //   - poller-log row: actually missing tmux session → real Dead
+            //   - topic w/ transcript: idle daemon, conversation history exists → Live
+            //   - topic w/o transcript: daemon hasn't spawned yet (lazy on first msg) → Starting
+            // Without this, every topic row's pill would render red "Dead"
+            // even though the daemon is healthy on standby.
+            if id == WatchLiveViewModel.pollerThreadId {
+                paneStatus = .sessionDead(stderr: s)
+            } else if !messages.isEmpty {
                 let cached = contentCache[id] ?? ""
                 paneStatus = .live(content: cached)
             } else {
-                paneStatus = .sessionDead(stderr: s)
+                paneStatus = .starting
             }
         case .noMount(let s): paneStatus = .noMount(stderr: s)
         case .error(let m): paneStatus = .error(m)

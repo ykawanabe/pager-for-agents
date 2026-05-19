@@ -156,15 +156,18 @@ final class WatchLiveViewModelTests: XCTestCase {
         XCTAssertTrue(content.contains("pane content"))
     }
 
-    func test_refreshPane_setsSessionDead() async {
+    func test_refreshPane_sessionDeadFromPollerRowStaysDead() async {
+        // Poller-log synthetic row: sessionDead from cta watchSystemSession
+        // genuinely means "the tmux session is gone." Pill should show Dead.
         let vm = makeVM(
-            mounts: { [self.makeMount(thread: 42, label: nil, topic: "T")] },
-            capture: { _ in .sessionDead(stderr: "topic-42 not alive") }
+            mounts: { [] },
+            capture: { _ in .sessionDead(stderr: "poller not alive") }
         )
         await vm.refreshSidebar()
+        vm.focus(thread: WatchLiveViewModel.pollerThreadId)
         await vm.refreshPane()
 
-        XCTAssertEqual(vm.paneStatus, .sessionDead(stderr: "topic-42 not alive"))
+        XCTAssertEqual(vm.paneStatus, .sessionDead(stderr: "poller not alive"))
     }
 
     func test_refreshPane_daemonModeSessionDeadWithMessagesShowsLive() async {
@@ -200,10 +203,12 @@ final class WatchLiveViewModelTests: XCTestCase {
         }
     }
 
-    func test_refreshPane_sessionDeadWithNoMessagesStaysDead() async {
-        // True "Dead" — mount exists but the daemon has never produced a
-        // turn (no JSONL transcript). User needs to know this topic isn't
-        // working. Don't mask it as .live just because we're in daemon mode.
+    func test_refreshPane_sessionDeadWithNoMessagesShowsStarting() async {
+        // Phase 4: a topic row whose `cta watch` returns sessionDead AND has
+        // no JSONL transcript yet is a topic where the daemon hasn't been
+        // engaged. It's not "Dead" — the daemon spawns lazily on first
+        // message. UI should show "Starting" (yellow) so the user sees
+        // "waiting for activity," not "broken."
         let vm = makeVM(
             mounts: { [self.makeMount(thread: 99, label: nil, topic: "U")] },
             capture: { _ in .sessionDead(stderr: "topic-99 not alive") },
@@ -214,7 +219,7 @@ final class WatchLiveViewModelTests: XCTestCase {
         await vm.refreshMessages()
         await vm.refreshPane()
 
-        XCTAssertEqual(vm.paneStatus, .sessionDead(stderr: "topic-99 not alive"))
+        XCTAssertEqual(vm.paneStatus, .starting)
     }
 
     func test_focus_restoresCachedContentOnSwitch() async {
