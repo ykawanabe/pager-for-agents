@@ -93,7 +93,7 @@ struct SetupWizardView: View {
             }
         }
         switch step.number {
-        case 1: return "Paste your bot token in Terminal: `cta init`. Or use the Open BotFather button →"
+        case 1: return "Paste your bot token in Terminal: `cta init`. Already pasted? Click Verify →"
         case 2: return "In @BotFather, /setprivacy → pick your bot → Disable. Without this the bot can't see non-command messages in groups."
         case 3: return "Send any message to your bot from the chat you want to pair."
         case 4: return "Send `/pair <code>` from the chat. Pairing code shown by Show pairing code →"

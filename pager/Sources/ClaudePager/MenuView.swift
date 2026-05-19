@@ -37,19 +37,17 @@ struct MenuView: View {
 
         Divider()
 
-        // MULTI_TOPIC has one claude session per topic. The unified Watch-Live
+        // MULTI_TOPIC has one claude daemon per topic (Phase 4: long-lived
+        // inside the poller process, no per-topic tmux). The unified Watch-Live
         // window shows every active topic in one place — sidebar lists them
         // with activity dots + 1-line previews; main pane renders the focused
-        // topic's tmux pane. See docs/plans/pager-watch-live.md.
-        // Power users can still drop to Terminal: `tmux attach -t topic-<id>`.
-        // Setup wizard — re-runnable any time. Labeled distinctly when the
-        // plugin .env hasn't been created yet so a first-launch user sees
-        // an obvious next step instead of an unlabeled menu.
-        Button(setupWizardLabel()) {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
-            openWindow(id: "setup-wizard")
-        }
+        // topic's JSONL transcript as chat bubbles. See docs/plans/pager-watch-live.md.
+        // Power users can still drop to Terminal via `cta open <thread>` —
+        // β handoff signals the poller to release the daemon and execs
+        // `claude --resume` in the project dir.
+        // Setup wizard lives under the hidden Debug menu now — the primary
+        // onboarding path is `cta init` (CLI), and the wizard is a dev/admin
+        // tool for inspecting setup state, not a user-facing entry point.
         Button("Watch live…") {
             // Pager is LSUIElement (accessory) — openWindow alone creates the
             // window off-screen / behind everything. Promote to .regular so
@@ -108,6 +106,12 @@ struct MenuView: View {
         if UserDefaults.standard.bool(forKey: "DebugMenuEnabled") {
             Divider()
             Menu("Debug") {
+                Button(setupWizardLabel()) {
+                    NSApp.setActivationPolicy(.regular)
+                    NSApp.activate(ignoringOtherApps: true)
+                    openWindow(id: "setup-wizard")
+                }
+                Divider()
                 Button("Reveal ~/.pager in Finder") {
                     let url = FileManager.default.homeDirectoryForCurrentUser
                         .appendingPathComponent(".pager")
