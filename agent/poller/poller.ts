@@ -555,6 +555,98 @@ export async function reacquireDaemonFromTerminal(threadId: number | "dm"): Prom
   await daemonRegistry.reacquireFromTerminal(String(threadId));
 }
 
+// ─── β handoff (Open in Terminal) IPC ────────────────────────────────────────
+// Pager / `cta release-daemon` write flag files into $STATE_DIR/release-flags/
+// to request that a topic's daemon yield its claude session lock so the user
+// can attach via `claude --resume <uuid>`. We poll the dir every loop tick
+// (cheap — usually empty). Protocol:
+//   <thread_id>            written by caller → release the daemon, then
+//                          rename to <thread_id>.ack so the caller's polling
+//                          loop knows the kill completed.
+//   <thread_id>.ack        the release ack — its presence means "released".
+//                          The caller deletes this to signal reacquire.
+//
+// On poller restart, any stale .ack files left behind by a prior run get
+// cleaned up so the new poller doesn't think topics are stuck released.
+
+const RELEASE_FLAG_DIR = join(STATE_DIR, "release-flags");
+
+function ensureReleaseFlagDir(): void {
+  try { mkdirSync(RELEASE_FLAG_DIR, { recursive: true, mode: 0o700 }); } catch { /* best effort */ }
+}
+
+/** Snapshot every entry in release-flags/ once per tick. Cheap when empty;
+ *  in steady state nobody's clicking "Open in Terminal" so this is a single
+ *  readdir on a directory with zero entries.
+ *
+ *  Behavior:
+ *  - bare `<thread_id>` file (no .ack sibling) → release daemon, rename to .ack
+ *  - missing `<thread_id>` AND missing `.ack` → if registry says "released",
+ *    reacquire (the caller deleted both files).
+ *  - .ack alone → status quo, do nothing. */
+async function processReleaseFlags(): Promise<void> {
+  if (!daemonRegistry) return;
+  let names: string[];
+  try {
+    names = require("node:fs").readdirSync(RELEASE_FLAG_DIR) as string[];
+  } catch {
+    return; // dir doesn't exist yet; ensure on startup
+  }
+  // Build per-thread state: did we see the request file, the ack file, both,
+  // or neither?
+  const states = new Map<string, { request: boolean; ack: boolean }>();
+  for (const name of names) {
+    const isAck = name.endsWith(".ack");
+    const thread = isAck ? name.slice(0, -4) : name;
+    const cur = states.get(thread) ?? { request: false, ack: false };
+    if (isAck) cur.ack = true;
+    else cur.request = true;
+    states.set(thread, cur);
+  }
+  const justReleased = new Set<string>();
+  for (const [thread, { request, ack }] of states) {
+    if (request && !ack) {
+      try {
+        await daemonRegistry.releaseForTerminal(thread);
+        renameSync(join(RELEASE_FLAG_DIR, thread), join(RELEASE_FLAG_DIR, `${thread}.ack`));
+        justReleased.add(thread);
+        process.stdout.write(`[${new Date().toISOString()}] β: released daemon for thread ${thread}\n`);
+      } catch (e) {
+        process.stderr.write(`poller: release-flag processing failed for ${thread}: ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+    }
+  }
+  // Detect reacquire: registry has a topic in "released" state but no .ack
+  // file present. Caller deleted the ack to signal "TUI is closed, bring
+  // the daemon back". Skip topics we JUST released this tick — their .ack
+  // exists on disk but our local `states` map is stale (built before the
+  // rename), so we'd incorrectly think the caller deleted the ack.
+  for (const [thread] of daemonRegistry.snapshotQueues()) {
+    if (justReleased.has(thread)) continue;
+    if (daemonRegistry.getStatus(thread) !== "released") continue;
+    // Re-stat instead of trusting the stale states map.
+    const ackPath = join(RELEASE_FLAG_DIR, `${thread}.ack`);
+    if (existsSync(ackPath)) continue;
+    try {
+      await daemonRegistry.reacquireFromTerminal(thread);
+      process.stdout.write(`[${new Date().toISOString()}] β: reacquired daemon for thread ${thread}\n`);
+    } catch (e) {
+      process.stderr.write(`poller: reacquire failed for ${thread}: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
+}
+
+/** Clean stale .ack files on startup so a poller restart while flags are
+ *  set doesn't leave topics stuck released. */
+function cleanupStaleReleaseFlags(): void {
+  try {
+    const names = require("node:fs").readdirSync(RELEASE_FLAG_DIR) as string[];
+    for (const name of names) {
+      try { unlinkSync(join(RELEASE_FLAG_DIR, name)); } catch { /* best effort */ }
+    }
+  } catch { /* dir missing, nothing to clean */ }
+}
+
 // ─── auto-pair via bot invite (Phase 5) ──────────────────────────────────────
 // Replaces "user must type /pair <code>" with "bot detects when it's added
 // to a chat, sends an inline-keyboard prompt asking the inviter to confirm".
@@ -1862,6 +1954,8 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  ensureReleaseFlagDir();
+  cleanupStaleReleaseFlags();
   await preflightBotToken();
   let offset = readOffset();
   refreshMountsIfChanged();
@@ -1882,6 +1976,10 @@ export async function main(): Promise<void> {
     refreshMountsIfChanged();
     refreshPairedIfChanged();
     refreshAckReactionIfChanged();
+    // β handoff: process any release / reacquire flag files written by
+    // `cta release-daemon` / Pager. Cheap when the dir is empty (steady
+    // state — nobody clicks "Open in Terminal" most of the time).
+    await processReleaseFlags();
     let updates: TgUpdate[];
     try {
       updates = await getUpdates(offset);
