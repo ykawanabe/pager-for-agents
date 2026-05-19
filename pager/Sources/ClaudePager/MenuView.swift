@@ -42,6 +42,14 @@ struct MenuView: View {
         // with activity dots + 1-line previews; main pane renders the focused
         // topic's tmux pane. See docs/plans/pager-watch-live.md.
         // Power users can still drop to Terminal: `tmux attach -t topic-<id>`.
+        // Setup wizard — re-runnable any time. Labeled distinctly when the
+        // plugin .env hasn't been created yet so a first-launch user sees
+        // an obvious next step instead of an unlabeled menu.
+        Button(setupWizardLabel()) {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            openWindow(id: "setup-wizard")
+        }
         Button("Watch live…") {
             // Pager is LSUIElement (accessory) — openWindow alone creates the
             // window off-screen / behind everything. Promote to .regular so
@@ -92,6 +100,23 @@ struct MenuView: View {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q")
+    }
+
+    /// Distinct label when setup hasn't been completed — first-launch users
+    /// see "Setup Wizard (start here) …" instead of an unlabeled menu item.
+    /// File check is cheap (single stat) and recomputed every menu open.
+    private func setupWizardLabel() -> String {
+        let pluginEnv = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/channels/telegram/.env")
+        let paired = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".pager/paired.json")
+        if !FileManager.default.fileExists(atPath: pluginEnv.path) {
+            return "Setup Wizard (start here)…"
+        }
+        if !FileManager.default.fileExists(atPath: paired.path) {
+            return "Setup Wizard (finish setup)…"
+        }
+        return "Setup Wizard…"
     }
 
     /// Three-state label. "Paused (on battery)" when the user wants caffeinate

@@ -189,7 +189,11 @@ echo "TAIL_FOLLOW_TEST_LINE_AAA" > "$STATE/topics/42.log"
 OUT_FILE=$(mktemp)
 cta watch 42 --follow --lines 100 > "$OUT_FILE" 2>&1 &
 WATCH_PID=$!
-sleep 0.5
+# tail -F's startup is bounded by file open + initial seek + first read;
+# under load (parallel test runs) 500ms wasn't enough — bumped to 2s to
+# stay reliable on a busy CI machine without adding meaningful wall-time
+# to the green path.
+sleep 2
 kill -TERM "$WATCH_PID" 2>/dev/null || true
 wait "$WATCH_PID" 2>/dev/null || true
 
