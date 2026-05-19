@@ -1457,6 +1457,95 @@ _init_wait_for_pair() {
   return 1
 }
 
+# ─── cta open <thread> — β handoff: TUI takeover for a daemon-mode topic ────
+# Tells the poller to release the topic's daemon (SIGTERM → clean session
+# lock release), then execs `claude --resume <uuid>` in the topic's project
+# directory. When the user exits the TUI, signals the poller to lazy-spawn
+# the daemon again on the next inbound message.
+#
+# The IPC is via flag files in $STATE_DIR/release-flags/:
+#   <thread>      written here = "please release this topic"
+#   <thread>.ack  written by poller = "released, you can take over"
+# Reacquire = delete the .ack file. Poller polls every loop tick.
+cmd_open() {
+  local thread_id="${1:-}"
+  if [[ -z "$thread_id" ]]; then
+    echo "Usage: cta open <thread_id|dm>" >&2
+    exit 1
+  fi
+
+  # Find the mount so we know the project_path. cta-side resolution mirrors
+  # what the poller does — no IPC needed for read-only info.
+  local store
+  store=$(_mount_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "cta open: mount-store not installed at $store — rerun install.sh" >&2
+    exit 1
+  fi
+  local mount_json
+  mount_json=$(bun run "$store" get "$thread_id" 2>/dev/null || echo "null")
+  if [[ -z "$mount_json" || "$mount_json" == "null" ]]; then
+    echo "cta open: no mount for thread '$thread_id'" >&2
+    exit 1
+  fi
+  local project_path
+  project_path=$(echo "$mount_json" | jq -r '.path')
+  if [[ ! -d "$project_path" ]]; then
+    echo "cta open: project_path '$project_path' is not a directory (stale mount?)" >&2
+    exit 1
+  fi
+
+  # Find the session UUID at $STATE_DIR/sessions/<thread_id>. If it doesn't
+  # exist the topic has never had a turn — nothing to resume; offer to start
+  # a fresh session-id instead.
+  local sess_file="$STATE_DIR/sessions/$thread_id"
+  local uuid=""
+  if [[ -f "$sess_file" ]]; then
+    uuid=$(cat "$sess_file" 2>/dev/null | tr -d '[:space:]')
+  fi
+
+  # Signal the poller to release the daemon. Touch the flag file, then poll
+  # for the .ack rename. 8s ceiling matches the poller's main-loop tick
+  # cadence (long-poll ~25s but processReleaseFlags runs every iteration).
+  local flag_dir="$STATE_DIR/release-flags"
+  mkdir -p "$flag_dir"
+  chmod 700 "$flag_dir" 2>/dev/null || true
+  local flag="$flag_dir/$thread_id"
+  local ack="$flag.ack"
+  # Clean any stale ack from a previous open that crashed before reacquire.
+  rm -f "$ack" 2>/dev/null || true
+  touch "$flag"
+
+  echo "Requesting daemon release for thread $thread_id…"
+  local waited=0
+  while [[ "$waited" -lt 800 ]]; do  # 80s ceiling — Telegram long-poll can hold 25s
+    if [[ -f "$ack" ]]; then break; fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [[ ! -f "$ack" ]]; then
+    echo "cta open: poller didn't acknowledge release within 80s." >&2
+    echo "Is the poller running? Check 'cta status' / tail $STATE_DIR/agent.log." >&2
+    rm -f "$flag" 2>/dev/null || true
+    exit 1
+  fi
+  echo "Daemon released. Launching claude TUI in $project_path…"
+
+  # Trap so we reacquire even if the user kills the terminal mid-session.
+  trap 'rm -f "'"$ack"'" 2>/dev/null; echo; echo "Daemon will respawn lazily on next Telegram message."' EXIT INT TERM
+
+  # cd + exec claude. --resume picks up the existing JSONL transcript so
+  # the user lands mid-conversation. If uuid is empty (never had a turn),
+  # claude opens a fresh session in the project dir.
+  cd "$project_path" || { echo "cta open: cd to $project_path failed" >&2; exit 1; }
+  if [[ -n "$uuid" ]]; then
+    claude --resume "$uuid" || true
+  else
+    claude || true
+  fi
+  # Trap runs the reacquire (rm -f "$ack") automatically.
+}
+
 cmd_init() {
   # Hard requirements: bash, jq, curl. All are macOS-stock or already
   # installed by the time `cta` runs (bash is the interpreter).
@@ -1648,6 +1737,7 @@ Usage:
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta migrate-state               Move v0.1 ~/.claude-telegram-agent/ → ~/.pager/
   cta init                        First-run setup wizard (token → pair → default mount)
+  cta open <thread>               Open a TUI for a topic (β handoff — daemon yields, claude --resume)
   cta help                        This message
 
 Reads ~/.pager/.env (CTA_STATE_DIR-overridable) for configurable tmux session names.
@@ -1683,6 +1773,7 @@ main() {
     config) cmd_config "$@" ;;
     migrate-state) cmd_migrate_state "$@" ;;
     init) cmd_init "$@" ;;
+    open) cmd_open "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       echo "Unknown command: $cmd" >&2

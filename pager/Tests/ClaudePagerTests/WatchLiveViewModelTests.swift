@@ -167,6 +167,56 @@ final class WatchLiveViewModelTests: XCTestCase {
         XCTAssertEqual(vm.paneStatus, .sessionDead(stderr: "topic-42 not alive"))
     }
 
+    func test_refreshPane_daemonModeSessionDeadWithMessagesShowsLive() async {
+        // Phase 4 daemon mode: `cta watch` returns sessionDead because there
+        // IS no per-topic tmux session anymore. But the topic has a JSONL
+        // transcript with messages — meaning the daemon is healthy, just
+        // idle. The status pill should say "Live", not "Dead".
+        let fakeMessages: [JsonlReader.Message] = [
+            JsonlReader.Message(
+                id: "m1",
+                role: .assistant,
+                text: "hello",
+                toolNames: [],
+                timestamp: Date()
+            )
+        ]
+        let vm = makeVM(
+            mounts: { [self.makeMount(thread: 42, label: nil, topic: "T")] },
+            capture: { _ in .sessionDead(stderr: "topic-42 not alive") },
+            messages: { _ in fakeMessages }
+        )
+        await vm.refreshSidebar()
+        vm.focus(thread: "42")
+        await vm.refreshMessages()
+        await vm.refreshPane()
+
+        // .live (not .sessionDead) — content is the cached pane content
+        // (empty in this test since no .ok capture ever happened).
+        if case .live = vm.paneStatus {
+            // good
+        } else {
+            XCTFail("expected .live for daemon-mode topic with messages, got \(vm.paneStatus)")
+        }
+    }
+
+    func test_refreshPane_sessionDeadWithNoMessagesStaysDead() async {
+        // True "Dead" — mount exists but the daemon has never produced a
+        // turn (no JSONL transcript). User needs to know this topic isn't
+        // working. Don't mask it as .live just because we're in daemon mode.
+        let vm = makeVM(
+            mounts: { [self.makeMount(thread: 99, label: nil, topic: "U")] },
+            capture: { _ in .sessionDead(stderr: "topic-99 not alive") },
+            messages: { _ in [] }
+        )
+        await vm.refreshSidebar()
+        vm.focus(thread: "99")
+        await vm.refreshMessages()
+        await vm.refreshPane()
+
+        XCTAssertEqual(vm.paneStatus, .sessionDead(stderr: "topic-99 not alive"))
+    }
+
     func test_focus_restoresCachedContentOnSwitch() async {
         // refreshSidebar populates contentCache for ALL mounts as part of
         // its preview poll (it captures every topic to fill activity dots).
