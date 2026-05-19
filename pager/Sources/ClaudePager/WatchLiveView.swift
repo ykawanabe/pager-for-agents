@@ -21,10 +21,6 @@ struct WatchLiveView: View {
     @State private var sendError: String?
     @State private var launchError: String?
     @FocusState private var inputFocused: Bool
-    /// Debounced tmux resize task — replaced (cancelling the old one) on
-    /// every geometry change. The actual resize-window fires 400ms after
-    /// the last change so a drag doesn't fire 60 SIGWINCH per second.
-    @State private var resizeTask: Task<Void, Never>? = nil
 
     var body: some View {
         NavigationSplitView {
@@ -163,13 +159,6 @@ struct WatchLiveView: View {
     /// and trim to a reasonable trailing slice so the user sees recent
     /// activity without the full scrollback. For real interaction the user
     /// clicks "Open in Terminal" below.
-    ///
-    /// Wrapped in a GeometryReader so we can keep tmux's pane width in
-    /// sync with Pager's window width — otherwise claude wraps its TUI at
-    /// whatever cols topic-wrapper.sh's session was created with (usually
-    /// 80), and a wider Pager window just shows that 80-col content with
-    /// trailing whitespace. The resize fires debounced from the .onChange
-    /// below.
     @ViewBuilder
     private var paneBody: some View {
         if let _ = vm.focusedThreadId {
@@ -191,34 +180,28 @@ struct WatchLiveView: View {
         }
     }
 
-    /// Existing tmux capture-pane renderer. Kept as the fallback path for
-    /// the "Poller log" synthetic row and for topics that haven't generated
-    /// a JSONL transcript yet (pre-stream-json installs, fresh mounts).
+    /// tmux capture-pane renderer — used for the "Poller log" synthetic row
+    /// (a real tmux session) and as the fallback for topics whose JSONL
+    /// transcript hasn't materialized yet. Phase 4 has no per-topic tmux
+    /// session, so for regular topics this path only renders the VM's
+    /// "no session" status until the JSONL bubble path takes over on the
+    /// first claude turn.
     @ViewBuilder
     private var tmuxPane: some View {
-        GeometryReader { geo in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    paneText
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                        .padding(10)
-                        .id("watch-live-bottom")
-                }
-                .onChange(of: paneSignal) { _, _ in
-                    proxy.scrollTo("watch-live-bottom", anchor: .bottom)
-                }
-                .onAppear {
-                    proxy.scrollTo("watch-live-bottom", anchor: .bottom)
-                    scheduleResize(width: geo.size.width, height: geo.size.height)
-                }
+        ScrollViewReader { proxy in
+            ScrollView {
+                paneText
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(10)
+                    .id("watch-live-bottom")
             }
-            .onChange(of: geo.size) { _, new in
-                scheduleResize(width: new.width, height: new.height)
+            .onChange(of: paneSignal) { _, _ in
+                proxy.scrollTo("watch-live-bottom", anchor: .bottom)
             }
-            .onChange(of: vm.focusedThreadId) { _, _ in
-                scheduleResize(width: geo.size.width, height: geo.size.height)
+            .onAppear {
+                proxy.scrollTo("watch-live-bottom", anchor: .bottom)
             }
         }
     }
@@ -284,51 +267,6 @@ struct WatchLiveView: View {
                     .fill(isUser ? Color.accentColor : Color(NSColor.controlBackgroundColor))
             )
             if !isUser { Spacer(minLength: 60) }
-        }
-    }
-
-    /// Cached cell dimensions for the monospace font we render in. Measured
-    /// from NSFont rather than guessed — magic numbers (7.2, 16) were off
-    /// enough that tmux's pane width didn't match Pager's display width
-    /// and lines wrapped a few cols early or late.
-    ///
-    /// Computed once per process: font metrics don't change at runtime.
-    private static let cellSize: (width: CGFloat, height: CGFloat) = {
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        // Mono width: every glyph has the same advance, so "M" is
-        // representative. Using NSAttributedString.size() picks up the
-        // layout-system width that SwiftUI Text actually uses.
-        let attrs = [NSAttributedString.Key.font: font]
-        let width = ("M" as NSString).size(withAttributes: attrs).width
-        // SwiftUI Text spacing is ascender + |descender| + leading.
-        let height = font.ascender + abs(font.descender) + font.leading
-        return (width, height)
-    }()
-
-    /// Translate pane pixel size into tmux cols/rows and fire a debounced
-    /// CTAClient.resizeTopic.
-    private func scheduleResize(width: CGFloat, height: CGFloat) {
-        guard let thread = vm.focusedThreadId else { return }
-        // System rows (poller log etc.) don't get resized — they're shared
-        // infrastructure sessions, not user-owned topics, and forcing them
-        // to track Pager's window width would interfere with anyone else
-        // observing them via `tmux attach -t poller` or similar.
-        if thread == WatchLiveViewModel.pollerThreadId { return }
-        // Padding from the 10pt padding inside the ScrollView + scroll bar
-        // gutter. The constants here account for the actual SwiftUI chrome
-        // around the text view: 10pt of padding on both horizontal edges
-        // plus ~16pt for the scroll bar.
-        let usableW = max(width - 36, 100)
-        let usableH = max(height - 20, 100)
-        let cell = Self.cellSize
-        let cols = Int(usableW / cell.width)
-        let rows = Int(usableH / cell.height)
-
-        resizeTask?.cancel()
-        resizeTask = Task.detached {
-            try? await Task.sleep(for: .milliseconds(400))
-            if Task.isCancelled { return }
-            CTAClient.resizeTopic(thread: thread, cols: cols, rows: rows)
         }
     }
 
@@ -486,10 +424,19 @@ struct WatchLiveView: View {
     private func openInTerminal() {
         guard let id = vm.focusedThreadId else { return }
         launchError = nil
-        // System rows attach to their bare session name (poller, watchdog),
-        // topic rows use the topic-<id> prefix that topic-wrapper.sh creates.
-        let session = id == WatchLiveViewModel.pollerThreadId ? "poller" : "topic-\(id)"
-        let result = TerminalLauncher.openTmux(session: session)
+        let result: TerminalLauncher.LaunchResult
+        if id == WatchLiveViewModel.pollerThreadId {
+            // Synthetic poller-log row is a real tmux session, attach directly.
+            result = TerminalLauncher.openTmux(session: "poller")
+        } else {
+            // Phase 4: regular topic rows don't have a per-topic tmux session
+            // anymore — claude lives inside the poller's ClaudeDaemonRegistry.
+            // `cta open <thread>` does the β handoff: signals the poller to
+            // release the daemon, execs `claude --resume <uuid>` in the
+            // project dir, and reacquires on exit. Single source of truth
+            // for the protocol — same code path as a terminal user typing it.
+            result = TerminalLauncher.openTopicViaCTA(threadId: id)
+        }
         if case .scriptFailed(let msg) = result {
             launchError = "Terminal launch failed: \(msg)"
         }

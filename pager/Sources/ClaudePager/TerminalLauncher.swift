@@ -1,16 +1,20 @@
 import Foundation
 import AppKit
 
-/// Opens the user's preferred terminal app with `tmux attach -t topic-<id>`.
-/// We delegate full interaction to a real terminal emulator (Terminal.app
-/// by default) rather than embedding SwiftTerm — the embedded route hit
-/// geometry/lifecycle issues (resize SIGWINCH on every reopen, alt-screen
-/// races during interactive pickers) that a real terminal handles natively.
+/// Launches a real terminal emulator (Terminal.app by default) with the
+/// right command for the user to interact with a claude session. Phase 4
+/// has two entry points:
 ///
-/// macOS's Terminal.app exposes AppleScript via the `do script` verb, which
-/// opens a fresh window and runs the command in it. We use AppleScript via
-/// `osascript` for the path-of-least-resistance integration. If the user
-/// has iTerm2, future iterations can detect and prefer it.
+/// - **β handoff** (`openTopicViaCTA`): for daemon-mode topics. Tells the
+///   poller to release the topic's daemon via `cta open <thread>`, which
+///   then execs `claude --resume <uuid>` in the project dir. When the
+///   user exits the TUI, `cta open`'s EXIT trap signals reacquire so the
+///   daemon respawns lazily on the next inbound message.
+/// - **`openTmux`**: legacy + system rows. Used for the synthetic
+///   "poller log" sidebar row, which is a real tmux session.
+///
+/// macOS's Terminal.app exposes AppleScript via the `do script` verb,
+/// which opens a fresh window and runs the command in it.
 enum TerminalLauncher {
 
     enum LaunchResult: Equatable {
@@ -18,7 +22,34 @@ enum TerminalLauncher {
         case scriptFailed(stderr: String)
     }
 
-    /// Open Terminal.app and attach to the given topic's tmux session.
+    /// Phase 4: open a TUI for a daemon-mode topic via `cta open <thread>`.
+    /// The CLI does the full β round-trip — request release flag, wait for
+    /// ack, exec `claude --resume <uuid>` in the project dir, reacquire
+    /// on exit via EXIT/INT/TERM trap.
+    ///
+    /// Pure path-shell-out via osascript. The Pager itself doesn't manage
+    /// any of the IPC plumbing — `cta open` is the single source of truth
+    /// for the handoff protocol, used identically from any caller.
+    static func openTopicViaCTA(threadId: String) -> LaunchResult {
+        let ctaPath = resolveCTA() ?? NSHomeDirectory() + "/.local/bin/cta"
+        // threadId comes from mounts.json — it's "dm" or a numeric string.
+        // Sanitize defensively even though no legitimate value can break
+        // out of the AppleScript do-script string.
+        let safeThread = threadId.replacingOccurrences(of: "\"", with: "")
+            .replacingOccurrences(of: "\\", with: "")
+        let command = "\(ctaPath) open \(safeThread)"
+        let escaped = command.replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "Terminal"
+            activate
+            do script "\(escaped)"
+        end tell
+        """
+        return runOsascript(script)
+    }
+
+    /// Open Terminal.app and attach to a literal tmux session name. Used
+    /// for system rows (poller, watchdog) — those are real tmux sessions.
     /// Returns immediately; Terminal.app launches asynchronously.
     static func openTmux(session: String) -> LaunchResult {
         // Use the absolute tmux path so the spawned shell finds it even
@@ -36,6 +67,16 @@ enum TerminalLauncher {
         end tell
         """
         return runOsascript(script)
+    }
+
+    /// Probe known cta install paths. Same ordering as CTAClient.
+    private static func resolveCTA() -> String? {
+        let candidates = [
+            NSHomeDirectory() + "/.local/bin/cta",
+            "/opt/homebrew/bin/cta",
+            "/usr/local/bin/cta",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     /// Probe known tmux install paths. Mirrors the pattern in CTAClient for
