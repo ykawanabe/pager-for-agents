@@ -262,6 +262,66 @@ async function reactToMessage(chat_id: number, message_id: number): Promise<void
   }
 }
 
+/**
+ * Two-stage delivery semantics by **state transition on a single reaction**
+ * (Telegram Bot API only allows ONE reaction per bot per message — multi-
+ * emoji arrays get silently rejected). Initial `reactToMessage` sets 👀
+ * ("delivered, poller queued it"); this one REPLACES 👀 with 👌
+ * ("read, LLM started processing"). Replace-semantics give a useful
+ * negative signal: if the user sees 👀 stuck without becoming 👌, something
+ * downstream (daemon crash, queue stuck) prevented the LLM from reading.
+ *
+ * onFlush in `ClaudeDaemonRegistry` fires when the batch is written to
+ * claude's stdin, which is the earliest point where "the LLM definitely
+ * has it" is true. Failures after that (daemon crash mid-turn) don't roll
+ * back the 👌 — it still means "we put it in front of the LLM."
+ *
+ * The read emoji is hard-coded for now. Could become a second config field
+ * (`readReaction`) if a user wants a different "read" emoji. 👌 was picked
+ * because it IS in the bot whitelist and reads naturally as "got it / read."
+ * ✅ is NOT in the whitelist (silently rejected).
+ */
+const READ_REACTION_EMOJI = "👌";
+
+async function markMessageRead(chat_id: number, message_id: number): Promise<void> {
+  if (!ackReactionCache) return; // delivered-ack off → read off too (paired toggle)
+  try {
+    // Bots are limited to ONE reaction per message — replace 👀 with the
+    // read marker (👌) rather than appending. See doc on READ_REACTION_EMOJI.
+    await fetch(`${getApiBase()}/setMessageReaction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id,
+        message_id,
+        reaction: [{ type: "emoji", emoji: READ_REACTION_EMOJI }],
+      }),
+    });
+  } catch (e) {
+    process.stderr.write(`poller: markMessageRead failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+/** Per-topic queue of msg refs awaiting the "read" ack. Drained on onFlush. */
+const pendingReadAcks: Map<string, Array<{ chat_id: number; message_id: number }>> = new Map();
+
+function trackPendingRead(threadIdStr: string, chat_id: number, message_id: number): void {
+  let list = pendingReadAcks.get(threadIdStr);
+  if (!list) { list = []; pendingReadAcks.set(threadIdStr, list); }
+  list.push({ chat_id, message_id });
+}
+
+/** Registry onFlush hook: the batch just got written to claude's stdin, so
+ *  every queued message in this turn is now "read" by the LLM. */
+function onDaemonFlush(threadIdStr: string, _combinedText: string): void {
+  const list = pendingReadAcks.get(threadIdStr);
+  if (!list || list.length === 0) return;
+  pendingReadAcks.delete(threadIdStr);
+  for (const { chat_id, message_id } of list) {
+    void markMessageRead(chat_id, message_id);
+  }
+}
+
 // ─── topic name cache ────────────────────────────────────────────────────────
 // Bot API has no getForumTopic / getForumTopicByID, so the only way to learn
 // a forum topic's user-set name is to observe forum_topic_created or
@@ -516,6 +576,7 @@ function initDaemonRegistry(): void {
     debounceMs: Number(process.env.PAGER_DAEMON_DEBOUNCE_MS ?? "2000"),
     daemonOptsFor: buildDaemonOpts,
     onText: postTelegramTextFromDaemon,
+    onFlush: onDaemonFlush,
     onTurnEnd: onDaemonTurnEnd,
   });
 }
@@ -533,11 +594,14 @@ function daemonDispatch(threadIdStr: string, msg: TgMessage): void {
     process.stderr.write("poller: daemonDispatch called before initDaemonRegistry — initializing on demand\n");
     initDaemonRegistry();
   }
-  // Fire typing keepalive + ack reaction in parallel — they're fast Bot API
-  // calls. mcp-telegram clears the typing marker if claude calls send_telegram;
-  // otherwise onDaemonTurnEnd clears it on the result event.
+  // Fire typing keepalive + delivered ack (👀) in parallel — they're fast
+  // Bot API calls. mcp-telegram clears the typing marker if claude calls
+  // send_telegram; otherwise onDaemonTurnEnd clears it on the result event.
+  // The "read" ack (👀+✅) fires later via onDaemonFlush when the registry
+  // actually writes this batch to claude's stdin.
   void startTypingKeepalive(msg.chat.id, msg.message_thread_id);
   void reactToMessage(msg.chat.id, msg.message_id);
+  trackPendingRead(threadIdStr, msg.chat.id, msg.message_id);
 
   daemonRegistry!.enqueue(threadIdStr, text);
 }
@@ -1063,9 +1127,9 @@ async function handleClear(msg: TgMessage): Promise<void> {
     return;
   }
 
-  // Rotate per-topic session UUID. topic-wrapper.sh reads this file at
-  // each restart and resumes whatever UUID is there — a fresh UUID means
-  // no --resume → fresh claude session.
+  // Rotate per-topic session UUID. The new daemon (spawned by the registry
+  // on the next enqueue) reads this file at start and uses --session-id with
+  // a fresh UUID → no --resume → cold conversation.
   const sessFile = join(sessionsDir(), String(key));
   const newUuid = randomUUID();
   try {
@@ -1080,15 +1144,18 @@ async function handleClear(msg: TgMessage): Promise<void> {
     return;
   }
 
-  // Kill the topic tmux session. kick_dead_topic_sessions (watchdog) or
-  // the wrapper's own restart loop will respawn it; new claude reads the
-  // rotated UUID file and starts fresh.
-  const targetSession = mount.tmux_session ?? `topic-${key}`;
-  spawnSync("tmux", ["kill-session", "-t", targetSession], { encoding: "utf8" });
+  // Phase 4 limitation (tracked): /clear rotates the UUID file but does NOT
+  // force the topic's running daemon to restart. The currently-alive daemon
+  // is still attached to the OLD UUID and continues using it until the
+  // poller restarts or the daemon crashes. To make /clear effective right
+  // now, the daemon needs a `resetTopic()` API on ClaudeDaemonRegistry that
+  // stops the daemon + clears the queue + clears the handle entry, so the
+  // next enqueue lazy-spawns with the new UUID. Not landed this session per
+  // "cleanup only" scope; see project_secretary_heartbeat_plan §6.1.
 
   await reply(
     { chat_id, thread_id: thread_id_raw },
-    "Cleared. New session starting — first reply may take 5–15s while claude cold-starts.",
+    "Cleared. New session starts on the next message (cold-start adds ~5–15s).",
   );
 }
 
@@ -1739,19 +1806,20 @@ function refreshMountsIfChanged(): void {
  * official plugin's allowFrom semantics in v0.
  */
 /**
- * Auto-spawn a topic tmux session for a thread_id that hit the wildcard
- * template. Persists a real mount via mount-store, then spawns the per-
- * topic claude wrapper. Subsequent messages route directly via the specific
- * mount (wildcard is only consulted for unmounted threads).
+ * Persist a wildcard-derived mount for a thread_id that hit the `*` template.
+ * Phase 4: only the mount-store record is created — there is no per-topic tmux
+ * session to spawn, since claude lives inside the poller's ClaudeDaemonRegistry
+ * and gets lazy-spawned on the next enqueue. Subsequent messages route directly
+ * via the specific mount (wildcard is only consulted for unmounted threads).
  *
- * Returns the new tmux_session name on success, null on failure.
+ * Returns the persisted `tmux_session` field (still recorded in mount-store
+ * for legacy schema compatibility) on success, null on failure.
  */
 function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): string | null {
   const servicesDir = process.env.MOUNT_STORE_PATH
     ? join(process.env.MOUNT_STORE_PATH, "..", "..")
     : installAgentDir();
   const storePath = join(servicesDir, "mount-store/mount-store.ts");
-  const wrapperPath = join(servicesDir, "topic-wrapper.sh");
 
   // Persist the new mount so subsequent restarts pick it up.
   const addResult = spawnSync("bun", ["run", storePath, "add", String(thread_id), templatePath, "auto"], { encoding: "utf8" });
@@ -1764,19 +1832,6 @@ function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): 
     mount = JSON.parse(addResult.stdout);
   } catch (e) {
     process.stderr.write(`poller: wildcard auto-mount: unparseable mount-store output: ${addResult.stdout}\n`);
-    return null;
-  }
-
-  // Spawn the tmux session. The wrapper script picks up the session UUID from
-  // sessions/<thread_id> (which mount-store didn't create — we let topic-wrapper
-  // generate one on first launch). printf %q to survive paths with spaces.
-  const cmd = [wrapperPath, String(thread_id), templatePath, mount.tmux_session]
-    .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
-    .join(" ");
-  spawnSync("tmux", ["kill-session", "-t", mount.tmux_session], { encoding: "utf8" }); // no-op if absent
-  const newSession = spawnSync("tmux", ["new-session", "-d", "-s", mount.tmux_session, cmd], { encoding: "utf8" });
-  if (newSession.status !== 0) {
-    process.stderr.write(`poller: wildcard auto-spawn tmux failed for ${thread_id}: ${newSession.stderr}\n`);
     return null;
   }
 
