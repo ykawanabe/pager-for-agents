@@ -80,9 +80,14 @@ enum TerminalLauncher {
     }
 
     /// Probe known tmux install paths. Mirrors the pattern in CTAClient for
-    /// resolving `cta`. Nil if not found — caller falls back to the default.
+    /// resolving `cta`. Bundled Pager.app/Contents/MacOS/tmux comes first
+    /// so the launched tmux inherits Pager's Full Disk Access grant — see
+    /// CTAClient.resolvedTmuxPath for the same logic. Nil if not found —
+    /// caller falls back to the default.
     private static func resolveTmux() -> String? {
+        let bundled = Bundle.main.bundlePath + "/Contents/MacOS/tmux"
         let candidates = [
+            bundled,
             "/opt/homebrew/bin/tmux",
             "/usr/local/bin/tmux",
             "/opt/local/bin/tmux",
