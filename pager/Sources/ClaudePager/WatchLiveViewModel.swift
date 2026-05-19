@@ -82,6 +82,10 @@ final class WatchLiveViewModel: ObservableObject {
     private let messagesProvider: MessagesProvider
     private var messagesTask: Task<Void, Never>?
     private var lastPreviewByThread: [String: String] = [:]
+    /// Phase 4 sidebar activity: tracks JSONL mtime per topic so we can flag
+    /// .live when the daemon writes new turns. Cheaper + more accurate than
+    /// polling `cta watch` (which always returns sessionDead in Phase 4).
+    private var lastJsonlMtimeByThread: [String: Date] = [:]
     private var sidebarTask: Task<Void, Never>?
     private var paneTask: Task<Void, Never>?
     private var streamCancel: (() -> Void)?
@@ -248,16 +252,11 @@ final class WatchLiveViewModel: ObservableObject {
             let activity: Activity
             switch await captureProvider(key) {
             case .ok(let content):
-                // While we're capturing for the sidebar preview anyway, stash
-                // the full content in the per-topic cache. This warms the
-                // cache for every visible topic every 5s — so by the time
-                // the user clicks a sidebar row, focus() can restore content
-                // immediately without a poll wait.
+                // Legacy capture-pane path. Phase 4 never lands here for
+                // topic rows in production (cta watch always returns
+                // sessionDead), but tests inject .ok content and this kept
+                // the fakes simple. Cache + detect change for activity.
                 contentCache[key] = content
-                // captureProvider returns content with ANSI codes (ansi:true)
-                // so the main pane can color it. Sidebar previews want plain
-                // text — strip via ANSIParser to stay consistent with the
-                // renderer used by the main pane.
                 let plain = ANSIParser.strip(content)
                 let last = WatchLiveViewModel.lastNonEmptyLine(plain)
                 preview = last
@@ -265,8 +264,11 @@ final class WatchLiveViewModel: ObservableObject {
                 activity = (previous != nil && previous != last) ? .live : .idle
                 lastPreviewByThread[key] = last
             case .sessionDead, .noMount, .error:
-                preview = ""
-                activity = .dead
+                // Phase 4: cta watch returns sessionDead for every topic
+                // because there's no per-topic tmux session. Fall back to
+                // JSONL mtime — that's the daemon's authoritative "did
+                // anything happen?" signal.
+                (preview, activity) = sidebarActivityForTopic(threadId: key, mountPath: mount.path)
             }
             newRows.append(Row(
                 threadId: key,
@@ -405,6 +407,41 @@ final class WatchLiveViewModel: ObservableObject {
         else { return [] }
         let path = JsonlReader.transcriptPath(projectPath: mount.path, sessionUuid: uuid)
         return JsonlReader.parseTranscript(at: path)
+    }
+
+    /// Phase 4 sidebar activity for a topic row. Resolves the topic's
+    /// JSONL transcript via session UUID, stats its mtime, and classifies:
+    ///   - mtime changed since last poll → .live (daemon just wrote a turn)
+    ///   - mtime unchanged → .idle (daemon healthy but quiet)
+    ///   - JSONL missing / no session UUID → .idle (daemon never engaged,
+    ///     not "dead" — it'll lazy-spawn on the next message)
+    /// Preview = last assistant text line from the transcript (truncated).
+    /// Returns ("", .idle) when no transcript exists yet.
+    private func sidebarActivityForTopic(threadId: String, mountPath: String) -> (String, Activity) {
+        let sessFile = "\(CTAClient.stateDir)/sessions/\(threadId)"
+        guard let uuid = try? String(contentsOfFile: sessFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !uuid.isEmpty
+        else {
+            // Daemon has never spawned for this topic (session-id file
+            // hasn't been written yet). Show as idle/waiting.
+            return ("", .idle)
+        }
+        let path = JsonlReader.transcriptPath(projectPath: mountPath, sessionUuid: uuid)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path.path)
+        guard let mtime = attrs?[.modificationDate] as? Date else {
+            return ("", .idle)
+        }
+        let prev = lastJsonlMtimeByThread[threadId]
+        let activity: Activity = (prev != nil && prev != mtime) ? .live : .idle
+        lastJsonlMtimeByThread[threadId] = mtime
+
+        // Preview: last non-empty assistant turn, single-lined and truncated.
+        // Reading the full JSONL every sidebar poll is bounded — sessions are
+        // typically <1MB and we do it for ~5-20 rows max.
+        let messages = JsonlReader.parseTranscript(at: path)
+        let lastText = messages.reversed().first(where: { !$0.text.isEmpty })?.text ?? ""
+        let preview = String(lastText.replacingOccurrences(of: "\n", with: " ").prefix(80))
+        return (preview, activity)
     }
 
     // MARK: - Free helpers (static; exposed for testability)

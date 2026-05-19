@@ -54,7 +54,10 @@ final class WatchLiveViewModelTests: XCTestCase {
         XCTAssertEqual(vm.rows[0].preview, "fresh line")
         XCTAssertEqual(vm.rows[1].label, "topic-7")              // no topic + no label → fallback
         XCTAssertEqual(vm.rows[1].preview, "only one line")
-        XCTAssertEqual(vm.rows[2].activity, .dead)               // sessionDead
+        // Phase 4: sessionDead from cta watch falls through to the JSONL
+        // mtime check. In tests there's no JSONL on disk → .idle (waiting),
+        // not .dead. Pre-Phase-4 expectation was .dead here.
+        XCTAssertEqual(vm.rows[2].activity, .idle)
         XCTAssertEqual(vm.rows[2].preview, "")
         // Poller row is always last, threadId == "_poller". captureProvider
         // here returns .error for "_poller" (not in our test map) so it
