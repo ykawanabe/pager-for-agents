@@ -100,6 +100,42 @@ struct MenuView: View {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q")
+
+        // Hidden debug submenu. Off by default in production builds — set
+        // `defaults write com.claude.pager DebugMenuEnabled -bool true`
+        // and restart Pager to see it. No #if DEBUG so the same binary
+        // serves devs and end users; one secret flag toggles visibility.
+        if UserDefaults.standard.bool(forKey: "DebugMenuEnabled") {
+            Divider()
+            Menu("Debug") {
+                Button("Reveal ~/.pager in Finder") {
+                    let url = FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent(".pager")
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+                Button("Reveal plugin .env in Finder") {
+                    let url = FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent(".claude/channels/telegram/.env")
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+                Divider()
+                Button("Reset setup (delete paired.json + mounts.json)…") {
+                    let alert = NSAlert()
+                    alert.messageText = "Reset Pager setup?"
+                    alert.informativeText = "Deletes paired.json and mounts.json so you can re-pair. Does NOT delete your bot token (Telegram .env) or your project files. Re-run Setup Wizard after."
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "Reset")
+                    alert.addButton(withTitle: "Cancel")
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        let dir = FileManager.default.homeDirectoryForCurrentUser
+                            .appendingPathComponent(".pager")
+                        for name in ["paired.json", "mounts.json"] {
+                            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Distinct label when setup hasn't been completed — first-launch users
