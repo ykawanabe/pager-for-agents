@@ -160,6 +160,32 @@ export class ClaudeDaemonRegistry {
     }
   }
 
+  /** Fully reset a topic's state — stop the daemon, drop the queue, drop
+   *  the handle entry entirely. Next enqueue lazy-spawns a fresh daemon
+   *  using whatever options daemonOptsFor() returns at that moment (so
+   *  callers can rotate session UUIDs etc. *before* the next message).
+   *
+   *  Distinct from releaseForTerminal: that one expects reacquire from a
+   *  terminal handoff and preserves the queue. resetTopic is for /clear
+   *  semantics — "throw the conversation away, restart with whatever the
+   *  caller has just configured."
+   *
+   *  Pending queue is intentionally dropped (matches user expectation:
+   *  /clear means "forget what was going on"). If the caller wants to
+   *  preserve a message across the reset, they should re-enqueue it. */
+  async resetTopic(threadId: string): Promise<void> {
+    const handle = this.handles.get(threadId);
+    if (!handle) return;
+    if (handle.debounceTimer) {
+      clearTimeout(handle.debounceTimer);
+      handle.debounceTimer = null;
+    }
+    if (handle.daemon) {
+      await handle.daemon.stop("SIGTERM");
+    }
+    this.handles.delete(threadId);
+  }
+
   /** Tear down all daemons. Called on poller graceful exit. */
   async shutdown(): Promise<void> {
     const promises: Promise<void>[] = [];
