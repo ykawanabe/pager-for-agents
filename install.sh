@@ -146,11 +146,15 @@ mkdir -p "$BIN_DIR"
 cp "$REPO_DIR/cli/cta" "$BIN_DIR/cta"
 chmod +x "$BIN_DIR/cta"
 say "Installed $BIN_DIR/cta"
-for s in restart_claude.sh watch_network.sh start_agents.sh; do
+for s in watch_network.sh start_agents.sh; do
   cp "$REPO_DIR/agent/$s" "$BIN_DIR/$s"
   chmod +x "$BIN_DIR/$s"
   say "Installed $BIN_DIR/$s"
 done
+# Phase 4 (2026-05-19): restart_claude.sh removed. Regular per-topic claude
+# lifecycle is now owned by poller.ts → ClaudeDaemonRegistry. Delete any
+# leftover from prior installs so the watchdog can't accidentally invoke it.
+rm -f "$BIN_DIR/restart_claude.sh" 2>/dev/null || true
 
 # ---- 3b. Install MULTI_TOPIC runtime modules --------------------------------
 # Layout: $INSTALL_DIR/agent/{lib,poller,mcp-telegram,mount-store,
@@ -160,15 +164,22 @@ AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
   mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
-  cp "$REPO_DIR/agent/poller/poller.ts" "$REPO_DIR/agent/poller/typing-keepalive.ts" "$REPO_DIR/agent/poller/package.json" "$AGENT_DIR/poller/"
+  cp "$REPO_DIR/agent/poller/poller.ts" \
+     "$REPO_DIR/agent/poller/typing-keepalive.ts" \
+     "$REPO_DIR/agent/poller/package.json" \
+     "$REPO_DIR/agent/poller/claude-daemon.ts" \
+     "$REPO_DIR/agent/poller/claude-daemon-registry.ts" \
+     "$REPO_DIR/agent/poller/slash-commands.ts" \
+     "$AGENT_DIR/poller/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
   cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
   chmod +x "$AGENT_DIR/topic-wrapper.sh"
-  # picker-watcher: bun script spawned by topic-wrapper to surface claude's
-  # interactive TUI pickers (/effort, /model, etc.) to Telegram as a
-  # snapshot — the bot can't deliver arrow-key picker input on its own.
-  cp "$REPO_DIR/agent/picker-watcher.ts" "$AGENT_DIR/picker-watcher.ts"
+  # Phase 4 (2026-05-19): picker-watcher.ts removed. The regular per-topic
+  # claude TUI is gone — daemons via stream-json now own dispatch — so there
+  # are no interactive pickers to surface. Delete any leftover so an old
+  # topic-wrapper.sh from a stale install can't try to spawn it.
+  rm -f "$AGENT_DIR/picker-watcher.ts" 2>/dev/null || true
   # mount-helper (auto-mount) artifacts: read by topic-wrapper.sh when invoked
   # in helper mode (4th positional arg). Without these files in $INSTALL_DIR/
   # agent/, a fresh install would `exit 1` on the first message to an
@@ -377,6 +388,7 @@ To pin a specific topic to a different dir, send inside that topic:
   /mount ~/path/to/other-project
 
 Useful commands from the host:
+  cta init                     — guided setup wizard (re-runnable, resumes where you left off)
   cta status                   — agent health snapshot
   cta pair-code                — re-display the fallback pairing code
   cta pair-code --reset        — invalidate the printed code + regen

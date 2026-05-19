@@ -78,11 +78,13 @@ else
   ng "cta mount: success message (got '$OUT')"
 fi
 
-# Without a poller alive, status message should say "will start on next 'cta start'"
-if echo "$OUT" | grep -q "will start on next 'cta start'"; then
-  ok "cta mount (no poller): deferred-spawn message"
+# Without a poller alive, status message should say "will route on next 'cta start'".
+# Phase 4: cta mount only writes mounts.json; the poller's daemon registry
+# lazy-spawns the claude process on next inbound message.
+if echo "$OUT" | grep -q "will route on next 'cta start'"; then
+  ok "cta mount (no poller): deferred-route message"
 else
-  ng "cta mount (no poller): deferred-spawn message (got '$OUT')"
+  ng "cta mount (no poller): deferred-route message (got '$OUT')"
 fi
 
 # ─── cta list: with one mount ───────────────────────────────────────────────

@@ -32,6 +32,16 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { addMount, gcProvisional, mountKey, readMounts, removeMount, type Mount, type ThreadId } from "../mount-store/mount-store";
+import {
+  aggregateCostFromJsonl,
+  fetchUsageStats,
+  formatCostMessage,
+  formatUsageMessage,
+  jsonlPathForSession,
+  resolveCredentialToken,
+} from "./slash-commands";
+import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
+import type { ClaudeDaemonOptions } from "./claude-daemon";
 
 // Poller-side cache key for Telegram updates. Hardcoded "telegram" because
 // this file is the Telegram adapter; the LINE adapter (when added) will
@@ -39,7 +49,7 @@ import { addMount, gcProvisional, mountKey, readMounts, removeMount, type Mount,
 function tgKey(thread_id: ThreadId): string {
   return mountKey("telegram", thread_id);
 }
-import { markTypingActive, runTypingKeepalive } from "./typing-keepalive";
+import { markTypingActive, markTypingDone, runTypingKeepalive } from "./typing-keepalive";
 import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs } from "../lib/paths";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
@@ -346,41 +356,203 @@ async function startTypingKeepalive(chat_id: number, thread_id?: number): Promis
   });
 }
 
-// ─── tmux dispatch ───────────────────────────────────────────────────────────
+// Telegram-friendliness instructions appended via --append-system-prompt
+// on every daemon spawn (Phase 4). No picker-avoidance section because
+// `claude -p --input-format stream-json` has no interactive arrow-key
+// pickers at all. Plain text replies come back via the stream-json
+// `result` event; `send_telegram(buttons=...)` is the right tool for
+// inline keyboards because there's no way to express button choices
+// in plain prose.
+const DAEMON_APPEND_SYSTEM_PROMPT = `You are responding through a Telegram bot. The user is on Telegram; your terminal output is NOT visible to them.
+
+For plain text replies, just write your reply — the bot reads your final text and posts it. You do NOT need to call send_telegram for text replies.
+
+When you need the user to choose between a small fixed set of options (Yes/No, A/B/C, two paths forward), call \`mcp__telegram__send_telegram(buttons=["Option A","Option B",...])\` (up to 8 buttons, each ≤50 chars). The user taps one and the chosen label is dispatched back as their next message. Do NOT use AskUserQuestion — it opens a local modal that the user cannot see or answer.
+
+Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.
+
+You also have access to ~/.pager/shared-context.md — a cross-session memory file shared with every other Pager-bot claude session on this host. Read it when the user references prior context, or near the start of substantive conversations. Append durable notes there (user preferences, ongoing concerns, decisions, recurring patterns) so future sessions across other topics/projects benefit. Keep entries short and avoid duplication.
+
+IMPORTANT — Telegram pairing / access is handled by claude-telegram-agent, NOT by the official @claude-plugins-official/telegram plugin. If the user asks about pairing, unpair, allowlist, or access changes, DO NOT invoke skills named \`telegram:access\`, \`telegram:configure\`, or anything from \`@claude-plugins-official/telegram\`. Instead:
+  - To unpair the current chat: tell the user to send \`/unpair confirm\` in the Telegram chat, OR to run \`cta unpair\` in their terminal.
+  - To re-pair to a different chat: unpair first, then either invite the bot to a new chat (auto-pair prompt fires) or send \`/pair <code>\` (code visible via \`cta pair-code\` on the host).
+  - To mount a project to a topic: \`/mount <path>\` inside that topic.`;
+
+// ─── daemon dispatch (Phase 4) ─────────────────────────────────────────────
+// Per-topic long-lived claude subprocess. No more tmux interactive TUI on
+// the bot's hot path. ClaudeDaemonRegistry owns the lifecycle (spawn,
+// debounce, queue, crash respawn); poller wires only the chat side.
+
+/** Build the --mcp-config JSON. Daemon keeps mcp-telegram wired so claude
+ *  can call `send_telegram(buttons=...)` for inline keyboards — plain text
+ *  replies come back via the stream-json result event and don't need MCP. */
+function buildMcpConfig(threadId: number | "dm"): string | null {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return null;
+  const chatId = effectiveChatId();
+  if (!chatId) return null;
+  const serverPath = process.env.TOPIC_WRAPPER_MCP_PATH
+    ?? join(installAgentDir(), "mcp-telegram/server.ts");
+  const cfg = {
+    mcpServers: {
+      telegram: {
+        command: "bun",
+        args: [serverPath],
+        env: {
+          TELEGRAM_BOT_TOKEN: token,
+          TELEGRAM_CHAT_ID: chatId,
+          TELEGRAM_THREAD_ID: String(threadId),
+          CTA_STATE_DIR: STATE_DIR,
+        },
+      },
+    },
+  };
+  return JSON.stringify(cfg);
+}
+
+/** Per-topic stable MCP config path. Daemon re-reads on respawn; we
+ *  overwrite each spawn (chat_id might have changed via /pair switch). */
+function mcpConfigPathFor(threadId: number | "dm"): string {
+  const dir = join(STATE_DIR, "tmp");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return join(dir, `mcp-config-${threadId}.json`);
+}
+
+/** Write the per-topic MCP config to disk. Idempotent. Returns the path,
+ *  or null if env is missing (no bot token / chat) — caller skips --mcp-config. */
+function ensureMcpConfig(threadId: number | "dm"): string | null {
+  const json = buildMcpConfig(threadId);
+  if (!json) return null;
+  const path = mcpConfigPathFor(threadId);
+  writeFileSync(path, json, { mode: 0o600 });
+  return path;
+}
 
 /**
- * Deliver text to a tmux pane. `load-buffer -b <name> -` reads from stdin into
- * a NAMED buffer; `paste-buffer -b <name> -d -t <session>` pastes it into the
- * target pane and deletes the named buffer afterward.
- *
- * Why named: the default (unnamed) tmux buffer is server-wide. Two concurrent
- * dispatches targeting different sessions race — call B's load-buffer can
- * overwrite the default before call A's paste-buffer fires, so A's pane
- * receives B's text. A unique buffer name per call eliminates the race
- * structurally regardless of which processes might race (poller, watchdog
- * kick, cta send, helper spawn).
- *
- * Trailing `send-keys Enter` submits the prompt — claude's TUI treats Enter
- * as "send." Multiline content, code blocks, emoji, quotes all survive the
- * paste-buffer transport (it preserves bytes verbatim).
+ * Build the daemon options for a topic. Resolves project_path from the
+ * mount cache, session UUID from $STATE_DIR/sessions/<thread_id>, and
+ * MCP config path. Called by the registry on every spawn (including
+ * crash respawns) so config stays in sync with mount changes.
  */
-function tmuxDispatch(session: string, text: string): { ok: boolean; stderr: string } {
-  const buf = `pager-${session}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claudeBin"> {
+  const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
+  const mount = mountsCache.get(tgKey(key));
+  if (!mount) throw new Error(`buildDaemonOpts: no mount for ${threadIdStr}`);
 
-  const load = spawnSync("tmux", ["load-buffer", "-b", buf, "-"], { input: text, encoding: "utf8" });
-  if (load.status !== 0) return { ok: false, stderr: `load-buffer: ${load.stderr}` };
-
-  const paste = spawnSync("tmux", ["paste-buffer", "-b", buf, "-d", "-t", session], { encoding: "utf8" });
-  if (paste.status !== 0) {
-    // Cleanup the orphaned named buffer if paste failed (load already created it).
-    spawnSync("tmux", ["delete-buffer", "-b", buf], { encoding: "utf8" });
-    return { ok: false, stderr: `paste-buffer: ${paste.stderr}` };
+  // Per-topic session UUID. Generate on first launch; re-use on subsequent.
+  const sessFile = join(sessionsDir(), String(key));
+  let uuid: string;
+  if (existsSync(sessFile)) {
+    uuid = readFileSync(sessFile, "utf8").trim();
+    if (!uuid) uuid = randomUUID();
+  } else {
+    uuid = randomUUID();
+    mkdirSync(sessionsDir(), { recursive: true });
+    writeFileSync(sessFile, uuid + "\n", { mode: 0o600 });
   }
+  // --resume needs JSONL to exist; otherwise --session-id starts fresh.
+  const jsonlExists = existsSync(jsonlPathForSession(mount.path, uuid));
 
-  const enter = spawnSync("tmux", ["send-keys", "-t", session, "Enter"], { encoding: "utf8" });
-  if (enter.status !== 0) return { ok: false, stderr: `send-keys Enter: ${enter.stderr}` };
+  const mcpConfigPath = ensureMcpConfig(key);
+  const hooksPath = process.env.TOPIC_WRAPPER_HOOKS_PATH
+    ?? join(process.env.CTA_INSTALL_DIR ?? join(homedir(), ".local/share/pager"), "bot-hooks.json");
 
-  return { ok: true, stderr: "" };
+  return {
+    cwd: mount.path,
+    sessionUuid: uuid,
+    resumeExisting: jsonlExists,
+    mcpConfigPath: mcpConfigPath ?? undefined,
+    settingsPath: existsSync(hooksPath) ? hooksPath : undefined,
+    appendSystemPrompt: process.env.BOT_APPEND_SYSTEM_PROMPT ?? DAEMON_APPEND_SYSTEM_PROMPT,
+  };
+}
+
+/** Parse a registry threadId (string) back into the TG numeric form. */
+function parseRegistryThreadId(threadIdStr: string): number | undefined {
+  return threadIdStr === "dm" ? undefined : Number(threadIdStr);
+}
+
+/**
+ * Singleton ClaudeDaemonRegistry. Initialized in main() after env setup so
+ * the daemon-opts factory has access to the live MAIN_CHAT_ID / paired
+ * state. Module-level let so daemonDispatch can reference it without
+ * passing it through dispatchUpdate's stack.
+ */
+let daemonRegistry: ClaudeDaemonRegistry | null = null;
+
+/**
+ * Wiring: pump each assistant text block out to Telegram. multi-message
+ * UX is automatic because claude code emits one assistant event per
+ * text/tool_use block during a turn.
+ */
+function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
+  const chatIdStr = effectiveChatId();
+  if (!chatIdStr) return;
+  const chat_id = Number(chatIdStr);
+  if (!Number.isFinite(chat_id)) return;
+  void reply({ chat_id, thread_id: parseRegistryThreadId(threadIdStr) }, text);
+}
+
+/** Turn-end hook: clear typing keepalive (mcp-telegram normally does this
+ *  on send_telegram; in daemon mode plain-text replies bypass MCP so we
+ *  must clear ourselves), log cost. */
+function onDaemonTurnEnd(threadIdStr: string, info: { costUsd: number | null; sessionId: string | null }): void {
+  const chatIdStr = effectiveChatId();
+  if (chatIdStr) {
+    const chat_id = Number(chatIdStr);
+    if (Number.isFinite(chat_id)) {
+      markTypingDone(STATE_DIR, chat_id, parseRegistryThreadId(threadIdStr) ?? "dm");
+    }
+  }
+  if (typeof info.costUsd === "number") {
+    process.stdout.write(`[${new Date().toISOString()}] daemon turn-end cost: $${info.costUsd.toFixed(4)} (session=${info.sessionId}, thread=${threadIdStr})\n`);
+  }
+}
+
+/** Initialize the daemon registry. Called once in main(). */
+function initDaemonRegistry(): void {
+  if (daemonRegistry) return;
+  daemonRegistry = new ClaudeDaemonRegistry({
+    debounceMs: Number(process.env.PAGER_DAEMON_DEBOUNCE_MS ?? "2000"),
+    daemonOptsFor: buildDaemonOpts,
+    onText: postTelegramTextFromDaemon,
+    onTurnEnd: onDaemonTurnEnd,
+  });
+}
+
+/**
+ * Phase 4 dispatch: hand the message to the registry. Registry handles
+ * spawn-if-needed, debounce, per-topic queue, turn streaming, and crash
+ * recovery. Fire-and-forget — replies flow back via the onText callback,
+ * not via this function's return value.
+ */
+function daemonDispatch(threadIdStr: string, msg: TgMessage): void {
+  const text = msg.text ?? msg.caption ?? "";
+  if (!text) return;
+  if (!daemonRegistry) {
+    process.stderr.write("poller: daemonDispatch called before initDaemonRegistry — initializing on demand\n");
+    initDaemonRegistry();
+  }
+  // Fire typing keepalive + ack reaction in parallel — they're fast Bot API
+  // calls. mcp-telegram clears the typing marker if claude calls send_telegram;
+  // otherwise onDaemonTurnEnd clears it on the result event.
+  void startTypingKeepalive(msg.chat.id, msg.message_thread_id);
+  void reactToMessage(msg.chat.id, msg.message_id);
+
+  daemonRegistry!.enqueue(threadIdStr, text);
+}
+
+/** Public API for cta / Pager IPC — kill the daemon for a topic so the
+ *  user can attach a TUI via `claude --resume <uuid>`. Awaited by callers. */
+export async function releaseDaemonForTerminal(threadId: number | "dm"): Promise<void> {
+  if (!daemonRegistry) return;
+  await daemonRegistry.releaseForTerminal(String(threadId));
+}
+
+/** Public API: re-acquire daemon after user closes their TUI. */
+export async function reacquireDaemonFromTerminal(threadId: number | "dm"): Promise<void> {
+  if (!daemonRegistry) return;
+  await daemonRegistry.reacquireFromTerminal(String(threadId));
 }
 
 // ─── auto-pair via bot invite (Phase 5) ──────────────────────────────────────
@@ -854,6 +1026,133 @@ async function handleCancel(msg: TgMessage): Promise<void> {
   );
 }
 
+// ─── bot-side slash command handlers (stream-json migration Phase 1) ────────
+// Replaces the picker-watcher's screen-scrape relay of /cost, /usage etc.
+// — that approach was fragile across claude TUI version bumps (Format A's
+// `⎿` marker vs Format B's `────` divider). Each of these handlers computes
+// the answer directly from claude's on-disk state instead of parsing pane text.
+
+/**
+ * Resolve the JSONL transcript for the topic that produced this message.
+ * Mirrors topic-wrapper.sh's resolution chain:
+ *   1. Mount → project_path
+ *   2. $STATE_DIR/sessions/<thread_id> → session UUID
+ *   3. ~/.claude/projects/<encoded_cwd>/<uuid>.jsonl
+ * Returns null if no mount or no session UUID is on disk yet (the topic
+ * hasn't started its first claude turn, so there's nothing to bill).
+ */
+function jsonlPathForMount(mount: Mount): string | null {
+  const key = mount.thread_id;
+  const sessFile = join(sessionsDir(), String(key));
+  if (!existsSync(sessFile)) return null;
+  let uuid: string;
+  try {
+    uuid = readFileSync(sessFile, "utf8").trim();
+  } catch { return null; }
+  if (!uuid) return null;
+  return jsonlPathForSession(mount.path, uuid);
+}
+
+async function handleCost(msg: TgMessage): Promise<void> {
+  const thread_id = msg.message_thread_id;
+  const key: number | "dm" = thread_id != null ? thread_id : "dm";
+  const mount = mountsCache.get(tgKey(key));
+  if (!mount) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id },
+      "No mount in this topic — nothing to bill. `/mount <path>` first.",
+    );
+    return;
+  }
+  const jsonl = jsonlPathForMount(mount);
+  if (!jsonl) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id },
+      "Session hasn't started yet — send any message in this topic first, then try `/cost` again.",
+    );
+    return;
+  }
+  const summary = aggregateCostFromJsonl(jsonl);
+  await reply({ chat_id: msg.chat.id, thread_id }, formatCostMessage(summary));
+}
+
+// 60s cache for /usage — Anthropic's Usage API is rate-limited and the
+// number doesn't move that fast. Identical pattern to teleclaw's 60s cache.
+let usageCache: { stats: import("./slash-commands").UsageStats; expires: number } | null = null;
+const USAGE_CACHE_MS = 60_000;
+
+async function handleUsage(msg: TgMessage): Promise<void> {
+  let stats: import("./slash-commands").UsageStats;
+  if (usageCache && usageCache.expires > Date.now()) {
+    stats = usageCache.stats;
+  } else {
+    const token = await resolveCredentialToken();
+    if (!token) {
+      await reply(
+        { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+        "Couldn't find claude code credentials on the host. Make sure you're signed in (`claude /login` on the Mac).",
+      );
+      return;
+    }
+    stats = await fetchUsageStats(token);
+    usageCache = { stats, expires: Date.now() + USAGE_CACHE_MS };
+  }
+  await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, formatUsageMessage(stats));
+}
+
+/**
+ * Kill the topic's tmux session — the wrapper's restart loop (or the
+ * watchdog's kick_dead_topic_sessions) brings up a fresh claude that resumes
+ * from the same session UUID. Different from `/clear`, which also rotates
+ * the UUID for a brand-new conversation.
+ */
+async function handleRestartCmd(msg: TgMessage): Promise<void> {
+  const thread_id = msg.message_thread_id;
+  const key: number | "dm" = thread_id != null ? thread_id : "dm";
+  const mount = mountsCache.get(tgKey(key));
+  if (!mount) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id },
+      "Nothing to restart — no mount in this topic.",
+    );
+    return;
+  }
+  const targetSession = mount.tmux_session ?? `topic-${key}`;
+  spawnSync("tmux", ["kill-session", "-t", targetSession], { encoding: "utf8" });
+  await reply(
+    { chat_id: msg.chat.id, thread_id },
+    "Restarting claude in this topic. First reply may take 5–15s while it cold-starts.",
+  );
+}
+
+/**
+ * Run `cta status` and post its output. The cta CLI knows about every
+ * component (LaunchAgent, poller heartbeat, MCP, watchdog) — this is the
+ * source of truth for "is the bot alive."
+ */
+async function handleStatusCmd(msg: TgMessage): Promise<void> {
+  // cta lives at $HOME/.local/bin/cta in install.sh's layout; allow override
+  // for tests. Plain status (no flags) prints the same checklist Pager menu
+  // bar shows.
+  const ctaPath = process.env.CTA_BIN ?? join(homedir(), ".local/bin/cta");
+  const r = spawnSync(ctaPath, ["status"], { encoding: "utf8", timeout: 5000 });
+  if (r.status !== 0 && !r.stdout) {
+    await reply(
+      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      `Couldn't run cta status: ${(r.stderr ?? "").trim() || `exit ${r.status}`}`,
+    );
+    return;
+  }
+  // cta status uses unicode glyphs (✓/✗) and color escapes; strip ANSI before
+  // sending to Telegram. Cap to 3500 chars (Telegram plain text limit margin).
+  let body = (r.stdout ?? "").replace(/\x1b\[[0-9;]*m/g, "");
+  if (body.length > 3500) body = body.slice(0, 3500) + "\n…(truncated)";
+  await reply(
+    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    `cta status\n${body}`,
+  );
+}
+
 // ─── in-chat commands (Phase 3) ──────────────────────────────────────────────
 // The bot listens for /pair, /mount, /unmount, /list, /help in any message.
 // Pre-pair state: only /pair <code> accepted, from any chat — once it matches
@@ -888,7 +1187,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
     writePairedAtomic(newState);
     pairedCache = newState;
     pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs;
-    killAllTopicSessions();
+    await resetPerTopicStateOnPairSwitch();
     await ensureWildcardMount();
     await reply(
       { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
@@ -931,10 +1230,39 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   );
 }
 
-/** Kill every tmux session named `topic-*`. Used when the paired chat
- * changes so stale mcp-telegram env (chat_id pinned at spawn) gets dropped
- * and the next message re-spawns with the current paired chat_id. */
-function killAllTopicSessions(): void {
+/** Tear down per-topic state when the paired chat changes. Daemons spawned
+ * before the pair switch have the previous chat_id pinned in mcp-telegram's
+ * env; the next message respawns them via the registry's lazy-spawn path,
+ * picking up the new paired.json's chat_id. We also kill any leftover
+ * `topic-*` tmux sessions from a stale pre-Phase-4 install (defensive). */
+async function resetPerTopicStateOnPairSwitch(): Promise<void> {
+  // Snapshot any in-flight queues before shutdown — otherwise a pair switch
+  // mid-conversation silently drops the user's pending text. Map<threadId, []>
+  // captures every non-empty queue across topics; we replay each into the
+  // fresh registry below so respawn picks them up with the new chat_id.
+  const queueSnapshot = new Map<string, string[]>();
+  if (daemonRegistry) {
+    for (const [threadId, queue] of daemonRegistry.snapshotQueues()) {
+      if (queue.length > 0) queueSnapshot.set(threadId, queue);
+    }
+    // Shut down all daemons — they hold the old chat_id in their MCP env.
+    // shutdown() awaits SIGTERM completion so claude releases its session
+    // lock file cleanly before the next message re-spawns it.
+    await daemonRegistry.shutdown();
+    initDaemonRegistry(); // fresh registry, lazy respawn on next enqueue
+    // Replay snapshotted messages into the new registry. Each enqueue arms
+    // the debounce; the first inbound after pair switch combines with any
+    // recovered text. Order within each topic is preserved.
+    if (daemonRegistry !== null) {
+      for (const [threadId, queue] of queueSnapshot) {
+        for (const text of queue) {
+          (daemonRegistry as ClaudeDaemonRegistry).enqueue(threadId, text);
+        }
+      }
+    }
+  }
+  // Belt-and-suspenders: kill any leftover `topic-*` tmux sessions from a
+  // stale pre-Phase-4 install. New code never spawns them.
   const ls = spawnSync("tmux", ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8" });
   if (ls.status !== 0) return; // no tmux server, nothing to kill
   const names = ls.stdout.split("\n").filter((n) => n.startsWith("topic-"));
@@ -942,7 +1270,7 @@ function killAllTopicSessions(): void {
     spawnSync("tmux", ["kill-session", "-t", name], { encoding: "utf8" });
   }
   if (names.length > 0) {
-    process.stdout.write(`[${new Date().toISOString()}] killed ${names.length} topic-* session(s) on pair switch\n`);
+    process.stdout.write(`[${new Date().toISOString()}] killed ${names.length} stale topic-* session(s) on pair switch\n`);
   }
 }
 
@@ -1122,13 +1450,19 @@ async function handleHelp(msg: TgMessage): Promise<void> {
   await reply(
     { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
     [
-      "Commands:",
+      "Mount commands:",
       "  /mount <path>   — bind THIS forum topic to a project dir on the Mac",
       "  /dm <path>      — bind your DM with the bot to a project dir",
       "  /unmount        — remove the mount for THIS topic (or DM)",
       "  /list           — show current mounts",
       "  /unpair confirm — release this chat so another can claim me",
-      "  /help           — this message",
+      "",
+      "Session commands (run on the topic's claude):",
+      "  /cost           — token usage + estimated cost for this session",
+      "  /usage          — Anthropic 5h/7d subscription usage",
+      "  /clear          — reset the conversation (new session UUID)",
+      "  /restart        — restart claude on this topic (keep session)",
+      "  /status         — show bot/daemon health (cta status output)",
       "",
       "Any non-command message is forwarded to the claude session for that mount.",
     ].join("\n"),
@@ -1157,9 +1491,17 @@ type CommandSpec =
   | { disposition: "hidden"; reason: string };
 
 const TUI_COMMANDS: Record<string, CommandSpec> = {
-  "/clear": { disposition: "translated", handler: (m) => handleClear(m) },
+  // ── translated: bot-side handlers ─────────────────────────────────────────
+  // Each computes the answer from claude's on-disk state (JSONL transcript,
+  // keychain credentials, tmux session liveness) instead of screen-scraping
+  // claude TUI output. See agent/poller/slash-commands.ts.
+  "/clear":   { disposition: "translated", handler: (m) => handleClear(m) },
+  "/cost":    { disposition: "translated", handler: (m) => handleCost(m) },
+  "/usage":   { disposition: "translated", handler: (m) => handleUsage(m) },
+  "/restart": { disposition: "translated", handler: (m) => handleRestartCmd(m) },
+  "/status":  { disposition: "translated", handler: (m) => handleStatusCmd(m) },
 
-  "/status":      { disposition: "hidden", reason: "Use `cta status` on your Mac (or the Pager menu bar) for daemon health." },
+  // ── hidden: TUI-only commands with no Telegram analog ─────────────────────
   "/config":      { disposition: "hidden", reason: "Edit `~/.pager/.env` directly, then `cta restart`." },
   "/agents":      { disposition: "hidden", reason: "Project agents live in `.claude/agents/` on disk." },
   "/permissions": { disposition: "hidden", reason: "Bot runs with `--dangerously-skip-permissions`; tools are constrained via `agent/helper-permissions.json`." },
@@ -1352,32 +1694,6 @@ function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): 
   return mount.tmux_session;
 }
 
-/**
- * Re-spawn a tmux topic session for a mount whose previous session has died
- * (claude crashed, operator killed it, OS restarted, etc.). Distinct from
- * autoSpawnFromWildcard because no new mount is created — we already have a
- * persisted mount; we just need the underlying tmux session resurrected.
- *
- * Returns true on success.
- */
-function respawnTopicSession(mount: Mount): boolean {
-  const servicesDir = process.env.MOUNT_STORE_PATH
-    ? join(process.env.MOUNT_STORE_PATH, "..", "..")
-    : installAgentDir();
-  const wrapperPath = join(servicesDir, "topic-wrapper.sh");
-  const cmd = [wrapperPath, String(mount.thread_id), mount.path, mount.tmux_session]
-    .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
-    .join(" ");
-  spawnSync("tmux", ["kill-session", "-t", mount.tmux_session], { encoding: "utf8" });
-  const r = spawnSync("tmux", ["new-session", "-d", "-s", mount.tmux_session, cmd], { encoding: "utf8" });
-  if (r.status !== 0) {
-    process.stderr.write(`poller: respawn tmux failed for ${mount.thread_id}: ${r.stderr}\n`);
-    return false;
-  }
-  process.stdout.write(`[${new Date().toISOString()}] respawned tmux session: ${mount.tmux_session} (thread ${mount.thread_id})\n`);
-  return true;
-}
-
 function routeMessage(msg: TgMessage): string | null {
   const expectedChat = effectiveChatId();
   if (expectedChat == null) {
@@ -1431,53 +1747,55 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
   // are gated by paired user_id inside tryHandleCommand.
   if (await tryHandleCommand(msg)) return;
 
-  let target = routeMessage(msg);
-  if (!target) {
-    // No specific mount, no wildcard. Try the mount-helper before dropping.
-    // Helper is skipped if PAGER_DISABLE_HELPER=1 — falls back to legacy
-    // silent-drop behavior for users who opt out.
-    const text0 = msg.text ?? msg.caption ?? "";
-    if (text0.length === 0) return;
-    const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
-    const helperSession = await spawnHelper(key);
-    if (!helperSession) return; // disabled or spawn failed; original drop
-    // Brief delay for tmux+helper-wrapper to come up before dispatching the
-    // user's original message. Helper claude greets via its system prompt
-    // even if this dispatch loses the text — at worst the user re-types.
-    await new Promise((r) => setTimeout(r, 2000));
-    target = helperSession;
-  }
-
-  const text = msg.text ?? msg.caption ?? "";
-  if (text.length === 0) {
+  const text0 = msg.text ?? msg.caption ?? "";
+  if (text0.length === 0) {
     process.stderr.write(`poller: update ${u.update_id}: empty text/caption, dropping\n`);
     return;
   }
 
-  let r = tmuxDispatch(target, text);
-  if (!r.ok && /can't find pane|session not found|no server running/i.test(r.stderr)) {
-    // Stale mount: the tmux session named in mounts.json has died (claude
-    // crashed, operator killed it, host rebooted between mount-create and
-    // first message). Find the mount and respawn from its persisted path.
-    // One retry — if respawn fails we drop the message and surface the error.
-    const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
-    const mount = mountsCache.get(tgKey(key));
-    if (mount && respawnTopicSession(mount)) {
-      r = tmuxDispatch(target, text);
-    }
-  }
-  if (!r.ok) {
-    process.stderr.write(`poller: update ${u.update_id}: dispatch to ${target} failed: ${r.stderr}\n`);
+  // Resolve which mount this message belongs to. routeMessage handles the
+  // chat/user gating and returns a session name; we also need the Mount
+  // itself for stream-json dispatch. Mount cache and routeMessage share
+  // a lookup by tgKey, so do it once here.
+  const expectedChat = effectiveChatId();
+  if (expectedChat == null || String(msg.chat.id) !== expectedChat) {
+    // routeMessage logs the drop reason. Just call it for the side-effect
+    // of logging, then return.
+    void routeMessage(msg);
     return;
   }
-  process.stdout.write(`[${new Date().toISOString()}] update ${u.update_id} → ${target} (${text.length} chars)\n`);
+  const expectedUser = effectiveUserId();
+  if (expectedUser != null && msg.from?.id !== expectedUser) {
+    void routeMessage(msg);
+    return;
+  }
+  const routeKey: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+  let mount = mountsCache.get(tgKey(routeKey));
+  if (!mount) {
+    // No specific mount — try wildcard auto-spawn (existing behavior).
+    const wildcard = mountsCache.get(tgKey("*"));
+    if (wildcard) {
+      const spawned = autoSpawnFromWildcard(routeKey, wildcard.path);
+      if (spawned) {
+        mount = mountsCache.get(tgKey(routeKey)); // refreshMountsIfChanged ran inside autoSpawn
+      }
+    }
+  }
+  if (!mount) {
+    // Still no mount — try the mount-helper before dropping (existing behavior).
+    const helperSession = await spawnHelper(routeKey);
+    if (!helperSession) return; // disabled or spawn failed
+    await new Promise((r) => setTimeout(r, 2000));
+    mount = mountsCache.get(tgKey(routeKey));
+    if (!mount) return; // helper spawn didn't register a mount; give up
+  }
 
-  // UX signals fired in parallel with claude composing the reply. Fire-and-
-  // forget — if Telegram is slow we'd rather deliver the reply on time than
-  // block on the typing/ack outbound. Errors are logged inside each helper.
-  // The typing keepalive runs until mcp-telegram clears the marker on reply.
-  void startTypingKeepalive(msg.chat.id, msg.message_thread_id);
-  void reactToMessage(msg.chat.id, msg.message_id);
+  // Phase 4: single dispatch path through the ClaudeDaemonRegistry.
+  // The registry owns spawn-if-needed, 2s debounce, per-topic queue, and
+  // crash respawn. Reply text streams back asynchronously via the
+  // postTelegramTextFromDaemon callback wired in initDaemonRegistry().
+  daemonDispatch(String(routeKey), msg);
+  process.stdout.write(`[${new Date().toISOString()}] update ${u.update_id} → daemon[${routeKey}] (${text0.length} chars)\n`);
 }
 
 // ─── main loop ───────────────────────────────────────────────────────────────
@@ -1524,6 +1842,21 @@ async function preflightBotToken(): Promise<void> {
 }
 
 export async function main(): Promise<void> {
+  // Install signal handlers BEFORE any work — if SIGTERM arrives during
+  // preflight/initDaemonRegistry, default node behavior is silent exit,
+  // which would orphan partly-spawned daemons holding session locks.
+  // The handler is null-safe against `daemonRegistry` not being constructed
+  // yet because the void-IIFE checks `if (daemonRegistry)`.
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    process.on(sig, () => {
+      process.stdout.write(`[${new Date().toISOString()}] poller: ${sig} received — shutting down daemons\n`);
+      void (async () => {
+        if (daemonRegistry) await daemonRegistry.shutdown();
+        process.exit(0);
+      })();
+    });
+  }
+
   if (!process.env.TELEGRAM_BOT_TOKEN) {
     process.stderr.write("poller: TELEGRAM_BOT_TOKEN must be set\n");
     process.exit(1);
@@ -1539,8 +1872,10 @@ export async function main(): Promise<void> {
   await gcOrphanedProvisionals();
   refreshPairedIfChanged();
   refreshAckReactionIfChanged();
+  initDaemonRegistry();
+
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
-  process.stdout.write(`[${new Date().toISOString()}] poller starting, offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}, helper=${HELPER_DISABLED ? "disabled" : "enabled"}\n`);
+  process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}, helper=${HELPER_DISABLED ? "disabled" : "enabled"}\n`);
 
   for (;;) {
     touchHeartbeat();

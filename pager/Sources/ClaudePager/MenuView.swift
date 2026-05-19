@@ -47,17 +47,15 @@ struct MenuView: View {
             // window off-screen / behind everything. Promote to .regular so
             // the window can take focus, then activate. We revert to
             // .accessory on window close (see WatchLiveView.onDisappear).
+            //
+            // Watch live now hosts both topic views AND the poller log (as
+            // a synthetic "Poller log" sidebar row). The standalone
+            // "Watch poller log" and "Show recent activity" menu items
+            // were redundant with that and have been removed — keep this
+            // menu compact, route everything through Watch live.
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "watch-live")
-        }
-        Button("Watch poller log") {
-            // Separate item for the dispatch / routing log (poller stdout).
-            // Helpful for diagnosing drops, pair state changes, etc.
-            openTerminal(running: "tmux attach -t poller 2>/dev/null || tail -F \"\(CTAClient.stateDir)/agent.log\"")
-        }
-        Button("Show recent activity") {
-            openTerminal(running: "tail -f \"\(CTAClient.stateDir)/agent.log\"")
         }
         Button("Restart bot") {
             _ = run("/bin/bash", ["-lc", "~/.local/bin/start_agents.sh"])

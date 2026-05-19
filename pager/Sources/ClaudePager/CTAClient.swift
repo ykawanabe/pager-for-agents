@@ -125,6 +125,81 @@ enum CTAClient {
     /// cta directly without re-implementing path resolution.
     static var executablePath: String? { resolvedPath }
 
+    /// Resolve the tmux binary (Pager LaunchAgent runs with a minimal PATH
+    /// that doesn't include Homebrew). Used by resizeTopic and any future
+    /// direct-tmux call. Same candidate ordering pattern as ctaCandidates.
+    private static let resolvedTmuxPath: String? = {
+        let candidates = [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/opt/local/bin/tmux",
+            "/usr/bin/tmux",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
+
+    /// Capture a non-topic tmux session (e.g. "poller", "watchdog") directly
+    /// via tmux, bypassing `cta watch` which only resolves mounted topics.
+    /// Used by WatchLiveView when the user focuses the synthetic "Poller"
+    /// sidebar row — agent.log is the persisted version of this same output,
+    /// but the live tmux pane gives us a single coherent snapshot.
+    ///
+    /// Returns the same WatchResult shape so the VM doesn't need a branch
+    /// at the call site: `.ok(content)` when the session exists, `.sessionDead`
+    /// when it doesn't, `.error` if tmux can't be found.
+    static func watchSystemSession(session: String, lines: Int) -> WatchResult {
+        guard let tmux = resolvedTmuxPath else {
+            return .error("tmux not installed at any known path (Homebrew etc.)")
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: tmux)
+        proc.arguments = ["capture-pane", "-p", "-S", "-\(lines)", "-t", session]
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return .error("failed to spawn tmux: \(error.localizedDescription)")
+        }
+        if proc.terminationStatus != 0 {
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return .sessionDead(stderr: err.isEmpty ? "session '\(session)' not running" : err)
+        }
+        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return .ok(out)
+    }
+
+    /// Resize the topic's tmux pane so claude wraps output to the width
+    /// Pager is currently displaying. Called debounced (400ms) from the
+    /// WatchLiveView GeometryReader to avoid hammering tmux with SIGWINCH
+    /// during a window drag. Best-effort: silent no-op if tmux is missing
+    /// or the session doesn't exist (claude isn't running for this topic).
+    /// Caller should not depend on synchronous completion.
+    static func resizeTopic(thread: String, cols: Int, rows: Int) {
+        guard let tmux = resolvedTmuxPath else { return }
+        // Clamp to a sane range. tmux accepts arbitrary sizes but extreme
+        // values either render garbage (too narrow) or waste CPU on a huge
+        // pane buffer (too wide).
+        let clampedCols = max(40, min(cols, 300))
+        let clampedRows = max(10, min(rows, 100))
+        let session = "topic-\(thread)"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: tmux)
+        proc.arguments = [
+            "resize-window",
+            "-t", session,
+            "-x", String(clampedCols),
+            "-y", String(clampedRows),
+        ]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+    }
+
     /// Run `cta status --json`. Blocking. Caller should be off the main thread.
     static func status() throws -> AgentStatusJSON {
         let raw = try run(args: ["status", "--json"])

@@ -542,19 +542,23 @@ describe("claude built-in interception (post-pair)", () => {
 
   beforeEach(() => { sent.length = 0; });
 
-  test("/status is intercepted with per-command reason, NOT passed to claude", async () => {
+  test("/status runs cta status and posts the result, NOT passed to claude", async () => {
+    // Phase 1 of stream-json migration: /status is now translated (bot-side
+    // handler) rather than hidden — it actually runs `cta status` and posts
+    // the formatted output, instead of telling the user "go run it yourself."
+    // Pointing CTA_BIN at /usr/bin/true gives a fast, deterministic exit-0
+    // with empty stdout — enough to verify the wiring without a real cta.
+    process.env.CTA_BIN = "/usr/bin/true";
     pair({ chat_id: -1001, user_id: 99 });
     const handled = await poller.tryHandleCommand(
       msg({ text: "/status", chat_id: -1001, from_id: 99 }),
     );
     expect(handled).toBe(true);
     expect(sent.length).toBe(1);
-    // P3.10 framework: each hidden command surfaces a per-command reason
-    // (was: a generic "local ui" message that gave no actionable hint).
-    expect(sent[0].text.toLowerCase()).toContain("tui command");
-    expect(sent[0].text).toContain("/status");
-    // /status's specific reason directs the user to `cta status`.
+    // Header line names the underlying command so the user knows what they're
+    // reading.
     expect(sent[0].text).toContain("cta status");
+    delete process.env.CTA_BIN;
   });
 
   test("/model, /agents are intercepted with TUI-only message", async () => {
@@ -724,5 +728,207 @@ describe("/clear (D14 — TUI command translated, not delegated)", () => {
     expect(handled).toBe(true); // consumed so claude doesn't see it
     expect(sent.length).toBe(0); // no reply leak
     expect(readFileSync(sessionFile, "utf8").trim()).toBe("owner-only-uuid"); // unchanged
+  });
+});
+
+// ─── Phase 1: bot-side slash command intercept ──────────────────────────────
+// /cost, /usage, /restart all run server-side instead of relaying claude TUI
+// output via the picker-watcher Format A/B parser (deleted in this phase).
+// See agent/poller/slash-commands.ts for the pure helpers; these tests cover
+// the poller wiring through tryHandleCommand → TUI_COMMANDS["translated"].
+
+describe("/cost (Phase 1 — JSONL token aggregation)", () => {
+  function pair(opts?: { chat_id?: number; user_id?: number }): void {
+    const state: poller.PairedState = {
+      version: 1,
+      chat_id: opts?.chat_id ?? -1001,
+      user_id: opts?.user_id ?? 99,
+      paired_at: new Date().toISOString(),
+    };
+    writeFileSync(PAIRED_STATE_FILE, JSON.stringify(state, null, 2));
+    poller.refreshPairedIfChanged();
+  }
+
+  function seedMount(thread_id: number | "dm", projectPath: string): void {
+    const mount = {
+      channel: "telegram",
+      thread_id,
+      path: projectPath,
+      label: "test",
+      session_id: "test-session-id",
+      tmux_session: typeof thread_id === "number" ? `topic-${thread_id}` : "topic-dm",
+      created_at: new Date().toISOString(),
+    };
+    writeFileSync(MOUNTS_JSON, JSON.stringify({ version: 2, mounts: [mount] }, null, 2));
+    poller.refreshMountsIfChanged();
+  }
+
+  function seedSessionUuid(thread_id: number | "dm", uuid: string): void {
+    const sessDir = join(STATE, "sessions");
+    mkdirSync(sessDir, { recursive: true });
+    writeFileSync(join(sessDir, String(thread_id)), uuid + "\n");
+  }
+
+  /**
+   * Plant a JSONL transcript under a fake $HOME. handleCost resolves the path
+   * via ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl, so we redirect HOME
+   * for the duration of one test.
+   */
+  function seedJsonl(homeDir: string, projectPath: string, uuid: string, entries: unknown[]): void {
+    const encoded = projectPath.replace(/[^a-zA-Z0-9-]/g, "-");
+    const dir = join(homeDir, ".claude/projects", encoded);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${uuid}.jsonl`), entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  }
+
+  beforeEach(() => { sent.length = 0; });
+
+  test("/cost on a mounted topic reports session totals from JSONL", async () => {
+    const tmpHome = join(STATE, "fakehome");
+    mkdirSync(tmpHome, { recursive: true });
+    const origHome = process.env.HOME;
+    process.env.HOME = tmpHome;
+    try {
+      pair({ chat_id: -1001, user_id: 99 });
+      const projectPath = join(STATE, "iron-flow");
+      mkdirSync(projectPath, { recursive: true });
+      seedMount(42, projectPath);
+      seedSessionUuid(42, "uuid-abc");
+      seedJsonl(tmpHome, projectPath, "uuid-abc", [
+        { type: "user", message: { content: "hi" } },
+        {
+          type: "assistant",
+          message: {
+            model: "claude-opus-4-7",
+            usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        },
+      ]);
+
+      const handled = await poller.tryHandleCommand(
+        msg({ text: "/cost", chat_id: -1001, thread_id: 42, from_id: 99 }),
+      );
+      expect(handled).toBe(true);
+      expect(sent.length).toBe(1);
+      expect(sent[0].text).toContain("Session cost");
+      expect(sent[0].text).toContain("claude-opus-4-7");
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
+
+  test("/cost on unmounted topic: friendly hint, no JSONL read", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/cost", chat_id: -1001, thread_id: 9999, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0].text.toLowerCase()).toMatch(/no mount|nothing to bill/);
+  });
+
+  test("/cost before any claude turn (no session UUID): tells user to send a message first", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    seedMount(42, STATE);
+    // no seedSessionUuid → handleCost hits the "session not started" branch
+
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/cost", chat_id: -1001, thread_id: 42, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0].text.toLowerCase()).toContain("send any message");
+  });
+});
+
+describe("/restart (Phase 1)", () => {
+  function pair(opts?: { chat_id?: number; user_id?: number }): void {
+    const state: poller.PairedState = {
+      version: 1,
+      chat_id: opts?.chat_id ?? -1001,
+      user_id: opts?.user_id ?? 99,
+      paired_at: new Date().toISOString(),
+    };
+    writeFileSync(PAIRED_STATE_FILE, JSON.stringify(state, null, 2));
+    poller.refreshPairedIfChanged();
+  }
+
+  beforeEach(() => { sent.length = 0; });
+
+  test("/restart on unmounted topic: friendly hint", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/restart", chat_id: -1001, thread_id: 12345, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0].text.toLowerCase()).toMatch(/no mount|nothing to restart/);
+  });
+
+  test("/restart on mounted topic: acks + (best-effort) kills tmux", async () => {
+    pair({ chat_id: -1001, user_id: 99 });
+    const mount = {
+      channel: "telegram",
+      thread_id: 42,
+      path: STATE,
+      label: "test",
+      session_id: "test-session-id",
+      tmux_session: "topic-42",
+      created_at: new Date().toISOString(),
+    };
+    writeFileSync(MOUNTS_JSON, JSON.stringify({ version: 2, mounts: [mount] }, null, 2));
+    poller.refreshMountsIfChanged();
+
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/restart", chat_id: -1001, thread_id: 42, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.length).toBe(1);
+    // tmux kill-session is no-op when nothing's running, but the ack reply
+    // must always go out so the user knows the command landed.
+    expect(sent[0].text.toLowerCase()).toContain("restart");
+  });
+});
+
+describe("/usage (Phase 1)", () => {
+  function pair(opts?: { chat_id?: number; user_id?: number }): void {
+    const state: poller.PairedState = {
+      version: 1,
+      chat_id: opts?.chat_id ?? -1001,
+      user_id: opts?.user_id ?? 99,
+      paired_at: new Date().toISOString(),
+    };
+    writeFileSync(PAIRED_STATE_FILE, JSON.stringify(state, null, 2));
+    poller.refreshPairedIfChanged();
+  }
+
+  beforeEach(() => { sent.length = 0; });
+
+  test("/usage without credentials: graceful error", async () => {
+    // Redirect HOME to a clean tmpdir so the real ~/.claude/.credentials.json
+    // isn't found; on macOS keychain may still succeed, so we accept either
+    // a "couldn't find credentials" message OR a successful 401-style reply
+    // from a real keychain hit — both prove handleUsage didn't crash.
+    const tmpHome = join(STATE, "fakehome-usage");
+    mkdirSync(tmpHome, { recursive: true });
+    const origHome = process.env.HOME;
+    process.env.HOME = tmpHome;
+    try {
+      pair({ chat_id: -1001, user_id: 99 });
+      const handled = await poller.tryHandleCommand(
+        msg({ text: "/usage", chat_id: -1001, from_id: 99 }),
+      );
+      expect(handled).toBe(true);
+      expect(sent.length).toBe(1);
+      // Either "couldn't find" (no creds) or "Anthropic usage" / "Couldn't fetch"
+      // (creds resolved but API didn't validate) — both prove the handler ran.
+      const text = sent[0].text;
+      const isExpectedShape =
+        text.toLowerCase().includes("couldn't") ||
+        text.includes("Anthropic usage");
+      expect(isExpectedShape).toBe(true);
+    } finally {
+      process.env.HOME = origHome;
+    }
   });
 });

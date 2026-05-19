@@ -39,10 +39,31 @@ final class WatchLiveViewModel: ObservableObject {
     @Published private(set) var paneStatus: PaneStatus = .unknown
     @Published var focusedThreadId: String?
 
+    /// Phase 3: structured message bubbles parsed from the focused topic's
+    /// claude-code JSONL transcript. Replaces the pane snapshot as the
+    /// primary content view in stream-json mode (the bot dispatches via
+    /// `claude -p` subprocess; the tmux pane is just an idle bash). When
+    /// the JSONL isn't available yet (mount has no path, no session UUID,
+    /// pre-stream-json install) this stays empty and the view falls back
+    /// to the legacy pane content.
+    @Published private(set) var messages: [JsonlReader.Message] = []
+
+    /// Per-thread cached content from the last successful capture. Survives
+    /// topic switches: when focus moves to thread X, we immediately restore
+    /// its cached content into paneStatus so the user doesn't see the
+    /// "Loading…" flash before refreshPane runs. Refreshed every time
+    /// refreshPane sees .ok for any thread. In-memory only — clears on VM
+    /// recreation (Pager restart), which is the expected staleness.
+    private var contentCache: [String: String] = [:]
+
     typealias MountsProvider = () async throws -> [CTAClient.MountJSON]
     typealias CaptureProvider = (String) async -> CTAClient.WatchResult
     typealias FocusPersist = (String?) -> Void
     typealias FocusRestore = () -> String?
+    /// Pluggable JSONL provider: given a thread id, return the parsed
+    /// message list (or empty when no transcript exists). Default reads
+    /// from disk via JsonlReader; tests inject a fixture.
+    typealias MessagesProvider = (String) async -> [JsonlReader.Message]
 
     /// Phase B.3: long-running subprocess that streams pane content for one
     /// topic. Returns a cancel closure, or nil if spawn failed (cta path not
@@ -58,6 +79,8 @@ final class WatchLiveViewModel: ObservableObject {
     private let captureProvider: CaptureProvider
     private let streamSpawner: StreamSpawner?
     private let persistFocus: FocusPersist
+    private let messagesProvider: MessagesProvider
+    private var messagesTask: Task<Void, Never>?
     private var lastPreviewByThread: [String: String] = [:]
     private var sidebarTask: Task<Void, Never>?
     private var paneTask: Task<Void, Never>?
@@ -86,6 +109,14 @@ final class WatchLiveViewModel: ObservableObject {
     /// default init closures can read it without crossing actor boundaries.
     nonisolated static let lastFocusedKey = "watchLive.lastFocusedThreadId"
 
+    /// Synthetic thread id for the "Poller log" sidebar row. Underscore
+    /// prefix keeps it from colliding with any real numeric / dm thread.
+    /// captureProvider branches on this to route to the poller tmux session
+    /// directly instead of the topic-X mount path. `nonisolated` because the
+    /// default messagesProvider (a nonisolated closure) needs to compare
+    /// against this constant without crossing actor boundaries.
+    nonisolated static let pollerThreadId = "_poller"
+
     init(
         mountsProvider: @escaping MountsProvider = { try CTAClient.listMounts() },
         // ansi:false → cta watch strips escape codes via tmux capture-pane
@@ -97,8 +128,18 @@ final class WatchLiveViewModel: ObservableObject {
         // 25× cost reduction per poll. Combined with the 2s paneTask
         // interval (was 500ms), the overall watch-live polling cost drops
         // by ~100×.
-        captureProvider: @escaping CaptureProvider = { CTAClient.watch(thread: $0, lines: 20, ansi: false) },
+        // Route the synthetic "_poller" thread id (a non-topic system row in
+        // the sidebar) to a direct tmux capture against the "poller" session.
+        // The regular cta-watch path only resolves mounted topics, so without
+        // this branch the Poller row would forever show as session-dead.
+        captureProvider: @escaping CaptureProvider = { thread in
+            if thread == WatchLiveViewModel.pollerThreadId {
+                return CTAClient.watchSystemSession(session: "poller", lines: 200)
+            }
+            return CTAClient.watch(thread: thread, lines: 200, ansi: false)
+        },
         streamSpawner: StreamSpawner? = WatchLiveViewModel.defaultStreamSpawner,
+        messagesProvider: @escaping MessagesProvider = WatchLiveViewModel.defaultMessagesProvider,
         focusRestore: FocusRestore = {
             UserDefaults.standard.string(forKey: WatchLiveViewModel.lastFocusedKey)
         },
@@ -113,6 +154,7 @@ final class WatchLiveViewModel: ObservableObject {
         self.mountsProvider = mountsProvider
         self.captureProvider = captureProvider
         self.streamSpawner = streamSpawner
+        self.messagesProvider = messagesProvider
         self.persistFocus = focusPersist
         self.focusedThreadId = focusRestore()
     }
@@ -139,6 +181,19 @@ final class WatchLiveViewModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+        // Phase 3: poll the focused topic's JSONL transcript for new
+        // user/assistant turns. 2s cadence matches the pane poll — the
+        // transcript file appends a few lines per turn and the JSONL is
+        // append-only, so re-parsing the whole file is cheap (under 10ms
+        // for a 1000-turn session). Streaming via fs-watcher is a future
+        // optimization; polling is dead-simple and works across renames.
+        messagesTask?.cancel()
+        messagesTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refreshMessages()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
         // Try streaming for whatever's focused now (might be restored from
         // UserDefaults — focus() isn't called again on init).
         attachStreamIfPossible()
@@ -149,15 +204,29 @@ final class WatchLiveViewModel: ObservableObject {
         sidebarTask = nil
         paneTask?.cancel()
         paneTask = nil
+        messagesTask?.cancel()
+        messagesTask = nil
         teardownStream()
     }
 
     func focus(thread: String) {
         if focusedThreadId != thread {
             focusedThreadId = thread
-            paneStatus = .unknown
+            // Restore cached content immediately so the user doesn't see a
+            // "Loading…" flash before refreshPane finishes for the new
+            // thread. .unknown only when we've truly never seen this topic.
+            if let cached = contentCache[thread] {
+                paneStatus = .live(content: cached)
+            } else {
+                paneStatus = .unknown
+            }
+            // Clear stale messages so the user doesn't see the previous
+            // topic's bubbles while refreshMessages catches up. One JSONL
+            // poll cycle (≤2s) repopulates.
+            messages = []
             persistFocus(thread)
             attachStreamIfPossible()
+            Task { await refreshMessages() } // immediate refill, no 2s wait
         }
     }
 
@@ -179,6 +248,12 @@ final class WatchLiveViewModel: ObservableObject {
             let activity: Activity
             switch await captureProvider(key) {
             case .ok(let content):
+                // While we're capturing for the sidebar preview anyway, stash
+                // the full content in the per-topic cache. This warms the
+                // cache for every visible topic every 5s — so by the time
+                // the user clicks a sidebar row, focus() can restore content
+                // immediately without a poll wait.
+                contentCache[key] = content
                 // captureProvider returns content with ANSI codes (ansi:true)
                 // so the main pane can color it. Sidebar previews want plain
                 // text — strip via ANSIParser to stay consistent with the
@@ -200,6 +275,33 @@ final class WatchLiveViewModel: ObservableObject {
                 activity: activity
             ))
         }
+
+        // Synthetic "Poller log" row at the tail of the sidebar. Routes to
+        // the poller tmux session via captureProvider's _poller branch.
+        // Replaces the standalone "Watch poller log" menu item — Watch live
+        // is now the single place to see any session, topic or system.
+        let pollerKey = WatchLiveViewModel.pollerThreadId
+        let pollerPreview: String
+        let pollerActivity: Activity
+        switch await captureProvider(pollerKey) {
+        case .ok(let content):
+            contentCache[pollerKey] = content
+            let plain = ANSIParser.strip(content)
+            let last = WatchLiveViewModel.lastNonEmptyLine(plain)
+            pollerPreview = last
+            let previous = lastPreviewByThread[pollerKey]
+            pollerActivity = (previous != nil && previous != last) ? .live : .idle
+            lastPreviewByThread[pollerKey] = last
+        case .sessionDead, .noMount, .error:
+            pollerPreview = ""
+            pollerActivity = .dead
+        }
+        newRows.append(Row(
+            threadId: pollerKey,
+            label: "Poller log",
+            preview: pollerPreview,
+            activity: pollerActivity
+        ))
 
         rows = newRows
 
@@ -238,10 +340,54 @@ final class WatchLiveViewModel: ObservableObject {
             let plain = ANSIParser.strip(content)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             paneStatus = plain.isEmpty ? .starting : .live(content: content)
+            // Stash the captured content so topic switches can restore it
+            // instantly without waiting for a fresh poll. Empty captures
+            // also get stashed (empty string) so the next focus(thread:)
+            // doesn't think this is a never-seen topic and revert to
+            // .unknown / Loading.
+            contentCache[id] = content
         case .sessionDead(let s): paneStatus = .sessionDead(stderr: s)
         case .noMount(let s): paneStatus = .noMount(stderr: s)
         case .error(let m): paneStatus = .error(m)
         }
+    }
+
+    /// Phase 3 (JSONL view): refresh the message bubble list for the focused
+    /// topic. Synthetic rows like "_poller" don't have a transcript — they
+    /// keep `messages` empty (the view falls back to pane content for them).
+    func refreshMessages() async {
+        guard let id = focusedThreadId else {
+            messages = []
+            return
+        }
+        let next = await messagesProvider(id)
+        // Avoid pointless publishes when content didn't change. Equality is
+        // cheap because Message is value-typed and id-stable.
+        if next.count != messages.count || next != messages {
+            messages = next
+        }
+    }
+
+    /// Default JSONL provider: resolve the focused topic's project_path +
+    /// session UUID from mounts.json / $STATE_DIR/sessions, then read and
+    /// parse the JSONL transcript. Synthetic threads (the "_poller" row)
+    /// return empty so the JSONL section stays hidden for them.
+    nonisolated static let defaultMessagesProvider: MessagesProvider = { threadId in
+        if threadId == WatchLiveViewModel.pollerThreadId { return [] }
+        // Look up the mount → project path. listMounts is sync I/O but
+        // bounded (one file read); call it off-main to keep refreshMessages
+        // non-blocking.
+        let mounts: [CTAClient.MountJSON]
+        do { mounts = try CTAClient.listMounts() } catch { return [] }
+        guard let mount = mounts.first(where: { $0.threadId.stringValue == threadId }) else { return [] }
+        // Session UUID lives at $STATE_DIR/sessions/<thread_id>. topic-wrapper.sh
+        // writes it on first claude launch.
+        let sessFile = "\(CTAClient.stateDir)/sessions/\(threadId)"
+        guard let uuid = try? String(contentsOfFile: sessFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !uuid.isEmpty
+        else { return [] }
+        let path = JsonlReader.transcriptPath(projectPath: mount.path, sessionUuid: uuid)
+        return JsonlReader.parseTranscript(at: path)
     }
 
     // MARK: - Free helpers (static; exposed for testability)
