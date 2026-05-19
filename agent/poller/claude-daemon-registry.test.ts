@@ -121,7 +121,7 @@ describe("ClaudeDaemonRegistry debounce", () => {
     // Slow fake claude takes ~1s per turn. Send msg 1, then msg 2 immediately —
     // msg 2 should NOT be sent to claude until msg 1's turn finishes.
     reg.enqueue("topic-42", "msg one");
-    await waitFor(() => sentToDaemon.length >= 1, 2000);
+    await waitFor(() => sentToDaemon.length >= 1, 5000);
     expect(sentToDaemon[0]).toContain("msg one");
 
     reg.enqueue("topic-42", "msg two");
@@ -129,8 +129,12 @@ describe("ClaudeDaemonRegistry debounce", () => {
     await new Promise((r) => setTimeout(r, 200));
     expect(sentToDaemon.length).toBe(1); // still just msg one
 
-    // Wait for first turn to finish + debounce window for msg 2.
-    await waitFor(() => sentToDaemon.length >= 2, 8000);
+    // Wait for first turn to finish + debounce window for msg 2. Generous
+    // ceiling because the fake-claude-daemon shell fixture spawns python3
+    // for JSON escaping, and python3's cold-start on macOS under load can
+    // stretch each turn well past the "slow"-mode nominal ~1s. Don't
+    // tighten this without understanding the fixture's load envelope.
+    await waitFor(() => sentToDaemon.length >= 2, 15000);
     expect(sentToDaemon[1]).toContain("msg two");
   });
 });

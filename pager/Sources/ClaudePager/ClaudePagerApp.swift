@@ -57,6 +57,14 @@ struct ClaudePagerApp: App {
         }
         .defaultSize(width: 1000, height: 600)
         .windowResizability(.contentMinSize)
+
+        // Setup wizard window. Re-runnable from the menu; auto-shown on
+        // first launch when no plugin .env exists (see init() observer).
+        Window("Pager Setup", id: "setup-wizard") {
+            SetupWizardView()
+        }
+        .defaultSize(width: 600, height: 520)
+        .windowResizability(.contentMinSize)
     }
 
     /// Re-apply the two @AppStorage values to the controller. Cheap; safe to

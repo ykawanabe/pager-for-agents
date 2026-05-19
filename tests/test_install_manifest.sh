@@ -39,6 +39,7 @@ manifest_entries() {
 #   - node_modules / build artifacts
 #   - *.test.ts (unit tests, not shipped)
 #   - .gitignore'd files (bun.lock, etc. — local-only)
+#   - fixtures/ directories (test-only fake binaries)
 filesystem_entries() {
   cd "$SCRIPT_DIR"
   # `git ls-files` lists tracked files only — matches what install.sh
@@ -46,13 +47,14 @@ filesystem_entries() {
   # someone running tests inside a stripped-down archive).
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     # Tracked files only. Excludes MANIFEST.txt itself, *.test.ts (unit
-    # tests don't ship), and per-package .gitignore files (gitignored
-    # children of each bun package — they're tracked for hygiene but not
-    # part of the runtime install).
+    # tests don't ship), per-package .gitignore files (gitignored children
+    # of each bun package — tracked for hygiene but not part of the
+    # runtime install), and fixtures/ directories (test-only shell stubs).
     git ls-files agent/ \
       | grep -v '^agent/MANIFEST\.txt$' \
       | grep -v '\.test\.ts$' \
       | grep -v '/\.gitignore$' \
+      | grep -v '/fixtures/' \
       | sed 's|^agent/||' \
       | sort
   else
@@ -61,6 +63,7 @@ filesystem_entries() {
       ! -name 'MANIFEST.txt' \
       ! -path '*/node_modules/*' \
       ! -path '*/dist/*' \
+      ! -path '*/fixtures/*' \
       ! -name '*.test.ts' \
       ! -name 'bun.lock' \
       | sed 's|^agent/||' \
