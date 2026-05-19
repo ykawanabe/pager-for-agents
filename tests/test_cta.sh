@@ -651,6 +651,39 @@ else
   ng "legacy hardcodes outside cmd_migrate_state: $hc (expected ≤3 — new hardcode? use \$STATE_DIR / \$INSTALL_DIR)"
 fi
 
+# ─── Phase 4 status semantics regression guard ───────────────────────────────
+# In Phase 4 daemon mode the long-lived "always-on" process is the POLLER
+# (bun), not a persistent `claude --channels` process. Status helpers must
+# resolve their liveness against the poller pattern, not v0's claude grep.
+#
+# Source of truth: scripts/check-no-secrets.sh' style — grep the script
+# itself so a refactor that drops the poller pattern breaks this test.
+# Stronger than a behavioral test because there's no good way to mock
+# `ps` and `pgrep` cross-platform without spawning real processes.
+if grep -q 'bun .\*/agent/poller/poller\\.ts\$' "$SCRIPT_DIR/cli/cta"; then
+  ok "Phase 4: _claude_ps_line + _mcp_alive use the anchored poller pattern"
+else
+  ng "Phase 4: poller pattern missing — Pager status flips red between turns"
+fi
+
+# Both helpers must use the SAME anchored pattern. Diverging here would
+# create a "claude.pid found but telegram_mcp false" state that confuses
+# the Pager status pill.
+if [[ $(grep -c 'bun .\*/agent/poller/poller\\.ts\$' "$SCRIPT_DIR/cli/cta") -ge 2 ]]; then
+  ok "Phase 4: claude.pid + telegram_mcp use the same poller-anchored pattern"
+else
+  ng "Phase 4: claude.pid + telegram_mcp diverged — Pager status will flap"
+fi
+
+# heartbeat-poller must be the last_activity source. v0 bot.pid alone
+# doesn't get touched in Phase 4 (the official plugin's heartbeat — daemon
+# mode never starts it), so last_activity would be null forever.
+if grep -q 'heartbeat-poller' "$SCRIPT_DIR/cli/cta"; then
+  ok "Phase 4: _last_activity reads from heartbeat-poller"
+else
+  ng "Phase 4: _last_activity still uses only bot.pid → null in daemon mode"
+fi
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo
