@@ -31,6 +31,16 @@ swift build -c release
 say "Assembling app bundle at $APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 
+# Copy the app icon. AppIcon.icns lives at pager/Resources/ in the repo;
+# Info.plist's CFBundleIconFile (set below) references it by base name.
+# Without this, Finder/Spotlight/About use the generic placeholder icon.
+if [[ -f "$REPO_DIR/Resources/AppIcon.icns" ]]; then
+    cp "$REPO_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+    say "Copied AppIcon.icns into bundle"
+else
+    say "AppIcon.icns missing — bundle will use the macOS default icon"
+fi
+
 # Replace the binary while the old one may still be running.
 #
 # Why no `launchctl unload` here: the previous version of this script called
@@ -85,6 +95,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <dict>
     <key>CFBundleExecutable</key>
     <string>ClaudePager</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundleName</key>
