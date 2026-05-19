@@ -126,8 +126,9 @@ enum CTAClient {
     static var executablePath: String? { resolvedPath }
 
     /// Resolve the tmux binary (Pager LaunchAgent runs with a minimal PATH
-    /// that doesn't include Homebrew). Used by resizeTopic and any future
-    /// direct-tmux call. Same candidate ordering pattern as ctaCandidates.
+    /// that doesn't include Homebrew). Used by watchSystemSession to capture
+    /// the synthetic "Poller" sidebar row's tmux session. Same candidate
+    /// ordering pattern as ctaCandidates.
     private static let resolvedTmuxPath: String? = {
         let candidates = [
             "/opt/homebrew/bin/tmux",
@@ -170,34 +171,6 @@ enum CTAClient {
         }
         let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return .ok(out)
-    }
-
-    /// Resize the topic's tmux pane so claude wraps output to the width
-    /// Pager is currently displaying. Called debounced (400ms) from the
-    /// WatchLiveView GeometryReader to avoid hammering tmux with SIGWINCH
-    /// during a window drag. Best-effort: silent no-op if tmux is missing
-    /// or the session doesn't exist (claude isn't running for this topic).
-    /// Caller should not depend on synchronous completion.
-    static func resizeTopic(thread: String, cols: Int, rows: Int) {
-        guard let tmux = resolvedTmuxPath else { return }
-        // Clamp to a sane range. tmux accepts arbitrary sizes but extreme
-        // values either render garbage (too narrow) or waste CPU on a huge
-        // pane buffer (too wide).
-        let clampedCols = max(40, min(cols, 300))
-        let clampedRows = max(10, min(rows, 100))
-        let session = "topic-\(thread)"
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: tmux)
-        proc.arguments = [
-            "resize-window",
-            "-t", session,
-            "-x", String(clampedCols),
-            "-y", String(clampedRows),
-        ]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        try? proc.run()
-        proc.waitUntilExit()
     }
 
     /// Run `cta status --json`. Blocking. Caller should be off the main thread.
