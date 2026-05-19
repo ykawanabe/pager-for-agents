@@ -86,6 +86,10 @@ final class WatchLiveViewModel: ObservableObject {
     /// .live when the daemon writes new turns. Cheaper + more accurate than
     /// polling `cta watch` (which always returns sessionDead in Phase 4).
     private var lastJsonlMtimeByThread: [String: Date] = [:]
+    /// Last computed preview line for each topic, keyed by thread id. Cached
+    /// so unchanged-mtime sidebar polls skip re-parsing the JSONL — parsing
+    /// every transcript on every 5s tick adds up fast as sessions grow.
+    private var topicPreviewCache: [String: String] = [:]
     private var sidebarTask: Task<Void, Never>?
     private var paneTask: Task<Void, Never>?
     private var streamCancel: (() -> Void)?
@@ -140,7 +144,13 @@ final class WatchLiveViewModel: ObservableObject {
             if thread == WatchLiveViewModel.pollerThreadId {
                 return CTAClient.watchSystemSession(session: "poller", lines: 200)
             }
-            return CTAClient.watch(thread: thread, lines: 200, ansi: false)
+            // Phase 4: per-topic tmux is gone, so `cta watch <thread>` would
+            // just spawn a subprocess only to return sessionDead. Skip the
+            // subprocess; the VM's sidebarActivityForTopic / refreshPane
+            // fallback uses JSONL mtime as the canonical activity source.
+            // Saves ~200-500ms per topic per 5s tick — enough to make the
+            // sidebar feel sluggish at 5+ topics before this change.
+            return .sessionDead(stderr: "phase4-no-tmux")
         },
         streamSpawner: StreamSpawner? = WatchLiveViewModel.defaultStreamSpawner,
         messagesProvider: @escaping MessagesProvider = WatchLiveViewModel.defaultMessagesProvider,
@@ -252,10 +262,10 @@ final class WatchLiveViewModel: ObservableObject {
             let activity: Activity
             switch await captureProvider(key) {
             case .ok(let content):
-                // Legacy capture-pane path. Phase 4 never lands here for
-                // topic rows in production (cta watch always returns
-                // sessionDead), but tests inject .ok content and this kept
-                // the fakes simple. Cache + detect change for activity.
+                // Test seam: production captureProvider returns sessionDead
+                // for topic rows without spawning a subprocess (see init's
+                // default). This .ok path only fires for fixture-driven
+                // tests that inject content directly.
                 contentCache[key] = content
                 let plain = ANSIParser.strip(content)
                 let last = WatchLiveViewModel.lastNonEmptyLine(plain)
@@ -264,10 +274,9 @@ final class WatchLiveViewModel: ObservableObject {
                 activity = (previous != nil && previous != last) ? .live : .idle
                 lastPreviewByThread[key] = last
             case .sessionDead, .noMount, .error:
-                // Phase 4: cta watch returns sessionDead for every topic
-                // because there's no per-topic tmux session. Fall back to
-                // JSONL mtime — that's the daemon's authoritative "did
-                // anything happen?" signal.
+                // Phase 4: no per-topic tmux. JSONL mtime is the activity
+                // source; reading it is cheap (single stat) so it's fine
+                // to run for every sidebar row every tick.
                 (preview, activity) = sidebarActivityForTopic(threadId: key, mountPath: mount.path)
             }
             newRows.append(Row(
@@ -432,16 +441,21 @@ final class WatchLiveViewModel: ObservableObject {
             return ("", .idle)
         }
         let prev = lastJsonlMtimeByThread[threadId]
-        let activity: Activity = (prev != nil && prev != mtime) ? .live : .idle
+        let changed = (prev != nil && prev != mtime)
+        let activity: Activity = changed ? .live : .idle
         lastJsonlMtimeByThread[threadId] = mtime
 
-        // Preview: last non-empty assistant turn, single-lined and truncated.
-        // Reading the full JSONL every sidebar poll is bounded — sessions are
-        // typically <1MB and we do it for ~5-20 rows max.
-        let messages = JsonlReader.parseTranscript(at: path)
-        let lastText = messages.reversed().first(where: { !$0.text.isEmpty })?.text ?? ""
-        let preview = String(lastText.replacingOccurrences(of: "\n", with: " ").prefix(80))
-        return (preview, activity)
+        // Only re-parse the JSONL when mtime changed (or we don't have a
+        // cached preview yet). Sessions grow to hundreds of KB / multi-MB
+        // over time and parsing them every 5s for every row was making the
+        // sidebar refresh visibly slow on busy topics.
+        if changed || topicPreviewCache[threadId] == nil {
+            let messages = JsonlReader.parseTranscript(at: path)
+            let lastText = messages.reversed().first(where: { !$0.text.isEmpty })?.text ?? ""
+            let preview = String(lastText.replacingOccurrences(of: "\n", with: " ").prefix(80))
+            topicPreviewCache[threadId] = preview
+        }
+        return (topicPreviewCache[threadId] ?? "", activity)
     }
 
     // MARK: - Free helpers (static; exposed for testability)
