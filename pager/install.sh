@@ -48,6 +48,36 @@ rm -f "$APP_BUNDLE/Contents/MacOS/ClaudePager"
 cp ".build/release/ClaudePager" "$APP_BUNDLE/Contents/MacOS/ClaudePager"
 chmod +x "$APP_BUNDLE/Contents/MacOS/ClaudePager"
 
+# Bundle tmux so it inherits Pager's Full Disk Access grant. macOS attaches
+# FDA permissions to (binary path, code signature) pairs — a system tmux at
+# /opt/homebrew/bin/tmux gets its own prompts independent of Pager's grant.
+# By copying tmux INSIDE the bundle and codesigning it as part of Pager's
+# ad-hoc identity, the bundled tmux is covered by whatever permissions the
+# user granted to Pager. Result: no "tmux would like to access Documents"
+# prompts on protected project dirs.
+#
+# We resolve via `brew --prefix tmux` (Homebrew) then fall back to whatever
+# `which tmux` finds. The Cellar path is preferred over the /opt/homebrew/bin
+# symlink because we want the actual Mach-O — symlinks aren't useful inside
+# a .app bundle.
+TMUX_SRC=""
+if command -v brew >/dev/null 2>&1; then
+    TMUX_PREFIX=$(brew --prefix tmux 2>/dev/null || true)
+    [[ -n "$TMUX_PREFIX" && -x "$TMUX_PREFIX/bin/tmux" ]] && TMUX_SRC="$TMUX_PREFIX/bin/tmux"
+fi
+if [[ -z "$TMUX_SRC" ]]; then
+    SYSTEM_TMUX=$(command -v tmux 2>/dev/null || true)
+    [[ -n "$SYSTEM_TMUX" && -x "$SYSTEM_TMUX" ]] && TMUX_SRC=$(readlink -f "$SYSTEM_TMUX" 2>/dev/null || echo "$SYSTEM_TMUX")
+fi
+if [[ -n "$TMUX_SRC" ]]; then
+    rm -f "$APP_BUNDLE/Contents/MacOS/tmux"
+    cp "$TMUX_SRC" "$APP_BUNDLE/Contents/MacOS/tmux"
+    chmod +x "$APP_BUNDLE/Contents/MacOS/tmux"
+    say "Bundled tmux from $TMUX_SRC into $APP_BUNDLE/Contents/MacOS/tmux"
+else
+    say "tmux not found via brew/PATH — skipping bundling; system tmux will be used (may prompt for FDA)"
+fi
+
 cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

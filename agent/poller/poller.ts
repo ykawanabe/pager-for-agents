@@ -26,8 +26,42 @@
  * Heartbeat: touches $STATE_DIR/heartbeat-poller every loop
  * iteration so the watchdog can detect a hung poller.
  */
-import { spawnSync } from "node:child_process";
+import { spawnSync as _spawnSync } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+
+/**
+ * Prefer the tmux bundled inside Claude Pager.app. The bundled binary is
+ * codesigned into Pager's ad-hoc identity, so it inherits the user's Full
+ * Disk Access grant — no per-folder permission prompts when claude opens
+ * projects in Documents/Desktop/Downloads. Falls back to Homebrew / system
+ * locations when Pager isn't installed or its tmux is missing.
+ *
+ * Resolved once at module load — tmux install location doesn't move at
+ * runtime. Empty string means "use literal 'tmux' and rely on PATH"
+ * (the legacy behavior).
+ */
+const TMUX_BIN: string = (() => {
+  const home = homedir();
+  const candidates = [
+    `${home}/Applications/Claude Pager.app/Contents/MacOS/tmux`,
+    "/opt/homebrew/bin/tmux",
+    "/usr/local/bin/tmux",
+    "/opt/local/bin/tmux",
+    "/usr/bin/tmux",
+  ];
+  for (const p of candidates) {
+    try { if (existsSync(p)) return p; } catch { /* probe-only */ }
+  }
+  return "tmux";
+})();
+
+/** Wrapper that rewrites a literal "tmux" command into the resolved binary
+ *  path. Spreading the rest of the call signature lets us preserve all
+ *  existing spawnSync options + arg shapes. */
+function spawnSync(cmd: string, args?: readonly string[], options?: Parameters<typeof _spawnSync>[2]): ReturnType<typeof _spawnSync> {
+  const resolved = cmd === "tmux" ? TMUX_BIN : cmd;
+  return _spawnSync(resolved, args as string[], options);
+}
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";

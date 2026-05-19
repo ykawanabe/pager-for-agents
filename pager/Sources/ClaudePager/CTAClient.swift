@@ -127,10 +127,19 @@ enum CTAClient {
 
     /// Resolve the tmux binary (Pager LaunchAgent runs with a minimal PATH
     /// that doesn't include Homebrew). Used by watchSystemSession to capture
-    /// the synthetic "Poller" sidebar row's tmux session. Same candidate
-    /// ordering pattern as ctaCandidates.
+    /// the synthetic "Poller" sidebar row's tmux session.
+    ///
+    /// Prefers the bundled tmux inside Pager.app/Contents/MacOS/tmux first
+    /// — that copy is covered by Pager's Full Disk Access grant (codesigned
+    /// into the same bundle), so it doesn't trigger per-folder permission
+    /// prompts when claude opens a project in Documents/Desktop/Downloads.
+    /// Falls back to Homebrew / standard locations if the bundled tmux is
+    /// missing (e.g. older install before bundling, or `brew --prefix tmux`
+    /// returned empty during install.sh).
     private static let resolvedTmuxPath: String? = {
+        let bundled = Bundle.main.bundlePath + "/Contents/MacOS/tmux"
         let candidates = [
+            bundled,
             "/opt/homebrew/bin/tmux",
             "/usr/local/bin/tmux",
             "/opt/local/bin/tmux",
