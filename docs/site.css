@@ -234,6 +234,13 @@ code {
   text-decoration: none;
 }
 
+.brand-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  display: block;
+}
+
 .mark {
   width: 28px;
   height: 28px;
