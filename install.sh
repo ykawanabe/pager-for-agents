@@ -176,7 +176,9 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   # via ../channels/telegram/adapter; without these copies the installed poller
   # crashes on startup ("Cannot find module").
   cp "$REPO_DIR/agent/channels/types.ts" "$AGENT_DIR/channels/"
-  cp "$REPO_DIR/agent/channels/telegram/adapter.ts" "$AGENT_DIR/channels/telegram/"
+  cp "$REPO_DIR/agent/channels/telegram/adapter.ts" \
+     "$REPO_DIR/agent/channels/telegram/transport.ts" \
+     "$AGENT_DIR/channels/telegram/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
   cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
