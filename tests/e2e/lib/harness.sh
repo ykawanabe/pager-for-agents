@@ -52,7 +52,7 @@ h_setup_sandbox() {
   SCENARIO_DIR=$(mktemp -d "/tmp/e2e-${name}.XXXXXX")
   export CTA_STATE_DIR="$SCENARIO_DIR/state"
   export CTA_INSTALL_DIR="$SCENARIO_DIR/install"
-  mkdir -p "$CTA_STATE_DIR" "$CTA_INSTALL_DIR/agent/poller" "$CTA_INSTALL_DIR/agent/mcp-telegram" "$CTA_INSTALL_DIR/agent/mount-store" "$CTA_INSTALL_DIR/agent/lib"
+  mkdir -p "$CTA_STATE_DIR" "$CTA_INSTALL_DIR/agent/poller" "$CTA_INSTALL_DIR/agent/mcp-telegram" "$CTA_INSTALL_DIR/agent/mount-store" "$CTA_INSTALL_DIR/agent/lib" "$CTA_INSTALL_DIR/agent/channels/telegram"
 
   # Mirror agent sources into the install dir so the poller and friends
   # resolve their helpers under the standard $CTA_INSTALL_DIR layout.
@@ -63,6 +63,10 @@ h_setup_sandbox() {
   cp "$REPO_DIR/agent/poller/slash-commands.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/claude-daemon.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/claude-daemon-registry.ts" "$CTA_INSTALL_DIR/agent/poller/"
+  # Telegram outbound wire adapter (P1 extraction). poller.ts imports it via
+  # ../channels/telegram/adapter — without this copy the sandboxed poller
+  # crashes on startup ("Cannot find module") and never polls.
+  cp "$REPO_DIR/agent/channels/telegram/adapter.ts" "$CTA_INSTALL_DIR/agent/channels/telegram/"
   cp "$REPO_DIR/agent/poller/package.json" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$CTA_INSTALL_DIR/agent/mcp-telegram/"
   cp "$REPO_DIR/agent/mcp-telegram/package.json" "$CTA_INSTALL_DIR/agent/mcp-telegram/"

@@ -44,6 +44,19 @@ import {
 } from "./slash-commands";
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
 import type { ClaudeDaemonOptions } from "./claude-daemon";
+// Telegram outbound wire (Bot API egress), extracted in P1 of the ChatTransport
+// migration. `reply` is the adapter's `sendText` (same signature, 58 call sites
+// unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
+// keepalive, offset — and drives this dumb wire. See ../channels/telegram/adapter.ts.
+import {
+  sendText as reply,
+  setReaction,
+  sendChatAction,
+  editMessageText,
+  sendInlineKeyboard,
+  answerCallback,
+  getApiBase,
+} from "../channels/telegram/adapter";
 
 // Poller-side cache key for Telegram updates. Hardcoded "telegram" because
 // this file is the Telegram adapter; the LINE adapter (when added) will
@@ -77,12 +90,6 @@ const ACCESS_JSON = process.env.ACCESS_JSON ?? join(homedir(), ".claude/channels
 // "<chat_id>/<message_thread_id>" so multi-chat installs don't collide on
 // numeric thread ids.
 const TOPICS_JSON = topicsJson();
-
-function getApiBase(): string {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) throw new Error("TELEGRAM_BOT_TOKEN must be set");
-  return process.env.TELEGRAM_API_BASE ?? `https://api.telegram.org/bot${token}`;
-}
 
 // ─── offset persistence ──────────────────────────────────────────────────────
 
@@ -193,27 +200,6 @@ function effectiveUserId(): number | null {
 // is per-topic and only reachable from claude. The poller needs its own
 // outbound for `/pair`/`/mount` confirmations — no claude in the loop.
 
-async function reply(
-  target: { chat_id: number | string; thread_id?: number },
-  text: string,
-): Promise<void> {
-  const body: Record<string, unknown> = { chat_id: target.chat_id, text };
-  if (target.thread_id != null) body.message_thread_id = target.thread_id;
-  try {
-    const resp = await fetch(`${getApiBase()}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const json = (await resp.json()) as { ok: boolean; description?: string };
-    if (!json.ok) {
-      process.stderr.write(`poller: reply failed: ${json.description ?? "(no description)"}\n`);
-    }
-  } catch (e) {
-    process.stderr.write(`poller: reply fetch failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
-}
-
 // ─── ack reaction (👀) + typing indicator ────────────────────────────────────
 // Two lightweight UX signals fired on every dispatched message:
 //   1. setMessageReaction with a configurable emoji ("seen" signal).
@@ -247,21 +233,11 @@ function refreshAckReactionIfChanged(): void {
 
 async function reactToMessage(chat_id: number, message_id: number): Promise<void> {
   if (!ackReactionCache) return; // toggled off
-  try {
-    await fetch(`${getApiBase()}/setMessageReaction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id,
-        message_id,
-        reaction: [{ type: "emoji", emoji: ackReactionCache }],
-      }),
-    });
-    // Telegram returns ok:false for invalid emojis (free-bot whitelist). Don't
-    // surface — just skip silently; the operator picks emoji via Pager UI.
-  } catch (e) {
-    process.stderr.write(`poller: setMessageReaction failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
+  // Policy lives here (whether to react + which glyph, from access.json); the
+  // wire is the adapter's setReaction. Telegram returns ok:false for invalid
+  // emojis (free-bot whitelist) — the adapter swallows it, the operator picks
+  // a valid glyph via Pager.
+  await setReaction(chat_id, message_id, ackReactionCache);
 }
 
 /**
@@ -287,21 +263,9 @@ const READ_REACTION_EMOJI = "👌";
 
 async function markMessageRead(chat_id: number, message_id: number): Promise<void> {
   if (!ackReactionCache) return; // delivered-ack off → read off too (paired toggle)
-  try {
-    // Bots are limited to ONE reaction per message — replace 👀 with the
-    // read marker (👌) rather than appending. See doc on READ_REACTION_EMOJI.
-    await fetch(`${getApiBase()}/setMessageReaction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id,
-        message_id,
-        reaction: [{ type: "emoji", emoji: READ_REACTION_EMOJI }],
-      }),
-    });
-  } catch (e) {
-    process.stderr.write(`poller: markMessageRead failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
+  // Bots are limited to ONE reaction per message — replace 👀 with the read
+  // marker (👌) rather than appending. See doc on READ_REACTION_EMOJI.
+  await setReaction(chat_id, message_id, READ_REACTION_EMOJI);
 }
 
 /** Per-topic queue of msg refs awaiting the "read" ack. Drained on onFlush. */
@@ -378,18 +342,11 @@ function recordTopicName(chat_id: number, thread_id: number, name: string): void
   }
 }
 
+// Thin wrapper over the adapter's sendChatAction. Kept as a named poller
+// function because it's the typing-keepalive loop's `send` callback and part
+// of the exported test surface (poller.sendTyping).
 async function sendTyping(chat_id: number, thread_id?: number): Promise<void> {
-  const body: Record<string, unknown> = { chat_id, action: "typing" };
-  if (thread_id != null) body.message_thread_id = thread_id;
-  try {
-    await fetch(`${getApiBase()}/sendChatAction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    process.stderr.write(`poller: sendChatAction failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
+  await sendChatAction(chat_id, thread_id);
 }
 
 // Tunables. Defaults: 4s between fires (Telegram clears typing at 5s, so this
@@ -929,64 +886,6 @@ interface TgCallbackQuery {
   from: { id: number; first_name?: string };
   message?: { chat: { id: number }; message_id: number; message_thread_id?: number; text?: string };
   data?: string;
-}
-
-/**
- * Edit a sent message's text in-place. Per Telegram Bot API semantics, omitting
- * reply_markup also drops any inline keyboard attached to the original — so
- * one call covers "append the user's choice + remove the buttons" for a
- * send_telegram(buttons=...) prompt the user just answered. Best-effort: if
- * the edit fails, the worst outcome is a stale button — not a delivery loss.
- */
-async function editMessageText(
-  chat_id: number,
-  message_id: number,
-  text: string,
-): Promise<void> {
-  try {
-    await fetch(`${getApiBase()}/editMessageText`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id, message_id, text }),
-    });
-  } catch (e) {
-    process.stderr.write(`poller: editMessageText failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
-}
-
-async function sendInlineKeyboard(
-  chat_id: number,
-  text: string,
-  buttons: Array<Array<{ text: string; callback_data: string }>>,
-): Promise<{ message_id: number } | null> {
-  try {
-    const resp = await fetch(`${getApiBase()}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id, text, reply_markup: { inline_keyboard: buttons } }),
-    });
-    const json = (await resp.json()) as { ok: boolean; result?: { message_id: number }; description?: string };
-    if (!json.ok) {
-      process.stderr.write(`poller: sendInlineKeyboard failed: ${json.description}\n`);
-      return null;
-    }
-    return json.result ?? null;
-  } catch (e) {
-    process.stderr.write(`poller: sendInlineKeyboard fetch failed: ${e instanceof Error ? e.message : String(e)}\n`);
-    return null;
-  }
-}
-
-async function answerCallback(callback_query_id: string, text?: string, alert?: boolean): Promise<void> {
-  try {
-    await fetch(`${getApiBase()}/answerCallbackQuery`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ callback_query_id, text, show_alert: alert ?? false }),
-    });
-  } catch (e) {
-    process.stderr.write(`poller: answerCallback failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
 }
 
 /**
