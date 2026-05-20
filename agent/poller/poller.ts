@@ -753,6 +753,72 @@ function cleanupStaleReleaseFlags(): void {
   } catch { /* dir missing, nothing to clean */ }
 }
 
+// ─── Watch-live input IPC (Phase 4 daemon mode) ──────────────────────────────
+// Pager's "Watch live" input field and `cta send` deliver text into a topic by
+// dropping a file into $STATE_DIR/inject/. In Phase 4 the daemon's stdin is
+// owned by this poller (there's no per-topic tmux session to paste into
+// anymore — the old `cta send` tmux path is dead), so an external caller can't
+// reach the daemon directly; it hands off through this drop-dir instead.
+//
+// Filename: `<thread_id>__<nonce>.txt` (thread_id is "dm" or numeric — never
+// contains "__"). cta writes atomically (`.tmp` then rename) so we never read a
+// partial file. We delete each file BEFORE enqueueing so a crash drops rather
+// than re-injects (same durability stance as the getUpdates offset).
+//
+// Latency: an fs.watch fires processing instantly even while the getUpdates
+// long-poll is blocked; the per-tick poll in the main loop is the fallback in
+// case a watch event is missed.
+const INJECT_DIR = join(STATE_DIR, "inject");
+
+function ensureInjectDir(): void {
+  try { mkdirSync(INJECT_DIR, { recursive: true, mode: 0o700 }); } catch { /* best effort */ }
+}
+
+let injectProcessing = false;
+async function processInjectFlags(): Promise<void> {
+  if (!daemonRegistry) return;
+  if (injectProcessing) return; // re-entrancy guard (watch + loop can overlap)
+  injectProcessing = true;
+  try {
+    const fs = require("node:fs");
+    let names: string[];
+    try {
+      names = (fs.readdirSync(INJECT_DIR) as string[])
+        .filter((n) => n.endsWith(".txt"))
+        .sort(); // ts-prefixed nonce → rough FIFO ordering
+    } catch {
+      return; // dir missing; ensured on startup
+    }
+    for (const name of names) {
+      const full = join(INJECT_DIR, name);
+      const sep = name.indexOf("__");
+      if (sep <= 0) { try { fs.unlinkSync(full); } catch { /* */ } continue; }
+      const threadId = name.slice(0, sep);
+      let text: string;
+      try { text = fs.readFileSync(full, "utf8"); } catch { continue; }
+      try { fs.unlinkSync(full); } catch { /* */ } // delete before enqueue
+      const trimmed = text.replace(/\s+$/, "");
+      if (!trimmed) continue;
+      daemonRegistry.enqueue(threadId, trimmed);
+      process.stdout.write(`[${new Date().toISOString()}] inject: thread ${threadId} (${trimmed.length} chars)\n`);
+    }
+  } finally {
+    injectProcessing = false;
+  }
+}
+
+let injectWatcher: { close(): void } | null = null;
+function startInjectWatcher(): void {
+  if (injectWatcher) return;
+  try {
+    injectWatcher = require("node:fs").watch(INJECT_DIR, () => { void processInjectFlags(); });
+  } catch (e) {
+    // fs.watch unsupported on this filesystem — the per-tick loop poll still
+    // drains the dir, just at long-poll cadence instead of instantly.
+    process.stderr.write(`poller: inject fs.watch unavailable (${e instanceof Error ? e.message : String(e)}); using loop-poll fallback\n`);
+  }
+}
+
 // ─── auto-pair via bot invite (Phase 5) ──────────────────────────────────────
 // Replaces "user must type /pair <code>" with "bot detects when it's added
 // to a chat, sends an inline-keyboard prompt asking the inviter to confirm".
@@ -2056,6 +2122,7 @@ export async function main(): Promise<void> {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   ensureReleaseFlagDir();
   cleanupStaleReleaseFlags();
+  ensureInjectDir();
   await preflightBotToken();
   let offset = readOffset();
   refreshMountsIfChanged();
@@ -2067,6 +2134,8 @@ export async function main(): Promise<void> {
   refreshPairedIfChanged();
   refreshAckReactionIfChanged();
   initDaemonRegistry();
+  startInjectWatcher();
+  await processInjectFlags(); // drain anything dropped before this poller started
 
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
   process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}, helper=${HELPER_DISABLED ? "disabled" : "enabled"}\n`);
@@ -2080,6 +2149,8 @@ export async function main(): Promise<void> {
     // `cta release-daemon` / Pager. Cheap when the dir is empty (steady
     // state — nobody clicks "Open in Terminal" most of the time).
     await processReleaseFlags();
+    // Watch-live input: drain any inject files (fallback to the fs.watch path).
+    await processInjectFlags();
     let updates: TgUpdate[];
     try {
       updates = await getUpdates(offset);
