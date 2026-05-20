@@ -608,6 +608,10 @@ function initDaemonRegistry(): void {
   if (daemonRegistry) return;
   daemonRegistry = new ClaudeDaemonRegistry({
     debounceMs: Number(process.env.PAGER_DAEMON_DEBOUNCE_MS ?? "2000"),
+    // Test seam: e2e scenarios point this at fixtures/fake-claude-daemon.sh so
+    // a turn can run without spawning real `claude`. Unset in production →
+    // registry defaults to "claude".
+    claudeBin: process.env.PAGER_CLAUDE_BIN || undefined,
     daemonOptsFor: buildDaemonOpts,
     onText: postTelegramTextFromDaemon,
     onFlush: onDaemonFlush,
