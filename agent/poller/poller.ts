@@ -2247,6 +2247,21 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
 
 // ─── main loop ───────────────────────────────────────────────────────────────
 
+/** fetch with a hard client-side timeout. Telegram long-poll only sets a
+ *  SERVER-side timeout; without a client abort, a half-open/stalled TCP
+ *  connection (Wi-Fi flap, NAT drop) makes `await fetch` hang forever and
+ *  wedges the poll loop — alive but stuck, heartbeat frozen. AbortController
+ *  bounds it so the call throws and the loop's retry path recovers. */
+export async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestInit): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getUpdates(offset: number): Promise<TgUpdate[]> {
   // Default getUpdates does NOT include my_chat_member or callback_query.
   // Pass allowed_updates explicitly so the auto-pair flow can fire. Telegram
@@ -2256,7 +2271,9 @@ async function getUpdates(offset: number): Promise<TgUpdate[]> {
     "message", "edited_message", "my_chat_member", "callback_query",
   ]));
   const url = `${getApiBase()}/getUpdates?timeout=${POLL_TIMEOUT_SEC}&offset=${offset}&allowed_updates=${allowed}`;
-  const resp = await fetch(url);
+  // Client timeout = server long-poll window + 15s slack. A stalled connection
+  // aborts here instead of hanging the loop forever.
+  const resp = await fetchWithTimeout(url, (POLL_TIMEOUT_SEC + 15) * 1000);
   const json = (await resp.json()) as TgResp;
   if (!json.ok) {
     throw new Error(`getUpdates: ${json.description ?? "(no description)"}`);
@@ -2273,7 +2290,7 @@ async function getUpdates(offset: number): Promise<TgUpdate[]> {
  */
 async function preflightBotToken(): Promise<void> {
   try {
-    const resp = await fetch(`${getApiBase()}/getMe`);
+    const resp = await fetchWithTimeout(`${getApiBase()}/getMe`, 15_000);
     const json = (await resp.json()) as { ok: boolean; result?: { id?: number; username?: string }; description?: string };
     if (!json.ok) {
       process.stderr.write(`poller: bot token rejected by Bot API: ${json.description ?? "(no description)"}\n`);
