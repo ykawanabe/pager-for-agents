@@ -34,6 +34,7 @@ poller/slash-commands.ts	agent	644
 # contract + per-platform wire adapters.
 channels/types.ts	agent	644
 channels/telegram/adapter.ts	agent	644
+channels/telegram/transport.ts	agent	644
 
 # Outbound MCP server
 mcp-telegram/server.ts	agent	644
