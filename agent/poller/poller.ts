@@ -1128,6 +1128,40 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
     return;
   }
 
+  // P6a: mount-choice button (`mnt:<thread>:<idx>`) — link the topic to the
+  // chosen project dir, then prompt the user to resend. Replaces the tmux
+  // mount-helper. Index references the deterministic mountCandidates() list.
+  if (cb.data.startsWith("mnt:")) {
+    if (!pairedCache || cb.from.id !== pairedCache.user_id) {
+      await answerCallback(cb.id, "Only the paired user can answer.", true);
+      return;
+    }
+    if (!cb.message) { await answerCallback(cb.id); return; }
+    const rest = cb.data.slice(4);
+    const ci = rest.indexOf(":");
+    if (ci < 0) { await answerCallback(cb.id); return; }
+    const tidStr = rest.slice(0, ci);
+    const idx = Number(rest.slice(ci + 1));
+    const thread_id_raw = tidStr === "dm" ? undefined : Number(tidStr);
+    const dir = mountCandidates()[idx];
+    if (!dir) {
+      await answerCallback(cb.id, "That option expired — send /mount <path>.", true);
+      return;
+    }
+    await answerCallback(cb.id);
+    try {
+      await addMount({ thread_id: tidStr === "dm" ? "dm" : Number(tidStr), path: dir, label: mountBasename(dir) });
+      refreshMountsIfChanged();
+    } catch (e) {
+      await reply({ chat_id: cb.message.chat.id, thread_id: thread_id_raw }, `Couldn't link: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    const original = cb.message.text ?? "";
+    void editMessageText(cb.message.chat.id, cb.message.message_id, `${original}\n\n↳ linked to ${dir}`);
+    await reply({ chat_id: cb.message.chat.id, thread_id: thread_id_raw }, `Linked this topic to ${dir}. Send your message again and I'll start the session.`);
+    return;
+  }
+
   // Pending pair expired or never set → tell the user and ack the callback.
   if (!pendingPair || pendingPair.expires_at < Date.now()) {
     pendingPair = null;
@@ -2109,6 +2143,34 @@ function routeMessage(msg: TgMessage): string | null {
   return null;
 }
 
+// P6a: when a topic has no mount (and no wildcard), the poller offers a
+// buttons prompt of known project dirs instead of spawning an interactive
+// tmux mount-helper. No claude/helper daemon, no chicken-and-egg.
+function mountBasename(p: string): string {
+  return p.replace(/\/+$/, "").split("/").pop() || p;
+}
+/** Deterministic candidate dir list (re-derived identically on the callback,
+ *  so callback_data can index into it). Distinct existing mount paths + the
+ *  default CLAUDE_CWD, capped for a tidy keyboard. */
+function mountCandidates(): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const add = (p?: string) => { if (p && !seen.has(p)) { seen.add(p); out.push(p); } };
+  for (const m of mountsCache.values()) add(m.path);
+  add(process.env.CLAUDE_CWD);
+  return out.slice(0, 6);
+}
+async function promptMountChoice(thread_id: number | "dm", chat_id: number, threadIdRaw: number | undefined): Promise<void> {
+  const cands = mountCandidates();
+  const tid = String(thread_id);
+  if (cands.length === 0) {
+    await reply({ chat_id, thread_id: threadIdRaw }, "This topic isn't linked to a project yet. Send `/mount <path>` (e.g. `/mount ~/projects/foo`), or set it in Pager.");
+    return;
+  }
+  const buttons = cands.map((p, i) => [{ text: mountBasename(p), callback_data: `mnt:${tid}:${i}` }]);
+  await sendInlineKeyboard(chat_id, "This topic isn't linked to a project yet. Pick one, or send `/mount <path>`:", buttons);
+}
+
 async function dispatchUpdate(u: TgUpdate): Promise<void> {
   // Auto-pair flow events first — neither requires a paired chat to exist.
   if (u.my_chat_member) { await handleMyChatMember(u.my_chat_member); return; }
@@ -2168,12 +2230,11 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
     }
   }
   if (!mount) {
-    // Still no mount — try the mount-helper before dropping (existing behavior).
-    const helperSession = await spawnHelper(routeKey);
-    if (!helperSession) return; // disabled or spawn failed
-    await new Promise((r) => setTimeout(r, 2000));
-    mount = mountsCache.get(tgKey(routeKey));
-    if (!mount) return; // helper spawn didn't register a mount; give up
+    // P6a: no mount and no wildcard — offer a buttons prompt of known project
+    // dirs (poller-only) instead of spawning the interactive tmux mount-helper.
+    // The user taps a dir (or sends /mount), then resends their message.
+    await promptMountChoice(routeKey, msg.chat.id, msg.message_thread_id);
+    return;
   }
 
   // Phase 4: single dispatch path through the ClaudeDaemonRegistry.
