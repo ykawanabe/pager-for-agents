@@ -17,6 +17,8 @@ final class WatchLiveViewModelTests: XCTestCase {
         // accidentally invoke the production provider (which would shell
         // out to `cta list`).
         messages: @escaping WatchLiveViewModel.MessagesProvider = { _ in [] },
+        // No-op so tests don't read the real typing marker off disk.
+        generating: @escaping WatchLiveViewModel.GeneratingProvider = { _ in false },
         restoredFocus: String? = nil
     ) -> WatchLiveViewModel {
         WatchLiveViewModel(
@@ -24,6 +26,7 @@ final class WatchLiveViewModelTests: XCTestCase {
             captureProvider: capture,
             streamSpawner: streamSpawner,
             messagesProvider: messages,
+            generatingProvider: generating,
             focusRestore: { restoredFocus },
             focusPersist: { _ in }
         )
@@ -467,6 +470,24 @@ final class WatchLiveViewModelTests: XCTestCase {
         box.empty = true
         await vm.refreshMessages()
         XCTAssertEqual(vm.messages.count, 1, "transient empty read must not clear messages")
+    }
+
+    func test_isGenerating_reflectsProvider_andClearsOnNoFocus() async {
+        final class Box { var gen = true }
+        let box = Box()
+        let vm = makeVM(
+            mounts: { [] },
+            capture: { _ in .ok("") },
+            messages: { _ in [] },
+            generating: { _ in box.gen },
+            restoredFocus: "42"
+        )
+        await vm.refreshMessages()
+        XCTAssertTrue(vm.isGenerating, "should reflect provider=true for focused topic")
+
+        box.gen = false
+        await vm.refreshMessages()
+        XCTAssertFalse(vm.isGenerating, "should clear when provider=false")
     }
 
     func test_refreshMessages_emptyWhenNoFocus() async {

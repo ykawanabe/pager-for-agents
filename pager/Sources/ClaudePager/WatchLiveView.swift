@@ -209,23 +209,57 @@ struct WatchLiveView: View {
     /// roleColored chat bubble. Scrolls to the last message on append.
     /// Shows an empty-state hint when the topic hasn't generated any turns
     /// yet (no JSONL transcript yet — daemon hasn't been engaged).
+    /// Bottom "Claude is working…" row — a typing-indicator analog so the user
+    /// sees progress while the daemon generates (the JSONL only gains the
+    /// assistant turn once it completes).
+    @ViewBuilder
+    private var workingIndicator: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Claude is working…")
+                .font(.system(size: 12))
+                .italic()
+                .foregroundColor(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+    }
+
     @ViewBuilder
     private var messagesPane: some View {
         if vm.messages.isEmpty {
-            VStack(spacing: 12) {
-                Image(systemName: "bubble.left.and.bubble.right")
-                    .font(.system(size: 36))
-                    .foregroundColor(.secondary)
-                Text("No messages yet")
-                    .font(.headline)
-                Text("Send a message in Telegram (or use the input below) to start a claude session for this topic. The first reply takes 5–15s while the daemon cold-starts.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 400)
+            if vm.isGenerating {
+                // First turn cold-starting — show progress instead of the
+                // "No messages yet" empty state.
+                VStack(spacing: 12) {
+                    ProgressView().controlSize(.regular)
+                    Text("Claude is working…")
+                        .font(.headline)
+                    Text("Cold-starting the daemon and generating the first reply (5–15s).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 400)
+                }
+                .padding()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 36))
+                        .foregroundColor(.secondary)
+                    Text("No messages yet")
+                        .font(.headline)
+                    Text("Send a message in Telegram (or use the input below) to start a claude session for this topic. The first reply takes 5–15s while the daemon cold-starts.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 400)
+                }
+                .padding()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .padding()
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -233,6 +267,10 @@ struct WatchLiveView: View {
                         ForEach(vm.messages) { msg in
                             messageBubble(msg)
                                 .id(msg.id)
+                        }
+                        if vm.isGenerating {
+                            workingIndicator
+                                .id("watch-live-working")
                         }
                     }
                     .padding(12)
@@ -246,6 +284,9 @@ struct WatchLiveView: View {
                 .onChange(of: vm.messages.count) { oldCount, newCount in
                     guard newCount > oldCount, let last = vm.messages.last?.id else { return }
                     proxy.scrollTo(last, anchor: .bottom)
+                }
+                .onChange(of: vm.isGenerating) { _, gen in
+                    if gen { proxy.scrollTo("watch-live-working", anchor: .bottom) }
                 }
                 .onAppear {
                     if let last = vm.messages.last?.id {
