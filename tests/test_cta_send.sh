@@ -1,11 +1,12 @@
 #!/bin/bash
 # Tests for `cta send <thread> <text>` (watch-live plan, Phase C.1).
 #
-# Delivers text into a topic's tmux pane via load-buffer + paste-buffer +
-# send-keys Enter (same dispatch primitive the poller uses — D3 fix
-# applies here too: per-call named buffer eliminates inter-process races).
+# Phase 4 (daemon mode): topics are claude daemons, not tmux sessions. `cta
+# send` drops an atomic file into $STATE_DIR/inject/<thread_id>__<nonce>.txt
+# which the poller watches and enqueues into the topic's daemon. This test
+# verifies the drop behavior (the poller side is covered by poller tests).
 #
-# Exit codes mirror cta watch: 0=delivered, 1=no mount/usage, 2=tmux dead.
+# Exit codes: 0=queued, 1=no mount/usage/write-failure.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,21 +21,13 @@ STATE=$(mktemp -d)
 TMP_PROJECT=$(mktemp -d)
 export CTA_STATE_DIR="$STATE"
 export CTA_AGENT_DIR="$SCRIPT_DIR/agent"
-
-mkdir -p "$STATE/tmux-$(id -u)"
-chmod 700 "$STATE/tmux-$(id -u)"
+INJECT="$STATE/inject"
 
 cta() {
-  TMUX_TMPDIR="$STATE" env -u TMUX -u TMUX_PANE "$CTA" "$@"
-}
-tmux_test() {
-  TMUX_TMPDIR="$STATE" env -u TMUX -u TMUX_PANE "$(command -v tmux)" "$@"
+  env -u TMUX -u TMUX_PANE "$CTA" "$@"
 }
 
-cleanup() {
-  tmux_test kill-server 2>/dev/null || true
-  rm -rf "$STATE" "$TMP_PROJECT"
-}
+cleanup() { rm -rf "$STATE" "$TMP_PROJECT"; }
 trap cleanup EXIT
 
 # ─── No mount → exit 1 ─────────────────────────────────────────────────────
@@ -49,60 +42,57 @@ else
   ng "cta send (no mount): exit 1 (rc=$RC, out='$OUT')"
 fi
 
-# ─── Mount but no tmux → exit 2 ────────────────────────────────────────────
+# ─── Mount + send → exit 0, inject file dropped with content ───────────────
 
 cta mount 42 "$TMP_PROJECT" iron-flow >/dev/null 2>&1
 set +e
-OUT=$(cta send 42 "hello" 2>&1)
-RC=$?
-set -e
-if [[ "$RC" -eq 2 ]]; then
-  ok "cta send (dead tmux): exit 2"
-else
-  ng "cta send (dead tmux): exit 2 (rc=$RC, out='$OUT')"
-fi
-
-# ─── Happy path: delivers text + Enter ─────────────────────────────────────
-
-# Spawn a tmux session backed by `cat` so anything pasted + Enter is
-# echoed to the pane.
-tmux_test new-session -d -s topic-42 cat
-
 OUT=$(cta send 42 "WATCH_SEND_TEST_ABC" 2>&1)
 RC=$?
-sleep 0.2  # paste→echo
-
-PANE=$(tmux_test capture-pane -p -t topic-42 2>&1)
-if [[ "$RC" -eq 0 ]] && echo "$PANE" | grep -q "WATCH_SEND_TEST_ABC"; then
-  ok "cta send: delivers text to pane (visible via capture-pane)"
+set -e
+f=$(ls "$INJECT"/42__*.txt 2>/dev/null | head -1)
+if [[ "$RC" -eq 0 && -n "$f" ]] && [[ "$(cat "$f")" == "WATCH_SEND_TEST_ABC" ]]; then
+  ok "cta send: exit 0 + inject file with exact content"
 else
-  ng "cta send: text not delivered (rc=$RC, pane='$PANE')"
+  ng "cta send: drop failed (rc=$RC, file='$f', out='$OUT')"
 fi
 
-# ─── Multiline content survives paste-buffer ──────────────────────────────
+# ─── No stray .tmp left behind (atomic publish) ────────────────────────────
+
+if ! ls "$INJECT"/.*.tmp >/dev/null 2>&1; then
+  ok "cta send: no leftover .tmp (atomic rename)"
+else
+  ng "cta send: leftover .tmp found"
+fi
+
+# ─── Multiline content preserved verbatim ──────────────────────────────────
 
 cta send 42 $'first-line-XYZ\nsecond-line-XYZ' >/dev/null 2>&1
-sleep 0.2
-
-PANE=$(tmux_test capture-pane -p -t topic-42 2>&1)
-if echo "$PANE" | grep -q "first-line-XYZ" && echo "$PANE" | grep -q "second-line-XYZ"; then
-  ok "cta send: multiline content delivered intact"
+# newest 42__*.txt
+f=$(ls -t "$INJECT"/42__*.txt 2>/dev/null | head -1)
+if [[ -n "$f" ]] && grep -q "first-line-XYZ" "$f" && grep -q "second-line-XYZ" "$f"; then
+  ok "cta send: multiline content preserved"
 else
-  ng "cta send: multiline delivery (pane='$PANE')"
+  ng "cta send: multiline (file='$f')"
 fi
 
-# ─── DM key ────────────────────────────────────────────────────────────────
+# ─── DM key → dm__*.txt ─────────────────────────────────────────────────────
 
 cta mount dm "$TMP_PROJECT" general >/dev/null 2>&1
-tmux_test new-session -d -s topic-dm cat
-
 cta send dm "DM_SEND_TEST_LINE" >/dev/null 2>&1
-sleep 0.2
-PANE=$(tmux_test capture-pane -p -t topic-dm 2>&1)
-if echo "$PANE" | grep -q "DM_SEND_TEST_LINE"; then
-  ok "cta send dm: works for DM key"
+f=$(ls "$INJECT"/dm__*.txt 2>/dev/null | head -1)
+if [[ -n "$f" ]] && [[ "$(cat "$f")" == "DM_SEND_TEST_LINE" ]]; then
+  ok "cta send dm: drops dm__*.txt with content"
 else
-  ng "cta send dm: works (pane='$PANE')"
+  ng "cta send dm: drop (file='$f')"
+fi
+
+# ─── inject dir is private (0700) ──────────────────────────────────────────
+
+mode=$(stat -f '%Lp' "$INJECT" 2>/dev/null || stat -c '%a' "$INJECT" 2>/dev/null)
+if [[ "$mode" == "700" ]]; then
+  ok "cta send: inject dir is mode 700"
+else
+  ng "cta send: inject dir mode (got '$mode')"
 fi
 
 # ─── Missing args → usage ─────────────────────────────────────────────────
