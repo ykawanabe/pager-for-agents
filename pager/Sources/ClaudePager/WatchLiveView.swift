@@ -14,12 +14,23 @@ import AppKit
 /// operator UI: show what's happening, push messages via `cta send`, and
 /// delegate true terminal interaction to Terminal.app when the user wants
 /// to actually drive claude's TUI.
+/// Reports the message list's bottom edge position within the scroll viewport
+/// so we can tell whether the user is scrolled near the bottom.
+private struct BottomEdgeKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
 struct WatchLiveView: View {
     @StateObject private var vm = WatchLiveViewModel()
     @State private var inputText: String = ""
     @State private var sendInFlight: Bool = false
     @State private var sendError: String?
     @State private var launchError: String?
+    /// Whether the message list is scrolled at/near the bottom. Auto-scroll on
+    /// new content only fires when true, so a user reading history isn't yanked
+    /// down. Starts true (fresh view shows the latest).
+    @State private var atBottom: Bool = true
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -261,36 +272,54 @@ struct WatchLiveView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(vm.messages) { msg in
-                            messageBubble(msg)
-                                .id(msg.id)
+            GeometryReader { outer in
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            ForEach(vm.messages) { msg in
+                                messageBubble(msg)
+                                    .id(msg.id)
+                            }
+                            if vm.isGenerating {
+                                workingIndicator
+                                    .id("watch-live-working")
+                            }
+                            // Zero-height probe at the very bottom. Its maxY in
+                            // the scroll's coordinate space tells us how far the
+                            // content bottom sits below the viewport bottom:
+                            // ~viewport height when scrolled to bottom, larger
+                            // when the user has scrolled up.
+                            Color.clear
+                                .frame(height: 1)
+                                .background(GeometryReader { g in
+                                    Color.clear.preference(
+                                        key: BottomEdgeKey.self,
+                                        value: g.frame(in: .named("msgScroll")).maxY
+                                    )
+                                })
+                                .id("watch-live-bottom")
                         }
-                        if vm.isGenerating {
-                            workingIndicator
-                                .id("watch-live-working")
-                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-                // Auto-scroll only when a NEW bubble is appended (count grows),
-                // not on every re-publish of the array. refreshMessages re-emits
-                // the whole list each poll; keying the scroll on count avoids
-                // yanking the view to the bottom while the user is reading
-                // history (a re-publish with the same count = no scroll).
-                .onChange(of: vm.messages.count) { oldCount, newCount in
-                    guard newCount > oldCount, let last = vm.messages.last?.id else { return }
-                    proxy.scrollTo(last, anchor: .bottom)
-                }
-                .onChange(of: vm.isGenerating) { _, gen in
-                    if gen { proxy.scrollTo("watch-live-working", anchor: .bottom) }
-                }
-                .onAppear {
-                    if let last = vm.messages.last?.id {
-                        proxy.scrollTo(last, anchor: .bottom)
+                    .coordinateSpace(name: "msgScroll")
+                    .onPreferenceChange(BottomEdgeKey.self) { bottomY in
+                        // Within 80pt of the viewport bottom = "at bottom".
+                        atBottom = (bottomY - outer.size.height) < 80
+                    }
+                    // Auto-scroll on a NEW bubble (count grows) — but only when
+                    // the user is already at the bottom, so reading history
+                    // isn't interrupted. Re-publishes with the same count never
+                    // scroll.
+                    .onChange(of: vm.messages.count) { oldCount, newCount in
+                        guard newCount > oldCount, atBottom else { return }
+                        proxy.scrollTo("watch-live-bottom", anchor: .bottom)
+                    }
+                    .onChange(of: vm.isGenerating) { _, gen in
+                        if gen, atBottom { proxy.scrollTo("watch-live-bottom", anchor: .bottom) }
+                    }
+                    .onAppear {
+                        proxy.scrollTo("watch-live-bottom", anchor: .bottom)
                     }
                 }
             }
