@@ -63,10 +63,14 @@ h_setup_sandbox() {
   cp "$REPO_DIR/agent/poller/slash-commands.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/claude-daemon.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/claude-daemon-registry.ts" "$CTA_INSTALL_DIR/agent/poller/"
-  # Telegram outbound wire adapter (P1 extraction). poller.ts imports it via
-  # ../channels/telegram/adapter — without this copy the sandboxed poller
-  # crashes on startup ("Cannot find module") and never polls.
-  cp "$REPO_DIR/agent/channels/telegram/adapter.ts" "$CTA_INSTALL_DIR/agent/channels/telegram/"
+  # Chat-channel modules (ChatTransport migration). poller.ts imports the wire
+  # adapter (P1) + the TelegramTransport (P3) which pulls in the core types —
+  # without these copies the sandboxed poller crashes on startup ("Cannot find
+  # module") and never polls.
+  cp "$REPO_DIR/agent/channels/types.ts" "$CTA_INSTALL_DIR/agent/channels/"
+  cp "$REPO_DIR/agent/channels/telegram/adapter.ts" \
+     "$REPO_DIR/agent/channels/telegram/transport.ts" \
+     "$CTA_INSTALL_DIR/agent/channels/telegram/"
   cp "$REPO_DIR/agent/poller/package.json" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$CTA_INSTALL_DIR/agent/mcp-telegram/"
   cp "$REPO_DIR/agent/mcp-telegram/package.json" "$CTA_INSTALL_DIR/agent/mcp-telegram/"

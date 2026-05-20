@@ -49,10 +49,8 @@ import type { ClaudeDaemonOptions } from "./claude-daemon";
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
 // keepalive, offset — and drives this dumb wire. See ../channels/telegram/adapter.ts.
 import {
-  sendText as reply,
   setReaction,
   sendChatAction,
-  editMessageText,
   sendInlineKeyboard,
   answerCallback,
   getUpdates,
@@ -66,6 +64,34 @@ import type {
   TgChatMemberUpdated,
   TgCallbackQuery,
 } from "../channels/telegram/adapter";
+import { TelegramTransport } from "../channels/telegram/transport";
+
+// ─── ChatTransport (P3, incremental cutover) ─────────────────────────────────
+// The poller drives outbound through the ChatTransport interface, not the wire
+// adapter directly. One instance per process (a poller serves one platform —
+// single getUpdates consumer). This slice routes the primary text egress
+// (reply → sendText) and message edits (editText) through it; ack / typing /
+// buttons / the inbound loop migrate in later P3 slices, so those still call the
+// adapter for now.
+const transport = new TelegramTransport();
+
+/** Outbound plain text. Now flows through transport.sendText (which chunks
+ *  >4096 and returns a ref); kept as `reply(target, text)` so the ~58 existing
+ *  call sites are unchanged. */
+async function reply(
+  target: { chat_id: number | string; thread_id?: number },
+  text: string,
+): Promise<void> {
+  await transport.sendText({
+    to: { channel: "telegram", chatId: Number(target.chat_id), threadId: target.thread_id },
+    text,
+  });
+}
+
+/** Edit a sent message's text in place — now via transport.editText (Editable). */
+async function editMessageText(chat_id: number, message_id: number, text: string): Promise<void> {
+  await transport.editText({ channel: "telegram", chatId: chat_id, messageId: message_id }, text);
+}
 
 // Poller-side cache key for Telegram updates. Hardcoded "telegram" because
 // this file is the Telegram adapter; the LINE adapter (when added) will
