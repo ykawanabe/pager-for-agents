@@ -26,46 +26,12 @@
  * Heartbeat: touches $STATE_DIR/heartbeat-poller every loop
  * iteration so the watchdog can detect a hung poller.
  */
-import { spawnSync as _spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
-
-/**
- * Prefer the tmux bundled inside Claude Pager.app. The bundled binary is
- * codesigned into Pager's ad-hoc identity, so it inherits the user's Full
- * Disk Access grant — no per-folder permission prompts when claude opens
- * projects in Documents/Desktop/Downloads. Falls back to Homebrew / system
- * locations when Pager isn't installed or its tmux is missing.
- *
- * Resolved once at module load — tmux install location doesn't move at
- * runtime. Empty string means "use literal 'tmux' and rely on PATH"
- * (the legacy behavior).
- */
-const TMUX_BIN: string = (() => {
-  const home = homedir();
-  const candidates = [
-    `${home}/Applications/Claude Pager.app/Contents/MacOS/tmux`,
-    "/opt/homebrew/bin/tmux",
-    "/usr/local/bin/tmux",
-    "/opt/local/bin/tmux",
-    "/usr/bin/tmux",
-  ];
-  for (const p of candidates) {
-    try { if (existsSync(p)) return p; } catch { /* probe-only */ }
-  }
-  return "tmux";
-})();
-
-/** Wrapper that rewrites a literal "tmux" command into the resolved binary
- *  path. Spreading the rest of the call signature lets us preserve all
- *  existing spawnSync options + arg shapes. */
-function spawnSync(cmd: string, args?: readonly string[], options?: Parameters<typeof _spawnSync>[2]): ReturnType<typeof _spawnSync> {
-  const resolved = cmd === "tmux" ? TMUX_BIN : cmd;
-  return _spawnSync(resolved, args as string[], options);
-}
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { addMount, gcProvisional, mountKey, readMounts, removeMount, type Mount, type ThreadId } from "../mount-store/mount-store";
+import { addMount, mountKey, readMounts, removeMount, type Mount, type ThreadId } from "../mount-store/mount-store";
 import {
   aggregateCostFromJsonl,
   contextWindowFor,
@@ -1234,130 +1200,6 @@ async function ensureWildcardMount(): Promise<void> {
   }
 }
 
-// ─── mount-helper (auto-mount) ───────────────────────────────────────────────
-// When an unmounted topic receives a message AND no wildcard exists AND the
-// kill-switch is unset, spawn a one-shot helper claude in $HOME. Helper finds
-// a real project directory via send_telegram conversation, then commits via
-// `cta mount`. Cancellation: user sends `/cancel`. Cleanup: gcOrphanedProvisionals
-// runs at startup to drop rows whose helper tmux is dead.
-
-const HELPER_DISABLED = process.env.PAGER_DISABLE_HELPER === "1";
-
-function tmuxHasSession(name: string): boolean {
-  return spawnSync("tmux", ["has-session", "-t", name], { encoding: "utf8" }).status === 0;
-}
-
-function readTopicNameFromCache(thread_id: number | "dm"): string | null {
-  if (thread_id === "dm") return null;
-  try {
-    const cache = readTopics();
-    const chat = effectiveChatId();
-    if (!chat) return null;
-    const key = `${chat}/${thread_id}`;
-    return cache.topics?.[key]?.name ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function sendImmediateAck(thread_id: number | "dm", topic_name: string | null): Promise<void> {
-  const chat_id = effectiveChatId();
-  if (!chat_id) return;
-  const text = topic_name
-    ? `Looking for projects matching "${topic_name}"…`
-    : "Setting up this topic — what project should it point to?";
-  const body: Record<string, unknown> = { chat_id, text };
-  if (typeof thread_id === "number") body.message_thread_id = thread_id;
-  try {
-    await fetch(`${getApiBase()}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    process.stderr.write(`poller: sendImmediateAck failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
-}
-
-async function spawnHelper(thread_id: number | "dm"): Promise<string | null> {
-  if (HELPER_DISABLED) return null;
-  const tmuxSession = `helper-${thread_id}`;
-
-  // Idempotent: existing helper tmux means a helper is already mid-conversation.
-  if (tmuxHasSession(tmuxSession)) return tmuxSession;
-
-  const topicName = readTopicNameFromCache(thread_id);
-  // Immediate ack first — claude cold-start takes ~5-15s; without this the
-  // user stares at silence and assumes the bot is dead.
-  await sendImmediateAck(thread_id, topicName);
-
-  const home = process.env.HOME ?? "/tmp";
-  try {
-    await addMount({
-      thread_id,
-      path: home,
-      label: topicName ?? `helper-${thread_id}`,
-      tmux_session: tmuxSession,
-      provisional: true,
-    });
-  } catch (e) {
-    process.stderr.write(`poller: spawnHelper addMount failed for ${thread_id}: ${e instanceof Error ? e.message : String(e)}\n`);
-    return null;
-  }
-
-  const servicesDir = process.env.MOUNT_STORE_PATH
-    ? join(process.env.MOUNT_STORE_PATH, "..", "..")
-    : installAgentDir();
-  const wrapperPath = join(servicesDir, "topic-wrapper.sh");
-  const cmd = [wrapperPath, String(thread_id), home, tmuxSession, "helper"]
-    .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
-    .join(" ");
-
-  // Pass PAGER_TOPIC_NAME through tmux's send-environment list isn't reliable;
-  // simpler to wrap the cmd in `env PAGER_TOPIC_NAME=...` so it gets to the
-  // helper-wrapper without polluting the poller's environment.
-  const safeName = (topicName ?? "").replace(/'/g, "'\\''");
-  const cmdWithEnv = `env PAGER_TOPIC_NAME='${safeName}' ${cmd}`;
-
-  spawnSync("tmux", ["kill-session", "-t", tmuxSession], { encoding: "utf8" });
-  const newSession = spawnSync(
-    "tmux",
-    ["new-session", "-d", "-s", tmuxSession, cmdWithEnv],
-    { encoding: "utf8" },
-  );
-  if (newSession.status !== 0) {
-    process.stderr.write(`poller: spawnHelper tmux new-session failed for ${thread_id}: ${newSession.stderr}\n`);
-    // Roll back the provisional mount so a retry can re-attempt cleanly.
-    try { await removeMount(thread_id); } catch { /* best effort */ }
-    return null;
-  }
-
-  refreshMountsIfChanged();
-  process.stdout.write(`[${new Date().toISOString()}] mount-helper spawned: thread ${thread_id} → ${tmuxSession} (topic_name=${topicName ?? "(unknown)"})\n`);
-  return tmuxSession;
-}
-
-// Grace window for cold-boot resilience (D15): after a host reboot every
-// helper-<id> tmux is dead, but provisional rows may have been written
-// seconds ago by spawnHelper before the reboot. Without grace, the user's
-// in-progress helper conversation gets wiped at poller startup. 10 min
-// is a balance: long enough to survive a normal reboot cycle (login,
-// LaunchAgent startup, mount of $HOME, etc.) but short enough that
-// genuinely abandoned helpers don't accumulate forever. Override via
-// PAGER_PROVISIONAL_GRACE_MS env if needed.
-const PROVISIONAL_GRACE_MS = Number(process.env.PAGER_PROVISIONAL_GRACE_MS ?? `${10 * 60_000}`);
-
-async function gcOrphanedProvisionals(): Promise<void> {
-  try {
-    const dropped = await gcProvisional((s) => tmuxHasSession(s), PROVISIONAL_GRACE_MS);
-    if (dropped > 0) {
-      process.stdout.write(`[${new Date().toISOString()}] poller: gc dropped ${dropped} orphaned provisional mount(s)\n`);
-      refreshMountsIfChanged();
-    }
-  } catch (e) {
-    process.stderr.write(`poller: gcOrphanedProvisionals failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
-}
 
 // /clear over Telegram: rotate the per-topic session UUID and kill the
 // topic's tmux session. The watchdog (kick_dead_topic_sessions) and the
@@ -1438,8 +1280,6 @@ async function handleCancel(msg: TgMessage): Promise<void> {
     );
     return;
   }
-  const helperSession = mount.tmux_session ?? `helper-${key}`;
-  spawnSync("tmux", ["kill-session", "-t", helperSession], { encoding: "utf8" });
   try {
     await removeMount(key);
   } catch (e) {
@@ -1543,8 +1383,13 @@ async function handleRestartCmd(msg: TgMessage): Promise<void> {
     );
     return;
   }
-  const targetSession = mount.tmux_session ?? `topic-${key}`;
-  spawnSync("tmux", ["kill-session", "-t", targetSession], { encoding: "utf8" });
+  if (daemonRegistry) {
+    try {
+      await daemonRegistry.resetTopic(String(key));
+    } catch (e) {
+      process.stderr.write(`poller: handleRestart resetTopic failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
   await reply(
     { chat_id: msg.chat.id, thread_id },
     "Restarting claude in this topic. First reply may take 5–15s while it cold-starts.",
@@ -1686,17 +1531,6 @@ async function resetPerTopicStateOnPairSwitch(): Promise<void> {
         }
       }
     }
-  }
-  // Belt-and-suspenders: kill any leftover `topic-*` tmux sessions from a
-  // stale pre-Phase-4 install. New code never spawns them.
-  const ls = spawnSync("tmux", ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8" });
-  if (ls.status !== 0) return; // no tmux server, nothing to kill
-  const names = ls.stdout.split("\n").filter((n) => n.startsWith("topic-"));
-  for (const name of names) {
-    spawnSync("tmux", ["kill-session", "-t", name], { encoding: "utf8" });
-  }
-  if (names.length > 0) {
-    process.stdout.write(`[${new Date().toISOString()}] killed ${names.length} stale topic-* session(s) on pair switch\n`);
   }
 }
 
@@ -2332,11 +2166,6 @@ export async function main(): Promise<void> {
   await preflightBotToken();
   let offset = readOffset();
   refreshMountsIfChanged();
-  // Clean up orphaned provisional mounts from prior helper sessions whose
-  // tmux is no longer alive (host reboot, claude crash, manual kill). Real
-  // mounts are not touched. Must run AFTER the first mountsCache load so the
-  // refresh below sees the post-GC state.
-  await gcOrphanedProvisionals();
   refreshPairedIfChanged();
   refreshAckReactionIfChanged();
   initDaemonRegistry();
@@ -2344,7 +2173,7 @@ export async function main(): Promise<void> {
   await processInjectFlags(); // drain anything dropped before this poller started
 
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
-  process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}, helper=${HELPER_DISABLED ? "disabled" : "enabled"}\n`);
+  process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
 
   for (;;) {
     touchHeartbeat();
