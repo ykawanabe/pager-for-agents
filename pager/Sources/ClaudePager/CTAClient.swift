@@ -399,6 +399,19 @@ enum CTAClient {
         return try? JSONDecoder().decode(PairedStateJSON.self, from: data)
     }
 
+    /// True if the topic's claude daemon appears to be mid-turn, derived from
+    /// the poller's typing marker: $STATE_DIR/typing/<chatId>__<thread>.token
+    /// (written at dispatch, removed at turn-end — see typing-keepalive.ts).
+    /// Freshness-guarded (10 min, the keepalive max) so a marker orphaned by a
+    /// crashed poller doesn't pin the indicator on forever.
+    static func isGenerating(thread: String) -> Bool {
+        guard let chatId = pairedState()?.chatId else { return false }
+        let path = "\(stateDir)/typing/\(chatId)__\(thread).token"
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date else { return false }
+        return Date().timeIntervalSince(mtime) < 600
+    }
+
     // MARK: - Topic names (best-effort harvest)
 
     /// Mirrors topics.json which the poller writes when it sees a

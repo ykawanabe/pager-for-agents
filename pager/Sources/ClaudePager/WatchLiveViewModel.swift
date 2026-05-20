@@ -48,6 +48,11 @@ final class WatchLiveViewModel: ObservableObject {
     /// to the legacy pane content.
     @Published private(set) var messages: [JsonlReader.Message] = []
 
+    /// True while the focused topic's daemon is mid-turn — drives a bottom
+    /// "Claude is working…" indicator (messaging-app style) so the user sees
+    /// progress instead of waiting for the whole turn to land in the JSONL.
+    @Published private(set) var isGenerating: Bool = false
+
     /// Per-thread cached content from the last successful capture. Survives
     /// topic switches: when focus moves to thread X, we immediately restore
     /// its cached content into paneStatus so the user doesn't see the
@@ -64,6 +69,9 @@ final class WatchLiveViewModel: ObservableObject {
     /// message list (or empty when no transcript exists). Default reads
     /// from disk via JsonlReader; tests inject a fixture.
     typealias MessagesProvider = (String) async -> [JsonlReader.Message]
+    /// Whether the topic's daemon is mid-turn (drives the bottom "working…"
+    /// indicator). Default reads the poller's typing marker; tests inject.
+    typealias GeneratingProvider = (String) -> Bool
 
     /// Phase B.3: long-running subprocess that streams pane content for one
     /// topic. Returns a cancel closure, or nil if spawn failed (cta path not
@@ -80,6 +88,7 @@ final class WatchLiveViewModel: ObservableObject {
     private let streamSpawner: StreamSpawner?
     private let persistFocus: FocusPersist
     private let messagesProvider: MessagesProvider
+    private let generatingProvider: GeneratingProvider
     private var messagesTask: Task<Void, Never>?
     private var lastPreviewByThread: [String: String] = [:]
     /// Phase 4 sidebar activity: tracks JSONL mtime per topic so we can flag
@@ -154,6 +163,7 @@ final class WatchLiveViewModel: ObservableObject {
         },
         streamSpawner: StreamSpawner? = WatchLiveViewModel.defaultStreamSpawner,
         messagesProvider: @escaping MessagesProvider = WatchLiveViewModel.defaultMessagesProvider,
+        generatingProvider: @escaping GeneratingProvider = { CTAClient.isGenerating(thread: $0) },
         focusRestore: FocusRestore = {
             UserDefaults.standard.string(forKey: WatchLiveViewModel.lastFocusedKey)
         },
@@ -169,6 +179,7 @@ final class WatchLiveViewModel: ObservableObject {
         self.captureProvider = captureProvider
         self.streamSpawner = streamSpawner
         self.messagesProvider = messagesProvider
+        self.generatingProvider = generatingProvider
         self.persistFocus = focusPersist
         self.focusedThreadId = focusRestore()
     }
@@ -238,6 +249,7 @@ final class WatchLiveViewModel: ObservableObject {
             // topic's bubbles while refreshMessages catches up. One JSONL
             // poll cycle (≤2s) repopulates.
             messages = []
+            isGenerating = false  // recomputed for the new topic on next refresh
             persistFocus(thread)
             attachStreamIfPossible()
             Task { await refreshMessages() } // immediate refill, no 2s wait
@@ -386,8 +398,11 @@ final class WatchLiveViewModel: ObservableObject {
     func refreshMessages() async {
         guard let id = focusedThreadId else {
             messages = []
+            if isGenerating { isGenerating = false }
             return
         }
+        let gen = generatingProvider(id)
+        if gen != isGenerating { isGenerating = gen }
         let next = await messagesProvider(id)
         // A transient empty read (JSONL mid-write, a brief mount/UUID lookup
         // miss) must NOT wipe an already-populated transcript: that flips the
