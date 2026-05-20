@@ -389,6 +389,12 @@ final class WatchLiveViewModel: ObservableObject {
             return
         }
         let next = await messagesProvider(id)
+        // A transient empty read (JSONL mid-write, a brief mount/UUID lookup
+        // miss) must NOT wipe an already-populated transcript: that flips the
+        // view to the "No messages yet" empty-state and back on the next poll,
+        // which is the visible "loading keeps flickering" symptom. Only the
+        // focus-change path above legitimately clears messages.
+        if next.isEmpty && !messages.isEmpty { return }
         // Avoid pointless publishes when content didn't change. Equality is
         // cheap because Message is value-typed and id-stable.
         if next.count != messages.count || next != messages {

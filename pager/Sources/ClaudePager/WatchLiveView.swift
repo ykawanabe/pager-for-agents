@@ -238,11 +238,14 @@ struct WatchLiveView: View {
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .onChange(of: vm.messages.last?.id) { _, newId in
-                    guard let newId else { return }
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(newId, anchor: .bottom)
-                    }
+                // Auto-scroll only when a NEW bubble is appended (count grows),
+                // not on every re-publish of the array. refreshMessages re-emits
+                // the whole list each poll; keying the scroll on count avoids
+                // yanking the view to the bottom while the user is reading
+                // history (a re-publish with the same count = no scroll).
+                .onChange(of: vm.messages.count) { oldCount, newCount in
+                    guard newCount > oldCount, let last = vm.messages.last?.id else { return }
+                    proxy.scrollTo(last, anchor: .bottom)
                 }
                 .onAppear {
                     if let last = vm.messages.last?.id {
