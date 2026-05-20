@@ -127,3 +127,4 @@ __pycache__/
 # also matches the symlink itself, not just a real directory.
 /memory
 /.claude/scheduled_tasks.lock
+.playwright-mcp/
