@@ -528,6 +528,27 @@ function ensureMcpConfig(threadId: number | "dm"): string | null {
  * MCP config path. Called by the registry on every spawn (including
  * crash respawns) so config stays in sync with mount changes.
  */
+// ─── per-topic --effort level ────────────────────────────────────────────────
+// Valid claude --effort levels. "auto" is NOT a thing — these are the only
+// values claude accepts.
+const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+// Bot-wide default. Overridable via PAGER_EFFORT in ~/.pager/.env. Deliberately
+// independent of the user's GLOBAL settings.json effortLevel (which also drives
+// their desktop claude) — the bot defaults to "high" for snappier phone replies.
+const DEFAULT_EFFORT =
+  process.env.PAGER_EFFORT && VALID_EFFORTS.has(process.env.PAGER_EFFORT)
+    ? process.env.PAGER_EFFORT
+    : "high";
+function effortDir(): string { return join(STATE_DIR, "effort"); }
+/** Per-topic effort override (set via /effort), else the bot default. */
+function resolveEffort(key: number | "dm"): string {
+  try {
+    const v = readFileSync(join(effortDir(), String(key)), "utf8").trim();
+    if (VALID_EFFORTS.has(v)) return v;
+  } catch { /* no override → default */ }
+  return DEFAULT_EFFORT;
+}
+
 function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claudeBin"> {
   const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
   const mount = mountsCache.get(tgKey(key));
@@ -558,7 +579,40 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
     mcpConfigPath: mcpConfigPath ?? undefined,
     settingsPath: existsSync(hooksPath) ? hooksPath : undefined,
     appendSystemPrompt: process.env.BOT_APPEND_SYSTEM_PROMPT ?? DAEMON_APPEND_SYSTEM_PROMPT,
+    effort: resolveEffort(key),
   };
+}
+
+// /effort <level> over Telegram: set the per-topic --effort level and respawn
+// the topic's daemon so it takes effect immediately. No arg → show current +
+// valid levels.
+async function handleEffort(msg: TgMessage, args: string): Promise<void> {
+  const dest = { chat_id: msg.chat.id, thread_id: msg.message_thread_id };
+  const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+  const level = args.trim().toLowerCase().split(/\s+/)[0];
+
+  if (!level) {
+    await reply(dest, `effort for this topic: ${resolveEffort(key)} (default ${DEFAULT_EFFORT})\nUsage: /effort <low|medium|high|xhigh|max>`);
+    return;
+  }
+  if (!VALID_EFFORTS.has(level)) {
+    await reply(dest, `"${level}" is not valid. Choose: low, medium, high, xhigh, max.`);
+    return;
+  }
+  try {
+    mkdirSync(effortDir(), { recursive: true, mode: 0o700 });
+    writeFileSync(join(effortDir(), String(key)), level + "\n", { mode: 0o600 });
+  } catch (e) {
+    await reply(dest, `Couldn't save effort: ${e instanceof Error ? e.message : String(e)}`);
+    return;
+  }
+  // Respawn the daemon so the new --effort applies on the next turn.
+  try {
+    if (daemonRegistry) await daemonRegistry.resetTopic(String(key));
+  } catch (e) {
+    process.stderr.write(`poller: handleEffort resetTopic failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+  await reply(dest, `effort set to ${level} for this topic (applies on your next message).`);
 }
 
 /** Parse a registry threadId (string) back into the TG numeric form. */
@@ -1735,6 +1789,7 @@ async function handleHelp(msg: TgMessage): Promise<void> {
       "  /cost           — token usage + estimated cost for this session",
       "  /usage          — Anthropic 5h/7d subscription usage",
       "  /clear          — reset the conversation (new session UUID)",
+      "  /effort <level> — set reasoning effort for this topic (low|medium|high|xhigh|max)",
       "  /restart        — restart claude on this topic (keep session)",
       "  /status         — show bot/daemon health (cta status output)",
       "",
@@ -1838,6 +1893,7 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
     case "/unmount": await handleUnmount(msg); return true;
     case "/cancel": await handleCancel(msg); return true;
     case "/list":  await handleList(msg); return true;
+    case "/effort": await handleEffort(msg, args); return true;
     case "/help":  await handleHelp(msg); return true;
     default: {
       // TUI command framework: translated → run handler, hidden → reply,

@@ -45,6 +45,9 @@ export interface ClaudeDaemonOptions {
   appendSystemPrompt?: string;
   /** Override the claude binary (tests point this at fixtures/fake-claude-daemon.sh). */
   claudeBin?: string;
+  /** --effort level (low|medium|high|xhigh|max). Omit → claude uses the
+   *  settings.json effortLevel default. */
+  effort?: string;
   /** Extra env vars merged into the subprocess env. */
   env?: Record<string, string>;
 }
@@ -93,6 +96,7 @@ export class ClaudeDaemon extends EventEmitter {
       mcpConfigPath: this.opts.mcpConfigPath,
       settingsPath: this.opts.settingsPath,
       appendSystemPrompt: this.opts.appendSystemPrompt,
+      effort: this.opts.effort,
     });
     const proc = spawn(bin, argv, {
       cwd: this.opts.cwd,
@@ -253,6 +257,7 @@ export class ClaudeDaemon extends EventEmitter {
     mcpConfigPath?: string;
     settingsPath?: string;
     appendSystemPrompt?: string;
+    effort?: string;
   }): string[] {
     const args: string[] = [
       "-p",
@@ -261,6 +266,9 @@ export class ClaudeDaemon extends EventEmitter {
       "--verbose",                           // required for stream-json output
       "--dangerously-skip-permissions",
     ];
+    if (opts.effort) {
+      args.push("--effort", opts.effort);
+    }
     if (opts.mcpConfigPath) {
       // Note: deliberately NOT passing --strict-mcp-config. We MERGE the
       // per-topic telegram MCP with the user's own ~/.claude.json MCPs so
