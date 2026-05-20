@@ -162,7 +162,7 @@ rm -f "$BIN_DIR/restart_claude.sh" 2>/dev/null || true
 # ~/.local/bin, data/code in ~/.local/share).
 AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
-  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store"
+  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
      "$REPO_DIR/agent/poller/typing-keepalive.ts" \
@@ -171,6 +171,10 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/poller/claude-daemon-registry.ts" \
      "$REPO_DIR/agent/poller/slash-commands.ts" \
      "$AGENT_DIR/poller/"
+  # Telegram outbound wire adapter (ChatTransport migration P1). poller.ts
+  # imports it via ../channels/telegram/adapter; without this copy the
+  # installed poller crashes on startup ("Cannot find module").
+  cp "$REPO_DIR/agent/channels/telegram/adapter.ts" "$AGENT_DIR/channels/telegram/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
   cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
