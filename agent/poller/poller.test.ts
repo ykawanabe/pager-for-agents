@@ -561,11 +561,11 @@ describe("claude built-in interception (post-pair)", () => {
     delete process.env.CTA_BIN;
   });
 
-  test("/model, /agents are intercepted with TUI-only message", async () => {
-    // /clear was removed from the blocklist (now has its own handler);
-    // /model and /agents stay as TUI-only intercepts.
+  test("/agents is intercepted with TUI-only message", async () => {
+    // /clear and /model now have their own handlers; /agents stays a
+    // TUI-only intercept.
     pair({ chat_id: -1001, user_id: 99 });
-    for (const cmd of ["/model", "/agents"]) {
+    for (const cmd of ["/agents"]) {
       sent.length = 0;
       const handled = await poller.tryHandleCommand(
         msg({ text: cmd, chat_id: -1001, from_id: 99 }),
@@ -593,15 +593,15 @@ describe("claude built-in interception (post-pair)", () => {
     expect(sent.length).toBe(1);
   });
 
-  test("/model surfaces the model-specific reason (not /status's reason)", async () => {
+  test("/model (no arg) shows the current model for the topic", async () => {
     pair({ chat_id: -1001, user_id: 99 });
     const handled = await poller.tryHandleCommand(
       msg({ text: "/model", chat_id: -1001, from_id: 99 }),
     );
     expect(handled).toBe(true);
     expect(sent.length).toBe(1);
-    // Per-command reason, not the generic blocklist message.
-    expect(sent[0].text).toContain("CLAUDE_MODEL");
+    // Real command now (not a hidden "edit .env" reason).
+    expect(sent[0].text.toLowerCase()).toContain("model for this topic");
   });
 
   test("/agents surfaces the agents-specific reason", async () => {

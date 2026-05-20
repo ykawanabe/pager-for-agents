@@ -11,9 +11,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   aggregateCostFromJsonl,
+  contextWindowFor,
   formatCostMessage,
   formatUsageMessage,
   fetchUsageStats,
+  lastContextFromJsonl,
   resolveCredentialToken,
   type CostSummary,
 } from "./slash-commands";
@@ -199,5 +201,41 @@ describe("fetchUsageStats + formatUsageMessage", () => {
     const msg = formatUsageMessage({ fiveHourPct: null, sevenDayPct: null, error: "401: unauthorized" });
     expect(msg).toContain("Couldn't fetch");
     expect(msg).toContain("401");
+  });
+});
+
+describe("lastContextFromJsonl / contextWindowFor", () => {
+  test("returns the LAST assistant turn's prompt size + model", () => {
+    const jsonl = join(SANDBOX, "ctx.jsonl");
+    const entries = [
+      { type: "assistant", message: { model: "claude-sonnet-4-6", usage: { input_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 5, output_tokens: 50 } } },
+      { type: "user", message: { content: "next" } },
+      { type: "assistant", message: { model: "claude-sonnet-4-6", usage: { input_tokens: 20, cache_read_input_tokens: 8000, cache_creation_input_tokens: 30, output_tokens: 60 } } },
+    ];
+    writeFileSync(jsonl, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const ctx = lastContextFromJsonl(jsonl);
+    expect(ctx).not.toBeNull();
+    expect(ctx!.tokens).toBe(20 + 8000 + 30); // last turn, output excluded
+    expect(ctx!.model).toBe("claude-sonnet-4-6");
+  });
+
+  test("null when file missing or no assistant turn", () => {
+    expect(lastContextFromJsonl(join(SANDBOX, "nope.jsonl"))).toBeNull();
+    const onlyUser = join(SANDBOX, "useronly.jsonl");
+    writeFileSync(onlyUser, JSON.stringify({ type: "user", message: { content: "hi" } }) + "\n");
+    expect(lastContextFromJsonl(onlyUser)).toBeNull();
+  });
+
+  test("skips a truncated trailing line", () => {
+    const jsonl = join(SANDBOX, "trunc.jsonl");
+    const good = JSON.stringify({ type: "assistant", message: { model: "m", usage: { input_tokens: 5, cache_read_input_tokens: 100 } } });
+    writeFileSync(jsonl, good + "\n" + '{"type":"assistant","mess'); // truncated
+    const ctx = lastContextFromJsonl(jsonl);
+    expect(ctx!.tokens).toBe(105);
+  });
+
+  test("contextWindowFor defaults 200k, 1M for 1m variants", () => {
+    expect(contextWindowFor("claude-sonnet-4-6")).toBe(200_000);
+    expect(contextWindowFor("claude-sonnet-4-6[1m]")).toBe(1_000_000);
   });
 });

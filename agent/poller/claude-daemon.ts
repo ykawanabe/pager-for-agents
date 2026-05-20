@@ -48,6 +48,8 @@ export interface ClaudeDaemonOptions {
   /** --effort level (low|medium|high|xhigh|max). Omit → claude uses the
    *  settings.json effortLevel default. */
   effort?: string;
+  /** --model (alias like "opus"/"sonnet" or a full id). Omit → claude default. */
+  model?: string;
   /** Extra env vars merged into the subprocess env. */
   env?: Record<string, string>;
 }
@@ -97,6 +99,7 @@ export class ClaudeDaemon extends EventEmitter {
       settingsPath: this.opts.settingsPath,
       appendSystemPrompt: this.opts.appendSystemPrompt,
       effort: this.opts.effort,
+      model: this.opts.model,
     });
     const proc = spawn(bin, argv, {
       cwd: this.opts.cwd,
@@ -258,6 +261,7 @@ export class ClaudeDaemon extends EventEmitter {
     settingsPath?: string;
     appendSystemPrompt?: string;
     effort?: string;
+    model?: string;
   }): string[] {
     const args: string[] = [
       "-p",
@@ -268,6 +272,9 @@ export class ClaudeDaemon extends EventEmitter {
     ];
     if (opts.effort) {
       args.push("--effort", opts.effort);
+    }
+    if (opts.model) {
+      args.push("--model", opts.model);
     }
     if (opts.mcpConfigPath) {
       // Note: deliberately NOT passing --strict-mcp-config. We MERGE the

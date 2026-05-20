@@ -119,6 +119,37 @@ export function aggregateCostFromJsonl(jsonlPath: string): CostSummary {
   return { byModel, totalCostUsd };
 }
 
+/**
+ * Approximate the CURRENT context-window usage from the transcript: the last
+ * assistant turn's prompt size (input + cache_read + cache_creation) is what
+ * was in context for that turn. Returns null if no usable turn yet.
+ */
+export function lastContextFromJsonl(jsonlPath: string): { tokens: number; model: string } | null {
+  if (!existsSync(jsonlPath)) return null;
+  let content: string;
+  try { content = readFileSync(jsonlPath, "utf8"); } catch { return null; }
+  const lines = content.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    let entry: { type?: string; message?: { model?: string; usage?: Record<string, number> } };
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type !== "assistant") continue;
+    const u = entry.message?.usage;
+    const model = entry.message?.model;
+    if (!u || !model) continue;
+    const tokens = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+    return { tokens, model };
+  }
+  return null;
+}
+
+/** Context window per model family. Defaults to 200k. */
+export function contextWindowFor(model: string): number {
+  if (/\[1m\]|-1m\b/.test(model)) return 1_000_000; // 1M-context variants
+  return 200_000;
+}
+
 export function formatCostMessage(summary: CostSummary): string {
   if (Object.keys(summary.byModel).length === 0) {
     return "No usage recorded in this session yet.";

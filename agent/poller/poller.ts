@@ -68,10 +68,12 @@ import { randomUUID } from "node:crypto";
 import { addMount, gcProvisional, mountKey, readMounts, removeMount, type Mount, type ThreadId } from "../mount-store/mount-store";
 import {
   aggregateCostFromJsonl,
+  contextWindowFor,
   fetchUsageStats,
   formatCostMessage,
   formatUsageMessage,
   jsonlPathForSession,
+  lastContextFromJsonl,
   resolveCredentialToken,
 } from "./slash-commands";
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
@@ -549,6 +551,21 @@ function resolveEffort(key: number | "dm"): string {
   return DEFAULT_EFFORT;
 }
 
+// ─── per-topic --model ───────────────────────────────────────────────────────
+// Accept aliases (opus/sonnet/haiku/…) or a full claude-* id. Loose validation
+// (claude itself rejects truly bogus names at spawn); we just block shell-junk.
+const MODEL_RE = /^[A-Za-z0-9._:-]{2,64}$/;
+function modelDir(): string { return join(STATE_DIR, "model"); }
+/** Per-topic model override (set via /model), else CLAUDE_MODEL env, else
+ *  undefined → claude's own default. */
+function resolveModel(key: number | "dm"): string | undefined {
+  try {
+    const v = readFileSync(join(modelDir(), String(key)), "utf8").trim();
+    if (MODEL_RE.test(v)) return v;
+  } catch { /* no override */ }
+  return process.env.CLAUDE_MODEL || undefined;
+}
+
 function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claudeBin"> {
   const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
   const mount = mountsCache.get(tgKey(key));
@@ -580,6 +597,7 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
     settingsPath: existsSync(hooksPath) ? hooksPath : undefined,
     appendSystemPrompt: process.env.BOT_APPEND_SYSTEM_PROMPT ?? DAEMON_APPEND_SYSTEM_PROMPT,
     effort: resolveEffort(key),
+    model: resolveModel(key),
   };
 }
 
@@ -613,6 +631,52 @@ async function handleEffort(msg: TgMessage, args: string): Promise<void> {
     process.stderr.write(`poller: handleEffort resetTopic failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
   await reply(dest, `effort set to ${level} for this topic (applies on your next message).`);
+}
+
+// /model <alias|id> over Telegram: set the per-topic model and respawn the
+// topic's daemon. No arg → show current.
+async function handleModel(msg: TgMessage, args: string): Promise<void> {
+  const dest = { chat_id: msg.chat.id, thread_id: msg.message_thread_id };
+  const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+  const name = args.trim().split(/\s+/)[0];
+
+  if (!name) {
+    await reply(dest, `model for this topic: ${resolveModel(key) ?? "(claude default)"}\nUsage: /model <opus|sonnet|haiku|full-id>`);
+    return;
+  }
+  if (!MODEL_RE.test(name)) {
+    await reply(dest, `"${name}" doesn't look like a model name. Use an alias (opus/sonnet/haiku) or a full id (claude-…).`);
+    return;
+  }
+  try {
+    mkdirSync(modelDir(), { recursive: true, mode: 0o700 });
+    writeFileSync(join(modelDir(), String(key)), name + "\n", { mode: 0o600 });
+  } catch (e) {
+    await reply(dest, `Couldn't save model: ${e instanceof Error ? e.message : String(e)}`);
+    return;
+  }
+  try {
+    if (daemonRegistry) await daemonRegistry.resetTopic(String(key));
+  } catch (e) {
+    process.stderr.write(`poller: handleModel resetTopic failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+  await reply(dest, `model set to ${name} for this topic (applies on your next message). If it's an invalid name, claude will fail to start — send /model with a valid one.`);
+}
+
+// /context over Telegram: approximate current context-window usage from the
+// transcript's last turn.
+async function handleContext(msg: TgMessage): Promise<void> {
+  const thread_id = msg.message_thread_id;
+  const key: number | "dm" = thread_id != null ? thread_id : "dm";
+  const dest = { chat_id: msg.chat.id, thread_id };
+  const mount = mountsCache.get(tgKey(key));
+  if (!mount) { await reply(dest, "No mount in this topic — `/mount <path>` first."); return; }
+  const jsonl = jsonlPathForMount(mount);
+  const ctx = jsonl ? lastContextFromJsonl(jsonl) : null;
+  if (!ctx) { await reply(dest, "No turns recorded yet — send a message in this topic first."); return; }
+  const win = contextWindowFor(ctx.model);
+  const pct = Math.round((ctx.tokens / win) * 100);
+  await reply(dest, `context: ~${ctx.tokens.toLocaleString()} / ${win.toLocaleString()} tokens (${pct}%) · ${ctx.model}\n(approx — last turn's prompt size)`);
 }
 
 /** Parse a registry threadId (string) back into the TG numeric form. */
@@ -1790,6 +1854,8 @@ async function handleHelp(msg: TgMessage): Promise<void> {
       "  /usage          — Anthropic 5h/7d subscription usage",
       "  /clear          — reset the conversation (new session UUID)",
       "  /effort <level> — set reasoning effort for this topic (low|medium|high|xhigh|max)",
+      "  /model <name>   — set model for this topic (opus|sonnet|haiku|full-id)",
+      "  /context        — approx context-window usage for this topic",
       "  /restart        — restart claude on this topic (keep session)",
       "  /status         — show bot/daemon health (cta status output)",
       "",
@@ -1829,12 +1895,13 @@ const TUI_COMMANDS: Record<string, CommandSpec> = {
   "/usage":   { disposition: "translated", handler: (m) => handleUsage(m) },
   "/restart": { disposition: "translated", handler: (m) => handleRestartCmd(m) },
   "/status":  { disposition: "translated", handler: (m) => handleStatusCmd(m) },
+  "/context": { disposition: "translated", handler: (m) => handleContext(m) },
 
   // ── hidden: TUI-only commands with no Telegram analog ─────────────────────
   "/config":      { disposition: "hidden", reason: "Edit `~/.pager/.env` directly, then `cta restart`." },
   "/agents":      { disposition: "hidden", reason: "Project agents live in `.claude/agents/` on disk." },
   "/permissions": { disposition: "hidden", reason: "Bot runs with `--dangerously-skip-permissions`; tools are constrained via `agent/helper-permissions.json`." },
-  "/model":       { disposition: "hidden", reason: "Set `CLAUDE_MODEL` in `~/.pager/.env`, then `cta restart`." },
+  "/compact":     { disposition: "hidden", reason: "Claude Code auto-compacts; on-demand /compact isn't triggerable in the daemon (stream-json) mode. Use /clear to reset the conversation." },
   "/output-style":{ disposition: "hidden", reason: "Telegram renders plain text — output styles are TUI-only." },
   "/init":        { disposition: "hidden", reason: "Run on your Mac in the project directory." },
   "/exit":        { disposition: "hidden", reason: "Use `/clear` to reset the conversation, or `cta stop` / `cta start` on your Mac." },
@@ -1894,6 +1961,7 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
     case "/cancel": await handleCancel(msg); return true;
     case "/list":  await handleList(msg); return true;
     case "/effort": await handleEffort(msg, args); return true;
+    case "/model": await handleModel(msg, args); return true;
     case "/help":  await handleHelp(msg); return true;
     default: {
       // TUI command framework: translated → run handler, hidden → reply,
