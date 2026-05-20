@@ -125,61 +125,20 @@ enum CTAClient {
     /// cta directly without re-implementing path resolution.
     static var executablePath: String? { resolvedPath }
 
-    /// Resolve the tmux binary (Pager LaunchAgent runs with a minimal PATH
-    /// that doesn't include Homebrew). Used by watchSystemSession to capture
-    /// the synthetic "Poller" sidebar row's tmux session.
-    ///
-    /// Prefers the bundled tmux inside Pager.app/Contents/MacOS/tmux first
-    /// — that copy is covered by Pager's Full Disk Access grant (codesigned
-    /// into the same bundle), so it doesn't trigger per-folder permission
-    /// prompts when claude opens a project in Documents/Desktop/Downloads.
-    /// Falls back to Homebrew / standard locations if the bundled tmux is
-    /// missing (e.g. older install before bundling, or `brew --prefix tmux`
-    /// returned empty during install.sh).
-    private static let resolvedTmuxPath: String? = {
-        let bundled = Bundle.main.bundlePath + "/Contents/MacOS/tmux"
-        let candidates = [
-            bundled,
-            "/opt/homebrew/bin/tmux",
-            "/usr/local/bin/tmux",
-            "/opt/local/bin/tmux",
-            "/usr/bin/tmux",
-        ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }()
-
-    /// Capture a non-topic tmux session (e.g. "poller", "watchdog") directly
-    /// via tmux, bypassing `cta watch` which only resolves mounted topics.
-    /// Used by WatchLiveView when the user focuses the synthetic "Poller"
-    /// sidebar row — agent.log is the persisted version of this same output,
-    /// but the live tmux pane gives us a single coherent snapshot.
-    ///
-    /// Returns the same WatchResult shape so the VM doesn't need a branch
-    /// at the call site: `.ok(content)` when the session exists, `.sessionDead`
-    /// when it doesn't, `.error` if tmux can't be found.
+    /// The synthetic "Poller" sidebar row's content. P6b: there is no `poller`
+    /// tmux session anymore — the poller's stdout is persisted to
+    /// $STATE_DIR/agent.log by the LaunchAgent (StandardOutPath), so we tail
+    /// that file instead of `tmux capture-pane`. `session` is ignored (there's
+    /// only the one agent log now). Same WatchResult shape as before.
     static func watchSystemSession(session: String, lines: Int) -> WatchResult {
-        guard let tmux = resolvedTmuxPath else {
-            return .error("tmux not installed at any known path (Homebrew etc.)")
+        let path = "\(stateDir)/agent.log"
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else {
+            return .sessionDead(stderr: "agent.log not found at \(path)")
         }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: tmux)
-        proc.arguments = ["capture-pane", "-p", "-S", "-\(lines)", "-t", session]
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            return .error("failed to spawn tmux: \(error.localizedDescription)")
-        }
-        if proc.terminationStatus != 0 {
-            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            return .sessionDead(stderr: err.isEmpty ? "session '\(session)' not running" : err)
-        }
-        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return .ok(out)
+        let allLines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let tail = allLines.suffix(lines).joined(separator: "\n")
+        return .ok(tail)
     }
 
     /// Run `cta status --json`. Blocking. Caller should be off the main thread.
