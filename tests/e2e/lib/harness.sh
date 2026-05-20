@@ -58,6 +58,11 @@ h_setup_sandbox() {
   # resolve their helpers under the standard $CTA_INSTALL_DIR layout.
   cp "$REPO_DIR/agent/poller/poller.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/typing-keepalive.ts" "$CTA_INSTALL_DIR/agent/poller/"
+  # Phase 4 modules poller.ts imports — without these the poller crashes on
+  # startup ("Cannot find module './slash-commands'") and never polls.
+  cp "$REPO_DIR/agent/poller/slash-commands.ts" "$CTA_INSTALL_DIR/agent/poller/"
+  cp "$REPO_DIR/agent/poller/claude-daemon.ts" "$CTA_INSTALL_DIR/agent/poller/"
+  cp "$REPO_DIR/agent/poller/claude-daemon-registry.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/package.json" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$CTA_INSTALL_DIR/agent/mcp-telegram/"
   cp "$REPO_DIR/agent/mcp-telegram/package.json" "$CTA_INSTALL_DIR/agent/mcp-telegram/"
