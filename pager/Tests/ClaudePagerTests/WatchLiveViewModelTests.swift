@@ -444,6 +444,31 @@ final class WatchLiveViewModelTests: XCTestCase {
         XCTAssertEqual(vm.messages[1].toolNames, ["Read"])
     }
 
+    func test_refreshMessages_transientEmptyKeepsPopulated() async {
+        // A populated transcript must survive a transient empty read (JSONL
+        // mid-write / brief mount-lookup miss). Otherwise the view flips to
+        // the "No messages yet" empty-state and back on every poll.
+        final class Box { var empty = false }
+        let box = Box()
+        let stub: [JsonlReader.Message] = [
+            .init(id: "u1", role: .user, text: "hi", toolNames: [], timestamp: nil),
+        ]
+        let vm = makeVM(
+            mounts: { [] },
+            capture: { _ in .ok("") },
+            messages: { thread in (thread == "42" && !box.empty) ? stub : [] },
+            restoredFocus: "42"
+        )
+
+        await vm.refreshMessages()
+        XCTAssertEqual(vm.messages.count, 1)
+
+        // Next poll returns empty (transient) — must NOT wipe the list.
+        box.empty = true
+        await vm.refreshMessages()
+        XCTAssertEqual(vm.messages.count, 1, "transient empty read must not clear messages")
+    }
+
     func test_refreshMessages_emptyWhenNoFocus() async {
         let vm = makeVM(
             mounts: { [] },
