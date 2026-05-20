@@ -2,10 +2,13 @@
  * Telegram outbound wire — the Bot API egress, extracted from poller.ts in
  * Phase 1 of the ChatTransport migration (see docs/plans/chat-transport-interface.md §9).
  *
- * Scope (P1, this slice): the OUTBOUND egress only — every send/react/typing/
- * button/edit/answer the poller fires. These take primitives, so there is no
- * inbound-type graph to drag along. `getUpdates`/`getMe` and the inbound Tg*
- * types stay in poller for now; they move in P2 alongside types.ts.
+ * Scope (P1): the full Bot API WIRE — outbound egress (send/react/typing/
+ * button/edit/answer) AND inbound fetch (getUpdates/getMe) + the raw Tg* wire
+ * types. Still NO ChatTransport interface and NO inbound normalization: the
+ * poller keeps driving the long-poll loop and consumes raw TgUpdate. P2 wraps
+ * this in `class TelegramTransport implements ChatTransport`, owns the loop,
+ * and normalizes TgUpdate → InboundEvent (types.ts) — at which point the raw
+ * Tg* types stop leaking into the poller.
  *
  * Design rules this file obeys:
  *   - Pure functions; reads env LAZILY (TELEGRAM_BOT_TOKEN / TELEGRAM_API_BASE)
@@ -165,4 +168,101 @@ export async function answerCallback(callback_query_id: string, text?: string, a
   } catch (e) {
     process.stderr.write(`poller: answerCallback failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
+}
+
+// ─── inbound wire ──────────────────────────────────────────────────────────
+// Raw Telegram update shapes + the long-poll fetch. The poller still drives
+// the loop and consumes TgUpdate directly (P1); P2's TelegramTransport will
+// own the loop and normalize these into the platform-agnostic InboundEvent.
+
+export interface TgUser { id: number; }
+export interface TgChat { id: number; }
+export interface TgForumTopicCreated { name: string; icon_color?: number; icon_custom_emoji_id?: string; }
+export interface TgForumTopicEdited { name?: string; icon_custom_emoji_id?: string; }
+export interface TgMessage {
+  message_id: number;
+  from?: TgUser;
+  chat: TgChat;
+  message_thread_id?: number;
+  text?: string;
+  caption?: string;
+  // Service messages carrying forum topic lifecycle events. Telegram emits
+  // these inside the topic itself (message_thread_id is the new topic id) when
+  // a topic is created or renamed. There's no Bot API getForumTopic, so this
+  // is the *only* way to learn topic names — meaning we can only know about
+  // topics created / renamed *after* the bot joined the group.
+  forum_topic_created?: TgForumTopicCreated;
+  forum_topic_edited?: TgForumTopicEdited;
+}
+export interface TgChatMemberUpdated {
+  chat: { id: number; title?: string };
+  from: { id: number; first_name?: string; username?: string };
+  new_chat_member: { user: { id: number; is_bot: boolean }; status: string };
+  old_chat_member: { user: { id: number; is_bot: boolean }; status: string };
+}
+export interface TgCallbackQuery {
+  id: string;
+  from: { id: number; first_name?: string };
+  message?: { chat: { id: number }; message_id: number; message_thread_id?: number; text?: string };
+  data?: string;
+}
+export interface TgUpdate {
+  update_id: number;
+  message?: TgMessage;
+  edited_message?: TgMessage;
+  my_chat_member?: TgChatMemberUpdated;
+  callback_query?: TgCallbackQuery;
+}
+export interface TgResp { ok: boolean; result?: TgUpdate[]; description?: string; }
+
+/**
+ * fetch with a hard client-side timeout. Telegram long-poll only sets a
+ * SERVER-side timeout; without a client abort, a half-open/stalled TCP
+ * connection (Wi-Fi flap, NAT drop) makes `await fetch` hang forever and
+ * wedges the poll loop — alive but stuck, heartbeat frozen. AbortController
+ * bounds it so the call throws and the loop's retry path recovers.
+ *
+ * Generic (not Telegram-specific) but colocated with its only consumers
+ * (getUpdates/getMe); promote to a shared lib if another transport needs it.
+ */
+export async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestInit): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Long-poll one batch of updates. `timeoutSec` is the server long-poll window —
+ * the poller owns the poll cadence and passes it in; the client abort budget is
+ * that window + 15s slack so a stalled connection throws here instead of hanging
+ * the loop. Throws on ok:false so the caller's retry path recovers.
+ * allowed_updates is sent every call (Telegram drops my_chat_member /
+ * callback_query otherwise on a fresh deploy — no server-side state assumed).
+ */
+export async function getUpdates(offset: number, timeoutSec: number): Promise<TgUpdate[]> {
+  const allowed = encodeURIComponent(JSON.stringify([
+    "message", "edited_message", "my_chat_member", "callback_query",
+  ]));
+  const url = `${getApiBase()}/getUpdates?timeout=${timeoutSec}&offset=${offset}&allowed_updates=${allowed}`;
+  const resp = await fetchWithTimeout(url, (timeoutSec + 15) * 1000);
+  const json = (await resp.json()) as TgResp;
+  if (!json.ok) {
+    throw new Error(`getUpdates: ${json.description ?? "(no description)"}`);
+  }
+  return json.result ?? [];
+}
+
+/**
+ * Fetch the bot's own identity (getMe), with a 15s client timeout. Pure wire:
+ * returns the parsed Bot API response and lets errors propagate. The poller's
+ * preflight owns the policy (capture bot id, exit on a rejected token,
+ * warn-and-continue on a transient network failure).
+ */
+export async function getMe(): Promise<{ ok: boolean; result?: { id?: number; username?: string }; description?: string }> {
+  const resp = await fetchWithTimeout(`${getApiBase()}/getMe`, 15_000);
+  return (await resp.json()) as { ok: boolean; result?: { id?: number; username?: string }; description?: string };
 }

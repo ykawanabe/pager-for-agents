@@ -55,7 +55,16 @@ import {
   editMessageText,
   sendInlineKeyboard,
   answerCallback,
-  getApiBase,
+  getUpdates,
+  getMe,
+} from "../channels/telegram/adapter";
+// Raw Telegram inbound wire types. The poller still consumes TgUpdate directly
+// in P1; P3's cutover replaces these with the normalized InboundEvent.
+import type {
+  TgMessage,
+  TgUpdate,
+  TgChatMemberUpdated,
+  TgCallbackQuery,
 } from "../channels/telegram/adapter";
 
 // Poller-side cache key for Telegram updates. Hardcoded "telegram" because
@@ -873,20 +882,6 @@ function startInjectWatcher(): void {
 let botUserId: number | null = null; // captured from preflight (getMe)
 let pendingPair: { chat_id: number; inviter_user_id: number; expires_at: number } | null = null;
 const PENDING_PAIR_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-interface TgChatMemberUpdated {
-  chat: { id: number; title?: string };
-  from: { id: number; first_name?: string; username?: string };
-  new_chat_member: { user: { id: number; is_bot: boolean }; status: string };
-  old_chat_member: { user: { id: number; is_bot: boolean }; status: string };
-}
-
-interface TgCallbackQuery {
-  id: string;
-  from: { id: number; first_name?: string };
-  message?: { chat: { id: number }; message_id: number; message_thread_id?: number; text?: string };
-  data?: string;
-}
 
 /**
  * Telegram fires this when the bot's status in a chat changes. We care about
@@ -1749,33 +1744,6 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
 
 // ─── update routing ──────────────────────────────────────────────────────────
 
-interface TgUser { id: number; }
-interface TgChat { id: number; }
-interface TgForumTopicCreated { name: string; icon_color?: number; icon_custom_emoji_id?: string; }
-interface TgForumTopicEdited { name?: string; icon_custom_emoji_id?: string; }
-interface TgMessage {
-  message_id: number;
-  from?: TgUser;
-  chat: TgChat;
-  message_thread_id?: number;
-  text?: string;
-  caption?: string;
-  // Service messages carrying forum topic lifecycle events. Telegram emits
-  // these inside the topic itself (message_thread_id is the new topic id) when
-  // a topic is created or renamed. There's no Bot API getForumTopic, so this
-  // is the *only* way to learn topic names — meaning we can only know about
-  // topics created / renamed *after* the bot joined the group.
-  forum_topic_created?: TgForumTopicCreated;
-  forum_topic_edited?: TgForumTopicEdited;
-}
-interface TgUpdate {
-  update_id: number;
-  message?: TgMessage;
-  edited_message?: TgMessage;
-  my_chat_member?: TgChatMemberUpdated;
-  callback_query?: TgCallbackQuery;
-}
-interface TgResp { ok: boolean; result?: TgUpdate[]; description?: string; }
 
 // ─── mounts cache ────────────────────────────────────────────────────────────
 // Hot-reload on mtime change so `cta mount/umount` is picked up without
@@ -1980,40 +1948,6 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
 
 // ─── main loop ───────────────────────────────────────────────────────────────
 
-/** fetch with a hard client-side timeout. Telegram long-poll only sets a
- *  SERVER-side timeout; without a client abort, a half-open/stalled TCP
- *  connection (Wi-Fi flap, NAT drop) makes `await fetch` hang forever and
- *  wedges the poll loop — alive but stuck, heartbeat frozen. AbortController
- *  bounds it so the call throws and the loop's retry path recovers. */
-export async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestInit): Promise<Response> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function getUpdates(offset: number): Promise<TgUpdate[]> {
-  // Default getUpdates does NOT include my_chat_member or callback_query.
-  // Pass allowed_updates explicitly so the auto-pair flow can fire. Telegram
-  // remembers the last allowed_updates per-bot, but we pass it every call so
-  // a fresh deploy works correctly without any server-side state assumption.
-  const allowed = encodeURIComponent(JSON.stringify([
-    "message", "edited_message", "my_chat_member", "callback_query",
-  ]));
-  const url = `${getApiBase()}/getUpdates?timeout=${POLL_TIMEOUT_SEC}&offset=${offset}&allowed_updates=${allowed}`;
-  // Client timeout = server long-poll window + 15s slack. A stalled connection
-  // aborts here instead of hanging the loop forever.
-  const resp = await fetchWithTimeout(url, (POLL_TIMEOUT_SEC + 15) * 1000);
-  const json = (await resp.json()) as TgResp;
-  if (!json.ok) {
-    throw new Error(`getUpdates: ${json.description ?? "(no description)"}`);
-  }
-  return json.result ?? [];
-}
-
 /**
  * Verify the bot token works before entering the long-poll loop. Without this
  * preflight, a bad token causes getUpdates to 401-loop silently in the
@@ -2023,8 +1957,7 @@ async function getUpdates(offset: number): Promise<TgUpdate[]> {
  */
 async function preflightBotToken(): Promise<void> {
   try {
-    const resp = await fetchWithTimeout(`${getApiBase()}/getMe`, 15_000);
-    const json = (await resp.json()) as { ok: boolean; result?: { id?: number; username?: string }; description?: string };
+    const json = await getMe();
     if (!json.ok) {
       process.stderr.write(`poller: bot token rejected by Bot API: ${json.description ?? "(no description)"}\n`);
       process.stderr.write(`poller: edit $HOME/.claude/channels/telegram/.env and rerun ./install.sh\n`);
@@ -2087,7 +2020,7 @@ export async function main(): Promise<void> {
     await processInjectFlags();
     let updates: TgUpdate[];
     try {
-      updates = await getUpdates(offset);
+      updates = await getUpdates(offset, POLL_TIMEOUT_SEC);
     } catch (e) {
       process.stderr.write(`poller: getUpdates failed: ${e instanceof Error ? e.message : String(e)}\n`);
       await new Promise((r) => setTimeout(r, 5_000));

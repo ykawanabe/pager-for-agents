@@ -1,5 +1,5 @@
 import { test, expect, afterAll } from "bun:test";
-import { fetchWithTimeout } from "./poller";
+import { fetchWithTimeout } from "../channels/telegram/adapter";
 
 // A server that delays past the timeout, to prove the client aborts.
 const server = Bun.serve({
