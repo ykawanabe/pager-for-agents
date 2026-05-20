@@ -35,16 +35,6 @@ set -uo pipefail
 # wins for entries we don't list.
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
 
-# Prefer the tmux bundled inside Claude Pager.app so it inherits the
-# Pager's Full Disk Access grant (codesigned into the bundle). When the
-# bundled copy is absent — older Pager install or Pager not installed —
-# fall back to whatever PATH lookup finds.
-TMUX_BUNDLED="$HOME/Applications/Claude Pager.app/Contents/MacOS/tmux"
-if [[ -x "$TMUX_BUNDLED" ]]; then
-    tmux() { "$TMUX_BUNDLED" "$@"; }
-    export -f tmux 2>/dev/null || true
-fi
-
 PLIST_LABEL="com.claude-agent"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
