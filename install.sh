@@ -171,9 +171,11 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/poller/claude-daemon-registry.ts" \
      "$REPO_DIR/agent/poller/slash-commands.ts" \
      "$AGENT_DIR/poller/"
-  # Telegram outbound wire adapter (ChatTransport migration P1). poller.ts
-  # imports it via ../channels/telegram/adapter; without this copy the
-  # installed poller crashes on startup ("Cannot find module").
+  # Chat-channel modules (ChatTransport migration). Platform-agnostic core
+  # contract (types.ts) + Telegram wire adapter. poller.ts imports the adapter
+  # via ../channels/telegram/adapter; without these copies the installed poller
+  # crashes on startup ("Cannot find module").
+  cp "$REPO_DIR/agent/channels/types.ts" "$AGENT_DIR/channels/"
   cp "$REPO_DIR/agent/channels/telegram/adapter.ts" "$AGENT_DIR/channels/telegram/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
