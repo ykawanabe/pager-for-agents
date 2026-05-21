@@ -595,6 +595,13 @@ function initDaemonRegistry(): void {
   if (daemonRegistry) return;
   daemonRegistry = new ClaudeDaemonRegistry({
     debounceMs: Number(process.env.PAGER_DAEMON_DEBOUNCE_MS ?? "2000"),
+    // Self-heal guards (incident 2026-05-21). Defaults are conservative;
+    // overridable for tuning + fast live verification.
+    //   RELEASE_MAX_MS      — orphaned β-handoff TTL (released topic abandoned
+    //                          by a dead terminal → next message reacquires)
+    //   INFLIGHT_TIMEOUT_MS — inactivity watchdog for a wedged turn
+    releaseMaxMs: Number(process.env.RELEASE_MAX_MS ?? `${10 * 60_000}`),
+    inFlightTimeoutMs: Number(process.env.INFLIGHT_TIMEOUT_MS ?? `${5 * 60_000}`),
     // Test seam: e2e scenarios point this at fixtures/fake-claude-daemon.sh so
     // a turn can run without spawning real `claude`. Unset in production →
     // registry defaults to "claude".
