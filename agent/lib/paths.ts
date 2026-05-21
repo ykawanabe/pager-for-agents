@@ -60,6 +60,7 @@ export function typingDir(): string { return join(stateDir(), "typing"); }
 export function agentLog(): string { return join(stateDir(), "agent.log"); }
 export function agentErrLog(): string { return join(stateDir(), "agent.err.log"); }
 export function sharedContextMd(): string { return join(stateDir(), "shared-context.md"); }
+export function settingsJson(): string { return join(stateDir(), "settings.json"); }
 
 // ─── Install paths ────────────────────────────────────────────────────────────
 
