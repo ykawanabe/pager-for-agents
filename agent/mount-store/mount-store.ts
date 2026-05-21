@@ -76,6 +76,7 @@ import {
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { mountsJson, stateDir } from "../lib/paths";
+import type { Channel } from "../channels/types";
 
 const STATE_DIR = stateDir();
 const MOUNTS_JSON = mountsJson();
@@ -97,11 +98,14 @@ const LOCK_RETRY_MAX = 200; // ~10s total
 export type ThreadId = number | "dm" | "*";
 
 /**
- * Messaging platform identifier. New channels get added here as their
- * adapters land. The string is namespaced storage-side; downstream code
- * matches against this exact value.
+ * Messaging platform identifier. The canonical definition lives in the
+ * ChatTransport contract (`channels/types.ts`) so the storage layer and the
+ * transport layer can never drift — re-exported here for mount-store consumers.
+ * (P3: the v2 schema already added the explicit `channel` field; this just
+ * makes its type authoritative, so a future adapter — discord, etc. — is
+ * accepted without a parallel edit here. No schema-version bump needed.)
  */
-export type Channel = "telegram" | "line";
+export type { Channel };
 
 export const DEFAULT_CHANNEL: Channel = "telegram";
 
