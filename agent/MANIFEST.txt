@@ -29,6 +29,7 @@ poller/claude-daemon.ts	agent	644
 poller/claude-daemon-registry.ts	agent	644
 poller/buttons-marker.ts	agent	644
 poller/slash-commands.ts	agent	644
+poller/watch-render.ts	agent	644
 
 # Chat-channel adapters (ChatTransport migration). Platform-agnostic core
 # contract + per-platform wire adapters.
