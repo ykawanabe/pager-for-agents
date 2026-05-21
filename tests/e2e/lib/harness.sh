@@ -63,6 +63,7 @@ h_setup_sandbox() {
   cp "$REPO_DIR/agent/poller/claude-daemon.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/claude-daemon-registry.ts" "$CTA_INSTALL_DIR/agent/poller/"
   cp "$REPO_DIR/agent/poller/buttons-marker.ts" "$CTA_INSTALL_DIR/agent/poller/"
+  cp "$REPO_DIR/agent/poller/watch-render.ts" "$CTA_INSTALL_DIR/agent/poller/"
   # Chat-channel modules (ChatTransport migration). poller.ts imports the wire
   # adapter (P1) + the TelegramTransport (P3) which pulls in the core types —
   # without these copies the sandboxed poller crashes on startup ("Cannot find

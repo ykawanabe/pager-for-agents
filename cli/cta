@@ -800,6 +800,11 @@ _mount_store_path() {
   echo "$d/mount-store/mount-store.ts"
 }
 
+_watch_render_path() {
+  local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
+  echo "$d/poller/watch-render.ts"
+}
+
 _topic_wrapper_path() {
   local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
   echo "$d/topic-wrapper.sh"
@@ -1108,48 +1113,20 @@ cmd_watch() {
     exit 1
   fi
 
-  local mount_json
-  mount_json=$(bun run "$store" get "$thread_id" 2>/dev/null || echo "null")
-  if [[ -z "$mount_json" || "$mount_json" == "null" ]]; then
-    echo "cta watch: no mount for thread '$thread_id'" >&2
+  # P6: Phase 4 daemons have no per-topic tmux pane to capture — render the
+  # topic's conversation from its on-disk claude session JSONL instead.
+  # watch-render does the mount + session-uuid + JSONL resolution and exits
+  # 0 (ok) / 1 (no mount, bad args) / 2 (no transcript yet), matching the
+  # contract Pager's WatchLive consumes. --ansi/--follow are inert (no ANSI in
+  # JSONL; streaming dropped in P6 — one-shot snapshot).
+  : "$keep_ansi" "$follow"
+  local render
+  render=$(_watch_render_path)
+  if [[ ! -f "$render" ]]; then
+    echo "cta watch: watch-render not installed at $render — rerun install.sh" >&2
     exit 1
   fi
-
-  local tmux_session
-  tmux_session=$(echo "$mount_json" | jq -r '.tmux_session // empty')
-  if [[ -z "$tmux_session" ]]; then
-    echo "cta watch: mount for '$thread_id' has no tmux_session field" >&2
-    exit 1
-  fi
-
-  if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
-    echo "cta watch: tmux session '$tmux_session' is not alive" >&2
-    exit 2
-  fi
-
-  local capture_args=(-p -S "-$lines" -t "$tmux_session")
-  if [[ "$keep_ansi" == "1" ]]; then
-    capture_args=(-e "${capture_args[@]}")
-  fi
-
-  # --follow path: print last $lines from the per-topic log file, then
-  # tail -F (capital — survives truncate/recreate on respawn). Falls
-  # back to snapshot mode if the log doesn't exist yet (topic-wrapper
-  # hasn't set up pipe-pane, e.g. older session predating B.1).
-  if [[ "$follow" == "1" ]]; then
-    local topic_log="$STATE_DIR/topics/$thread_id.log"
-    if [[ -f "$topic_log" ]]; then
-      # tail -F follows by name + survives truncation (rotated on respawn).
-      # Don't strip ANSI here — caller can pipe through their own filter.
-      tail -n "$lines" -F "$topic_log"
-      return
-    fi
-    echo "cta watch --follow: per-topic log not yet available at $topic_log" >&2
-    echo "  (topic-wrapper sets it up on next claude respawn — try 'cta start' to refresh)" >&2
-    exit 2
-  fi
-
-  tmux capture-pane "${capture_args[@]}"
+  bun run "$render" "$thread_id" --lines "$lines"
 }
 
 # `cta send <thread> <text...>` — deliver text into a topic's claude daemon.
