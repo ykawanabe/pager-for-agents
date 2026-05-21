@@ -1076,7 +1076,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
   if (!mount) {
     await reply(
       { chat_id, thread_id: thread_id_raw },
-      "Nothing to clear — no mount in this topic. Send a message to start a mount-helper session, or `cta mount` from your Mac.",
+      "Nothing to clear — no project linked to this topic yet. Send a message and pick a directory from the buttons, or `cta mount <path>` from your Mac.",
     );
     return;
   }
@@ -1084,7 +1084,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
   if (mount.provisional) {
     await reply(
       { chat_id, thread_id: thread_id_raw },
-      "This topic is in mount-helper mode (no project session running yet). Send `/cancel` to abort the helper instead.",
+      "This topic has a pending mount, not a running session — nothing to clear. Send `/cancel` to drop it, or `cta mount <path>` from your Mac.",
     );
     return;
   }
@@ -1132,7 +1132,7 @@ async function handleCancel(msg: TgMessage): Promise<void> {
   if (!mount?.provisional) {
     await reply(
       { chat_id, thread_id: thread_id_raw },
-      "Nothing to cancel — this topic isn't in mount-helper mode.",
+      "Nothing to cancel — this topic has no pending mount.",
     );
     return;
   }
