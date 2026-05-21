@@ -24,7 +24,6 @@ watch_network.sh	bin	755
 
 # Poller (TypeScript / bun)
 poller/poller.ts	agent	644
-poller/typing-keepalive.ts	agent	644
 poller/package.json	agent	644
 poller/claude-daemon.ts	agent	644
 poller/claude-daemon-registry.ts	agent	644
@@ -35,6 +34,7 @@ poller/slash-commands.ts	agent	644
 channels/types.ts	agent	644
 channels/telegram/adapter.ts	agent	644
 channels/telegram/transport.ts	agent	644
+channels/telegram/typing-keepalive.ts	agent	644
 
 # Outbound MCP server
 mcp-telegram/server.ts	agent	644

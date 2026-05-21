@@ -7,7 +7,7 @@
  * interfaces it advertises (compile-time assignment + runtime type guards).
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -19,6 +19,8 @@ process.env.CTA_STATE_DIR = STATE;
 process.env.ACCESS_JSON = ACCESS_JSON;
 process.env.TELEGRAM_BOT_TOKEN = "fake";
 process.env.POLL_TIMEOUT_SEC = "1";
+process.env.TYPING_INTERVAL_MS = "50"; // short keepalive loop so tests don't linger
+process.env.TYPING_MAX_MS = "500";
 
 // ─── fake Bot API ─────────────────────────────────────────────────────────────
 type Sent = { chat_id: number | string; message_thread_id?: number; text: string; reply_markup?: unknown };
@@ -97,14 +99,14 @@ describe("capabilities", () => {
 
 describe("conformance (type guards reflect implemented interfaces)", () => {
   const t = new TelegramTransport();
-  test("implements editable / reactable / buttons / proactive", () => {
+  test("implements editable / reactable / typing / buttons / proactive", () => {
     expect(guards.isEditable(t)).toBe(true);
     expect(guards.isReactable(t)).toBe(true);
+    expect(guards.isTyping(t)).toBe(true);
     expect(guards.isButtonCapable(t)).toBe(true);
     expect(guards.isProactive(t)).toBe(true);
   });
-  test("does NOT advertise the deferred interfaces (typing/files/slash)", () => {
-    expect(guards.isTyping(t)).toBe(false);
+  test("does NOT advertise the deferred interfaces (files/slash)", () => {
     expect(guards.isFileCapable(t)).toBe(false);
     expect(guards.isSlashCommandable(t)).toBe(false);
   });
@@ -174,6 +176,15 @@ describe("wire methods route at the Bot API", () => {
     const me = await t.whoami();
     expect(me.id).toBe("4242");
     expect(me.username).toBe("pager_bot");
+  });
+
+  test("startTyping writes the typing marker; clearTypingExternal removes it", async () => {
+    const addr = { channel: "telegram" as const, chatId: -100, threadId: 42 };
+    const markerPath = join(STATE, "typing", "-100__42.token");
+    await t.startTyping(addr); // marker written synchronously; keepalive loop fire-and-forget
+    expect(existsSync(markerPath)).toBe(true);
+    await t.clearTypingExternal(addr);
+    expect(existsSync(markerPath)).toBe(false);
   });
 });
 

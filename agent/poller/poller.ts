@@ -49,7 +49,6 @@ import type { ClaudeDaemonOptions } from "./claude-daemon";
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
 // keepalive, offset — and drives this dumb wire. See ../channels/telegram/adapter.ts.
 import {
-  sendChatAction,
   sendInlineKeyboard,
   answerCallback,
   getUpdates,
@@ -99,7 +98,6 @@ async function editMessageText(chat_id: number, message_id: number, text: string
 function tgKey(thread_id: ThreadId): string {
   return mountKey("telegram", thread_id);
 }
-import { markTypingActive, markTypingDone, runTypingKeepalive } from "./typing-keepalive";
 import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs } from "../lib/paths";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
@@ -242,8 +240,8 @@ function effectiveUserId(): number | null {
 // N:1 fan-in: one daemon flush drains the whole per-topic queue, flipping every
 // message dispatched in that debounce window at once.
 //
-// (The typing indicator is still adapter-based below — sendTyping /
-// startTypingKeepalive; TypingIndicating moves to the transport in a later slice.)
+// (Typing is likewise transport-owned now — TypingIndicating.startTyping at
+// dispatch + clearTypingExternal at turn-end.)
 
 /** Per-topic queue of ack handles awaiting the "read" flip. Drained on onFlush. */
 const pendingReadAcks: Map<string, AckHandle[]> = new Map();
@@ -318,38 +316,10 @@ function recordTopicName(chat_id: number, thread_id: number, name: string): void
   }
 }
 
-// Thin wrapper over the adapter's sendChatAction. Kept as a named poller
-// function because it's the typing-keepalive loop's `send` callback and part
-// of the exported test surface (poller.sendTyping).
-async function sendTyping(chat_id: number, thread_id?: number): Promise<void> {
-  await sendChatAction(chat_id, thread_id);
-}
-
-// Tunables. Defaults: 4s between fires (Telegram clears typing at 5s, so this
-// leaves ~1s of overlap), 10 minutes hard cap so a crashed mcp-telegram can't
-// leave the loop spinning forever. Env overrides exist for tests + operator
-// tuning; production should leave them alone.
-const TYPING_INTERVAL_MS = Number(process.env.TYPING_INTERVAL_MS ?? "4000");
-const TYPING_MAX_MS = Number(process.env.TYPING_MAX_MS ?? `${10 * 60_000}`);
-
-/**
- * Writes the per-target marker, then runs the keepalive loop. Fire-and-
- * forget from the caller's perspective — the loop returns when the marker
- * is cleared (by mcp-telegram on reply), replaced (by a newer dispatch
- * taking over), or the hard cap elapses.
- */
-async function startTypingKeepalive(chat_id: number, thread_id?: number): Promise<void> {
-  const token = markTypingActive(STATE_DIR, chat_id, thread_id);
-  await runTypingKeepalive({
-    stateDir: STATE_DIR,
-    chatId: chat_id,
-    threadId: thread_id,
-    token,
-    send: () => sendTyping(chat_id, thread_id),
-    intervalMs: TYPING_INTERVAL_MS,
-    maxMs: TYPING_MAX_MS,
-  });
-}
+// Typing indicator moved to the ChatTransport (TypingIndicating). The poller
+// calls transport.startTyping at dispatch and transport.clearTypingExternal at
+// turn-end; the keepalive loop + the on-disk marker (still read by mcp-telegram
+// and Pager) live in the transport now.
 
 // Telegram-friendliness instructions appended via --append-system-prompt
 // on every daemon spawn (Phase 4). No picker-avoidance section because
@@ -612,7 +582,7 @@ function onDaemonTurnEnd(threadIdStr: string, info: { costUsd: number | null; se
   if (chatIdStr) {
     const chat_id = Number(chatIdStr);
     if (Number.isFinite(chat_id)) {
-      markTypingDone(STATE_DIR, chat_id, parseRegistryThreadId(threadIdStr) ?? "dm");
+      void transport.clearTypingExternal({ channel: "telegram", chatId: chat_id, threadId: parseRegistryThreadId(threadIdStr) });
     }
   }
   if (typeof info.costUsd === "number") {
@@ -649,9 +619,9 @@ async function daemonDispatch(threadIdStr: string, msg: TgMessage): Promise<void
     process.stderr.write("poller: daemonDispatch called before initDaemonRegistry — initializing on demand\n");
     initDaemonRegistry();
   }
-  // Typing keepalive — fast Bot API call, cleared by onDaemonTurnEnd on the
-  // result event. Fire-and-forget.
-  void startTypingKeepalive(msg.chat.id, msg.message_thread_id);
+  // Typing keepalive (via the transport) — fast Bot API call + disk marker,
+  // cleared at turn-end via clearTypingExternal. Fire-and-forget.
+  void transport.startTyping({ channel: "telegram", chatId: msg.chat.id, threadId: msg.message_thread_id });
   // Delivered ack (👀): the transport reads the operator glyph (access.json) and
   // returns a handle to flip to 👌 on flush — or null if the operator disabled it
   // (skip the ack pipeline). Await so the handle is queued BEFORE enqueue; the
@@ -2030,8 +2000,6 @@ export {
   handleHelp,
   refreshPairedIfChanged,
   refreshMountsIfChanged,
-  sendTyping,
-  startTypingKeepalive,
   effectiveChatId,
   effectiveUserId,
   type TgMessage,
