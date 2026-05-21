@@ -134,11 +134,12 @@ export type InboundEvent<Raw = unknown> =
       from: SenderId;
       label: string;
       messageRef: MessageRef;
+      raw: Raw;
     }
-  | { kind: "topic-created"; routingKey: RoutingKey; name: string }
-  | { kind: "topic-renamed"; routingKey: RoutingKey; name: string }
-  | { kind: "joined"; address: ChatAddress; invitedBy?: SenderId; chatTitle?: string; needsAdminForText?: boolean }
-  | { kind: "removed"; address: ChatAddress }
+  | { kind: "topic-created"; routingKey: RoutingKey; name: string; raw: Raw }
+  | { kind: "topic-renamed"; routingKey: RoutingKey; name: string; raw: Raw }
+  | { kind: "joined"; address: ChatAddress; invitedBy?: SenderId; chatTitle?: string; needsAdminForText?: boolean; raw: Raw }
+  | { kind: "removed"; address: ChatAddress; raw: Raw }
   // reconnecting; informational. Fatal errors → adapter throws from start()/run
   // loop → process.exit → launchd respawn.
   | { kind: "transport-degraded"; reason: string };

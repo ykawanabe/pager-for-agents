@@ -1965,46 +1965,59 @@ export async function main(): Promise<void> {
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
   process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
 
-  for (;;) {
-    touchHeartbeat();
-    refreshMountsIfChanged();
-    refreshPairedIfChanged();
-    refreshSettingsIfChanged();
-    // Idle-daemon eviction (opt-in): reclaim RAM from topics quiet ≥ N min.
-    // Reuses resetTopic → the next message respawns + --resumes (cold start,
-    // no context loss). No-op unless the operator set a threshold.
-    if (daemonRegistry && idleEvictMinutes > 0) {
-      const evicted = await daemonRegistry.sweepIdle(idleEvictMinutes * 60_000);
-      if (evicted.length > 0) {
-        process.stdout.write(`[${new Date().toISOString()}] evicted ${evicted.length} idle daemon(s) after ${idleEvictMinutes}m: ${evicted.join(", ")}\n`);
+  // ── Housekeeping off the poll cadence ──────────────────────────────────────
+  // P3a: transport.start() below owns the inbound long-poll loop (it blocks on
+  // getUpdates), so the periodic upkeep that used to ride each loop iteration
+  // now runs on its own timer. A re-entrancy guard keeps a slow idle-sweep from
+  // overlapping the next tick.
+  let housekeeping = false;
+  const housekeep = (): void => {
+    if (housekeeping) return;
+    housekeeping = true;
+    void (async () => {
+      try {
+        touchHeartbeat();
+        refreshMountsIfChanged();
+        refreshPairedIfChanged();
+        refreshSettingsIfChanged();
+        // Idle-daemon eviction (opt-in): reclaim RAM from topics quiet ≥ N min.
+        // Reuses resetTopic → next message respawns + --resumes (cold start, no
+        // context loss). No-op unless the operator set a threshold.
+        if (daemonRegistry && idleEvictMinutes > 0) {
+          const evicted = await daemonRegistry.sweepIdle(idleEvictMinutes * 60_000);
+          if (evicted.length > 0) {
+            process.stdout.write(`[${new Date().toISOString()}] evicted ${evicted.length} idle daemon(s) after ${idleEvictMinutes}m: ${evicted.join(", ")}\n`);
+          }
+        }
+        // β handoff release/reacquire flags + watch-live inject. fs.watch
+        // handles immediacy; this is the steady-state fallback drain.
+        await processReleaseFlags();
+        await processInjectFlags();
+      } catch (e) {
+        process.stderr.write(`poller: housekeeping tick failed: ${e instanceof Error ? e.message : String(e)}\n`);
+      } finally {
+        housekeeping = false;
       }
-    }
-    // β handoff: process any release / reacquire flag files written by
-    // `cta release-daemon` / Pager. Cheap when the dir is empty (steady
-    // state — nobody clicks "Open in Terminal" most of the time).
-    await processReleaseFlags();
-    // Watch-live input: drain any inject files (fallback to the fs.watch path).
-    await processInjectFlags();
-    let updates: TgUpdate[];
-    try {
-      updates = await getUpdates(offset, POLL_TIMEOUT_SEC);
-    } catch (e) {
-      process.stderr.write(`poller: getUpdates failed: ${e instanceof Error ? e.message : String(e)}\n`);
-      await new Promise((r) => setTimeout(r, 5_000));
-      continue;
-    }
-    if (updates.length === 0) continue;
+    })();
+  };
+  housekeep(); // once immediately — the old loop did upkeep before its first poll
+  const housekeepTimer = setInterval(housekeep, 5_000);
 
-    // Persist offset BEFORE dispatching, per eng review: prefer dropping
-    // a batch on mid-dispatch crash over re-delivering duplicates.
-    const maxId = updates[updates.length - 1].update_id;
-    writeOffset(maxId + 1);
-    offset = maxId + 1;
-
-    for (const u of updates) {
-      await dispatchUpdate(u);
+  // ── Inbound: drive dispatch through the ChatTransport ──────────────────────
+  // P3a: the poller no longer owns the getUpdates loop — TelegramTransport.start()
+  // does, using the SAME offset file + offset-before-dispatch durability
+  // contract. Every telegram-derived event carries the raw TgUpdate, so the
+  // existing dispatchUpdate runs unchanged; only loop ownership moved. (Migrating
+  // dispatchUpdate onto normalized ChatAddress/MessageRef is a later step.)
+  transport.onEvent(async (ev) => {
+    if (ev.kind === "transport-degraded") {
+      process.stderr.write(`poller: transport degraded: ${ev.reason}\n`);
+      return;
     }
-  }
+    await dispatchUpdate(ev.raw as TgUpdate);
+  });
+  await transport.start({});
+  clearInterval(housekeepTimer); // unreachable in steady state (start() blocks)
 }
 
 // Tests import this module to drive command handlers directly. Only run the
