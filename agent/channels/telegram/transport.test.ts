@@ -140,6 +140,14 @@ describe("wire methods route at the Bot API", () => {
     expect(reactions).toHaveLength(0);
   });
 
+  test("setDeliveredAck returns null on malformed access.json (no throw)", async () => {
+    writeFileSync(ACCESS_JSON, "{ not valid json");
+    reactions.length = 0;
+    const h = await t.setDeliveredAck({ channel: "telegram", chatId: 1, messageId: 1 });
+    expect(h).toBeNull();
+    expect(reactions).toHaveLength(0);
+  });
+
   test("setReadAcks flips many handles to 👌 (N:1 flush)", async () => {
     const handles = await Promise.all([
       t.setDeliveredAck({ channel: "telegram", chatId: 1, messageId: 1 }),

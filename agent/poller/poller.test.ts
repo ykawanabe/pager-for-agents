@@ -96,7 +96,6 @@ function resetState(): void {
   mkdirSync(STATE, { recursive: true, mode: 0o700 });
   poller.refreshPairedIfChanged();
   poller.refreshMountsIfChanged();
-  poller.refreshAckReactionIfChanged();
   poller._setBotUserIdForTest(99999); // pretend bot id; tests use distinct user ids
 }
 
@@ -381,7 +380,7 @@ describe("plain text (non-command) handling", () => {
   });
 });
 
-describe("typing + ack reaction (UX signals)", () => {
+describe("typing (UX signal)", () => {
   test("sendTyping fires sendChatAction with 'typing' action", async () => {
     await poller.sendTyping(-1001, 42);
     expect(chatActions.length).toBe(1);
@@ -397,48 +396,10 @@ describe("typing + ack reaction (UX signals)", () => {
     expect(chatActions[0].message_thread_id).toBeUndefined();
   });
 
-  test("reactToMessage no-ops when ackReaction not configured", async () => {
-    // Explicit access.json with empty config — mtime changes from any prior
-    // test's write, forces refresh to clear the cache. (Module-level cache
-    // doesn't reset across tests unless an mtime change triggers reload.)
-    writeFileSync(ACCESS_JSON, JSON.stringify({}));
-    poller.refreshAckReactionIfChanged();
-    await poller.reactToMessage(-1001, 50);
-    expect(reactions.length).toBe(0);
-  });
-
-  test("reactToMessage fires setMessageReaction when ackReaction is set", async () => {
-    // Each test needs a fresh mtime so the cache reloads.
-    await new Promise((r) => setTimeout(r, 10));
-    writeFileSync(ACCESS_JSON, JSON.stringify({ ackReaction: "👀" }));
-    poller.refreshAckReactionIfChanged();
-    await poller.reactToMessage(-1001, 50);
-    expect(reactions.length).toBe(1);
-    expect(reactions[0].chat_id).toBe(-1001);
-    expect(reactions[0].message_id).toBe(50);
-    expect(reactions[0].reaction[0]).toEqual({ type: "emoji", emoji: "👀" });
-  });
-
-  test("ackReaction reloads when access.json mtime changes", async () => {
-    await new Promise((r) => setTimeout(r, 10));
-    writeFileSync(ACCESS_JSON, JSON.stringify({ ackReaction: "👀" }));
-    poller.refreshAckReactionIfChanged();
-    await poller.reactToMessage(-1001, 1);
-    expect(reactions.length).toBe(1);
-
-    // Toggle off — remove the field. Mtime changes so cache invalidates.
-    await new Promise((r) => setTimeout(r, 10));
-    writeFileSync(ACCESS_JSON, JSON.stringify({}));
-    poller.refreshAckReactionIfChanged();
-    await poller.reactToMessage(-1001, 2);
-    expect(reactions.length).toBe(1); // no new reaction fired
-  });
-
-  test("ackReaction handles malformed access.json gracefully", async () => {
-    writeFileSync(ACCESS_JSON, "{ not valid json");
-    // Should not throw, just leave the cache as-is and log to stderr.
-    expect(() => poller.refreshAckReactionIfChanged()).not.toThrow();
-  });
+  // The 2-stage ack (👀→👌) is now owned by the ChatTransport (Reactable):
+  // glyph-from-access.json, null-when-off, and the 👌 read-flip are covered in
+  // channels/telegram/transport.test.ts; the end-to-end poller→daemon→flush
+  // pipeline is covered by tests/e2e/scenarios/ack_reaction.sh.
 });
 
 describe("typing keepalive", () => {

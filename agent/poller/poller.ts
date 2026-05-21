@@ -49,7 +49,6 @@ import type { ClaudeDaemonOptions } from "./claude-daemon";
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
 // keepalive, offset — and drives this dumb wire. See ../channels/telegram/adapter.ts.
 import {
-  setReaction,
   sendChatAction,
   sendInlineKeyboard,
   answerCallback,
@@ -65,6 +64,7 @@ import type {
   TgCallbackQuery,
 } from "../channels/telegram/adapter";
 import { TelegramTransport } from "../channels/telegram/transport";
+import type { AckHandle } from "../channels/types";
 
 // ─── ChatTransport (P3, incremental cutover) ─────────────────────────────────
 // The poller drives outbound through the ChatTransport interface, not the wire
@@ -117,9 +117,6 @@ const HEARTBEAT_FILE = heartbeatFile();
 const MOUNTS_JSON = mountsJson();
 const PAIRING_CODE_FILE = pairingCodeFile();
 const PAIRED_STATE_FILE = pairedStateFile();
-// Pager writes the ack-reaction toggle here as `ackReaction: "👀"` (or absent
-// for "off"). Single source of truth — Pager-driven config the poller reads.
-const ACCESS_JSON = process.env.ACCESS_JSON ?? join(homedir(), ".claude/channels/telegram/access.json");
 // Topic-name cache: poller writes, Pager reads. Updated when we see a
 // forum_topic_created / forum_topic_edited service message fly past. Key is
 // "<chat_id>/<message_thread_id>" so multi-chat installs don't collide on
@@ -235,92 +232,36 @@ function effectiveUserId(): number | null {
 // is per-topic and only reachable from claude. The poller needs its own
 // outbound for `/pair`/`/mount` confirmations — no claude in the loop.
 
-// ─── ack reaction (👀) + typing indicator ────────────────────────────────────
-// Two lightweight UX signals fired on every dispatched message:
-//   1. setMessageReaction with a configurable emoji ("seen" signal).
-//      Toggle controlled by access.json's `ackReaction` field. Pager writes it;
-//      poller reads it. Empty / absent = no reaction.
-//   2. sendChatAction "typing" so the user sees the bot "typing..." while
-//      claude is composing the reply. Telegram auto-clears typing at 5s, so
-//      a per-target keepalive loop re-fires it every ~4s. mcp-telegram clears
-//      the marker file after a successful sendMessage, which stops the loop.
-//      See typing-keepalive.ts.
+// ─── 2-stage reaction ack (👀 delivered → 👌 read) ───────────────────────────
+// Owned by the ChatTransport (Reactable). setDeliveredAck reads the operator
+// glyph (access.json) and sets 👀, returning a handle — or null if the operator
+// disabled the glyph; setReadAcks flips queued handles to 👌. Telegram allows
+// one reaction per bot per message, so the read REPLACES the delivered glyph
+// (swap, not stack — capabilities.ackMechanism = "reaction-swap").
+//
+// N:1 fan-in: one daemon flush drains the whole per-topic queue, flipping every
+// message dispatched in that debounce window at once.
+//
+// (The typing indicator is still adapter-based below — sendTyping /
+// startTypingKeepalive; TypingIndicating moves to the transport in a later slice.)
 
-let ackReactionCache: string | null = null;
-let accessMtimeMs = 0;
+/** Per-topic queue of ack handles awaiting the "read" flip. Drained on onFlush. */
+const pendingReadAcks: Map<string, AckHandle[]> = new Map();
 
-function refreshAckReactionIfChanged(): void {
-  let mtimeMs = 0;
-  try { mtimeMs = statSync(ACCESS_JSON).mtimeMs; } catch { /* missing */ }
-  if (mtimeMs === accessMtimeMs) return;
-  accessMtimeMs = mtimeMs;
-  if (mtimeMs === 0) { ackReactionCache = null; return; }
-  try {
-    const raw = readFileSync(ACCESS_JSON, "utf8");
-    const parsed = JSON.parse(raw) as { ackReaction?: unknown };
-    const v = typeof parsed.ackReaction === "string" ? parsed.ackReaction.trim() : "";
-    ackReactionCache = v.length > 0 ? v : null;
-    process.stdout.write(`[${new Date().toISOString()}] ack reaction reloaded: ${ackReactionCache ?? "(off)"}\n`);
-  } catch (e) {
-    process.stderr.write(`poller: access.json read failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
-}
-
-async function reactToMessage(chat_id: number, message_id: number): Promise<void> {
-  if (!ackReactionCache) return; // toggled off
-  // Policy lives here (whether to react + which glyph, from access.json); the
-  // wire is the adapter's setReaction. Telegram returns ok:false for invalid
-  // emojis (free-bot whitelist) — the adapter swallows it, the operator picks
-  // a valid glyph via Pager.
-  await setReaction(chat_id, message_id, ackReactionCache);
-}
-
-/**
- * Two-stage delivery semantics by **state transition on a single reaction**
- * (Telegram Bot API only allows ONE reaction per bot per message — multi-
- * emoji arrays get silently rejected). Initial `reactToMessage` sets 👀
- * ("delivered, poller queued it"); this one REPLACES 👀 with 👌
- * ("read, LLM started processing"). Replace-semantics give a useful
- * negative signal: if the user sees 👀 stuck without becoming 👌, something
- * downstream (daemon crash, queue stuck) prevented the LLM from reading.
- *
- * onFlush in `ClaudeDaemonRegistry` fires when the batch is written to
- * claude's stdin, which is the earliest point where "the LLM definitely
- * has it" is true. Failures after that (daemon crash mid-turn) don't roll
- * back the 👌 — it still means "we put it in front of the LLM."
- *
- * The read emoji is hard-coded for now. Could become a second config field
- * (`readReaction`) if a user wants a different "read" emoji. 👌 was picked
- * because it IS in the bot whitelist and reads naturally as "got it / read."
- * ✅ is NOT in the whitelist (silently rejected).
- */
-const READ_REACTION_EMOJI = "👌";
-
-async function markMessageRead(chat_id: number, message_id: number): Promise<void> {
-  if (!ackReactionCache) return; // delivered-ack off → read off too (paired toggle)
-  // Bots are limited to ONE reaction per message — replace 👀 with the read
-  // marker (👌) rather than appending. See doc on READ_REACTION_EMOJI.
-  await setReaction(chat_id, message_id, READ_REACTION_EMOJI);
-}
-
-/** Per-topic queue of msg refs awaiting the "read" ack. Drained on onFlush. */
-const pendingReadAcks: Map<string, Array<{ chat_id: number; message_id: number }>> = new Map();
-
-function trackPendingRead(threadIdStr: string, chat_id: number, message_id: number): void {
+function trackPendingRead(threadIdStr: string, handle: AckHandle): void {
   let list = pendingReadAcks.get(threadIdStr);
   if (!list) { list = []; pendingReadAcks.set(threadIdStr, list); }
-  list.push({ chat_id, message_id });
+  list.push(handle);
 }
 
-/** Registry onFlush hook: the batch just got written to claude's stdin, so
- *  every queued message in this turn is now "read" by the LLM. */
+/** Registry onFlush hook: the batch just got written to claude's stdin, so every
+ *  queued message in this turn is now "read" by the LLM. One flush → many handles
+ *  flipped to 👌 at once (N:1). */
 function onDaemonFlush(threadIdStr: string, _combinedText: string): void {
   const list = pendingReadAcks.get(threadIdStr);
   if (!list || list.length === 0) return;
   pendingReadAcks.delete(threadIdStr);
-  for (const { chat_id, message_id } of list) {
-    void markMessageRead(chat_id, message_id);
-  }
+  void transport.setReadAcks(list);
 }
 
 // ─── topic name cache ────────────────────────────────────────────────────────
@@ -701,21 +642,22 @@ function initDaemonRegistry(): void {
  * recovery. Fire-and-forget — replies flow back via the onText callback,
  * not via this function's return value.
  */
-function daemonDispatch(threadIdStr: string, msg: TgMessage): void {
+async function daemonDispatch(threadIdStr: string, msg: TgMessage): Promise<void> {
   const text = msg.text ?? msg.caption ?? "";
   if (!text) return;
   if (!daemonRegistry) {
     process.stderr.write("poller: daemonDispatch called before initDaemonRegistry — initializing on demand\n");
     initDaemonRegistry();
   }
-  // Fire typing keepalive + delivered ack (👀) in parallel — they're fast
-  // Bot API calls. mcp-telegram clears the typing marker if claude calls
-  // send_telegram; otherwise onDaemonTurnEnd clears it on the result event.
-  // The "read" ack (👀+✅) fires later via onDaemonFlush when the registry
-  // actually writes this batch to claude's stdin.
+  // Typing keepalive — fast Bot API call, cleared by onDaemonTurnEnd on the
+  // result event. Fire-and-forget.
   void startTypingKeepalive(msg.chat.id, msg.message_thread_id);
-  void reactToMessage(msg.chat.id, msg.message_id);
-  trackPendingRead(threadIdStr, msg.chat.id, msg.message_id);
+  // Delivered ack (👀): the transport reads the operator glyph (access.json) and
+  // returns a handle to flip to 👌 on flush — or null if the operator disabled it
+  // (skip the ack pipeline). Await so the handle is queued BEFORE enqueue; the
+  // flush fires ≥ debounce later, so it always finds it (no race).
+  const ack = await transport.setDeliveredAck({ channel: "telegram", chatId: msg.chat.id, messageId: msg.message_id });
+  if (ack) trackPendingRead(threadIdStr, ack);
 
   daemonRegistry!.enqueue(threadIdStr, text);
 }
@@ -1968,7 +1910,9 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
   // The registry owns spawn-if-needed, 2s debounce, per-topic queue, and
   // crash respawn. Reply text streams back asynchronously via the
   // postTelegramTextFromDaemon callback wired in initDaemonRegistry().
-  daemonDispatch(String(routeKey), msg);
+  // Fire-and-forget: daemonDispatch awaits the delivered-ack internally before
+  // enqueue, but the caller need not block on it.
+  void daemonDispatch(String(routeKey), msg);
   process.stdout.write(`[${new Date().toISOString()}] update ${u.update_id} → daemon[${routeKey}] (${text0.length} chars)\n`);
 }
 
@@ -2025,7 +1969,6 @@ export async function main(): Promise<void> {
   let offset = readOffset();
   refreshMountsIfChanged();
   refreshPairedIfChanged();
-  refreshAckReactionIfChanged();
   initDaemonRegistry();
   startInjectWatcher();
   await processInjectFlags(); // drain anything dropped before this poller started
@@ -2037,7 +1980,6 @@ export async function main(): Promise<void> {
     touchHeartbeat();
     refreshMountsIfChanged();
     refreshPairedIfChanged();
-    refreshAckReactionIfChanged();
     // β handoff: process any release / reacquire flag files written by
     // `cta release-daemon` / Pager. Cheap when the dir is empty (steady
     // state — nobody clicks "Open in Terminal" most of the time).
@@ -2088,8 +2030,6 @@ export {
   handleHelp,
   refreshPairedIfChanged,
   refreshMountsIfChanged,
-  refreshAckReactionIfChanged,
-  reactToMessage,
   sendTyping,
   startTypingKeepalive,
   effectiveChatId,
