@@ -33,6 +33,20 @@ export interface RegistryOptions {
   onTurnEnd?: (threadId: string, info: TurnEndInfo) => void;
   /** Optional: backoff escalation cap. Default 60s. */
   maxBackoffMs?: number;
+  /** Optional: how long a topic may sit "released" (β handoff to terminal)
+   *  before an incoming message self-heals it back. Guards the orphaned-
+   *  handoff failure (terminal died without signaling reacquire → topic stuck
+   *  released → messages silently queued forever). Default 10min. The window
+   *  must be long enough not to yank a daemon out from under a terminal the
+   *  user is actively using. */
+  releaseMaxMs?: number;
+  /** Optional: inactivity watchdog for an inFlight turn. If the daemon emits
+   *  no text and no turn-end/crash for this long, the turn is presumed wedged
+   *  (the 2026-05-21 incident: daemon posted text then died without a result
+   *  event → registry stuck inFlight). The watchdog kills the daemon so the
+   *  crash path respawns. Reset on every text block (so a long-but-active turn
+   *  is never killed). Default 5min. */
+  inFlightTimeoutMs?: number;
 }
 
 type DaemonState = "idle" | "pending" | "inFlight" | "released" | "crashed";
@@ -48,6 +62,12 @@ interface DaemonHandle {
   backoffMs: number;
   /** Spawned count — exposed for tests to detect respawns. */
   spawnedCount: number;
+  /** Wall-clock ms when releaseForTerminal was last called; null when not
+   *  released. Drives the orphaned-handoff TTL self-heal. */
+  releasedAt: number | null;
+  /** Inactivity watchdog for the current inFlight turn (B2). Cleared on
+   *  turn-end / crash / release / reset; reset on each text block. */
+  inFlightTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export class ClaudeDaemonRegistry {
@@ -107,14 +127,26 @@ export class ClaudeDaemonRegistry {
         debounceTimer: null,
         backoffMs: 0,
         spawnedCount: 0,
+        releasedAt: null,
+        inFlightTimer: null,
       };
       this.handles.set(threadId, handle);
     }
     handle.queue.push(text);
 
-    // If terminal is holding the daemon, the message just sits in the
-    // queue until reacquireFromTerminal fires.
-    if (handle.state === "released") return;
+    // If terminal is holding the daemon, the message normally just sits in the
+    // queue until reacquireFromTerminal fires. BUT if it's been released
+    // longer than releaseMaxMs, the terminal almost certainly died without
+    // signaling reacquire (the orphaned-handoff incident 2026-05-21) — so
+    // self-heal: reacquire now and let this message (plus any backlog) flush,
+    // rather than swallowing it forever.
+    if (handle.state === "released") {
+      const maxMs = this.opts.releaseMaxMs ?? 10 * 60_000;
+      if (handle.releasedAt != null && Date.now() - handle.releasedAt > maxMs) {
+        void this.reacquireFromTerminal(threadId);
+      }
+      return;
+    }
 
     // If a turn is in progress, leave the queue alone — turn-end will
     // re-arm the debounce timer.
@@ -134,9 +166,14 @@ export class ClaudeDaemonRegistry {
     // "released" below and leave a stale state. Also stops new enqueues
     // from arming a debounce timer mid-teardown.
     handle.state = "released";
+    handle.releasedAt = Date.now();
     if (handle.debounceTimer) {
       clearTimeout(handle.debounceTimer);
       handle.debounceTimer = null;
+    }
+    if (handle.inFlightTimer) {
+      clearTimeout(handle.inFlightTimer);
+      handle.inFlightTimer = null;
     }
     if (handle.daemon) {
       // SIGTERM gives claude a chance to close the session lock file
@@ -153,6 +190,7 @@ export class ClaudeDaemonRegistry {
     const handle = this.handles.get(threadId);
     if (!handle) return;
     handle.state = "idle";
+    handle.releasedAt = null;
     // If there's queued work, arm the debounce now. Otherwise the
     // daemon stays unspawned until the next enqueue (lazy).
     if (handle.queue.length > 0) {
@@ -180,6 +218,10 @@ export class ClaudeDaemonRegistry {
       clearTimeout(handle.debounceTimer);
       handle.debounceTimer = null;
     }
+    if (handle.inFlightTimer) {
+      clearTimeout(handle.inFlightTimer);
+      handle.inFlightTimer = null;
+    }
     if (handle.daemon) {
       await handle.daemon.stop("SIGTERM");
     }
@@ -193,6 +235,10 @@ export class ClaudeDaemonRegistry {
       if (handle.debounceTimer) {
         clearTimeout(handle.debounceTimer);
         handle.debounceTimer = null;
+      }
+      if (handle.inFlightTimer) {
+        clearTimeout(handle.inFlightTimer);
+        handle.inFlightTimer = null;
       }
       if (handle.daemon) {
         promises.push(handle.daemon.stop("SIGTERM"));
@@ -212,6 +258,42 @@ export class ClaudeDaemonRegistry {
     handle.debounceTimer = setTimeout(() => {
       void this.flush(threadId);
     }, this.opts.debounceMs ?? 2000);
+  }
+
+  private clearInFlightTimer(handle: DaemonHandle): void {
+    if (handle.inFlightTimer) {
+      clearTimeout(handle.inFlightTimer);
+      handle.inFlightTimer = null;
+    }
+  }
+
+  /** (Re)arm the inactivity watchdog for an inFlight turn. If it fires, the
+   *  turn produced no text/turn-end/crash for inFlightTimeoutMs — presumed
+   *  wedged (the 2026-05-21 incident: a daemon that posted text then died
+   *  without a result event left the registry stuck inFlight forever). We
+   *  SIGKILL the daemon; its 'close' → 'crash' event drives respawn through
+   *  the existing crash handler (which also frees the session lock for the
+   *  resume). Reset on every text block so an active turn is never killed. */
+  private armInFlightWatchdog(threadId: string, handle: DaemonHandle): void {
+    this.clearInFlightTimer(handle);
+    const timeoutMs = this.opts.inFlightTimeoutMs ?? 5 * 60_000;
+    handle.inFlightTimer = setTimeout(() => {
+      const h = this.handles.get(threadId);
+      if (!h || h.state !== "inFlight") return;
+      h.inFlightTimer = null;
+      const wedged = h.daemon;
+      if (wedged) {
+        // SIGKILL (not SIGTERM): the daemon is wedged and won't honor a
+        // graceful shutdown. The crash event recovers state + respawns.
+        void wedged.stop("SIGKILL");
+      } else {
+        // No daemon object but stuck inFlight — recover directly.
+        h.state = "crashed";
+        h.backoffMs = 0;
+        h.state = "idle";
+        if (h.queue.length > 0) this.armDebounce(threadId, h);
+      }
+    }, timeoutMs);
   }
 
   private async flush(threadId: string): Promise<void> {
@@ -239,6 +321,9 @@ export class ClaudeDaemonRegistry {
     try {
       this.opts.onFlush?.(threadId, combined);
       await handle.daemon!.send(combined);
+      // Start the inactivity watchdog: if the daemon emits no text and no
+      // turn-end/crash before it fires, the turn is presumed wedged.
+      this.armInFlightWatchdog(threadId, handle);
     } catch (err) {
       // Daemon went away between the alive-check and the write. Re-queue
       // the message so the user doesn't lose it, then rearm the debounce
@@ -273,6 +358,10 @@ export class ClaudeDaemonRegistry {
     });
 
     daemon.on("text", (text: string) => {
+      // Activity → reset the inactivity watchdog so a long-but-active turn is
+      // never killed (only true silence trips it).
+      const h = this.handles.get(threadId);
+      if (h && h.state === "inFlight") this.armInFlightWatchdog(threadId, h);
       this.opts.onText(threadId, text);
     });
 
@@ -280,6 +369,7 @@ export class ClaudeDaemonRegistry {
       this.opts.onTurnEnd?.(threadId, info);
       const h = this.handles.get(threadId);
       if (!h) return;
+      this.clearInFlightTimer(h);
       if (h.state === "released") return; // user yanked the daemon mid-turn
       // Healthy turn — reset crash backoff.
       h.backoffMs = 0;
@@ -291,6 +381,7 @@ export class ClaudeDaemonRegistry {
     daemon.on("crash", (info: CrashInfo) => {
       const h = this.handles.get(threadId);
       if (!h) return;
+      this.clearInFlightTimer(h);
       // Clean exit during release-for-terminal is expected; don't treat as crash.
       if (h.state === "released") return;
       h.daemon = null;

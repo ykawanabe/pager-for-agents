@@ -11,6 +11,10 @@
 #   slow                 — sleeps 1s before replying (test debounce timing)
 #   multiblock           — emits 2 text blocks per turn (test streaming output)
 #   crash-on-turn-2      — exits 1 after the second turn (test respawn)
+#   hang-no-result       — emits assistant text then hangs WITHOUT a result
+#                          event, staying alive (simulates a daemon wedged
+#                          mid-turn: text posted, no turn-end → registry stuck
+#                          inFlight. Repro of the 2026-05-21 General incident).
 #
 # Pure-bash implementation: python3 cold-start (1-3s on a loaded mac) was
 # the dominant cost; this fixture is hot-path during test runs, so we use
@@ -74,6 +78,19 @@ while IFS= read -r line; do
   text=$(extract_content "$line")
 
   [[ "$MODE" == "slow" ]] && sleep 1
+
+  if [[ "$MODE" == "hang-no-result" ]]; then
+    # Post the assistant text, then go silent — no result event — by looping
+    # back to block on the next stdin read. The process stays alive (so the
+    # registry sees neither turn-end nor crash and would be stuck inFlight
+    # forever without the inactivity watchdog, B2). We deliberately do NOT
+    # `sleep`: a forked `sleep` child would inherit and hold this script's
+    # stdout pipe, so a SIGKILL of the script wouldn't close stdout until the
+    # sleep ended — masking the kill. Blocking on the built-in `read` holds no
+    # child fd, so SIGKILL closes stdout immediately (like real claude).
+    emit_assistant_text "You said: $text"
+    continue
+  fi
 
   if [[ "$MODE" == "multiblock" ]]; then
     emit_assistant_text "thinking…"

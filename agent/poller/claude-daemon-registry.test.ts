@@ -259,6 +259,77 @@ describe("ClaudeDaemonRegistry crash recovery", () => {
   });
 });
 
+describe("ClaudeDaemonRegistry self-heal (incident 2026-05-21)", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
+
+  test("orphaned 'released' topic self-heals on enqueue after releaseMaxMs (terminal died, never reacquired)", async () => {
+    const sentToDaemon: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      releaseMaxMs: 200,                    // short orphan TTL for the test
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+      onFlush: (_t, combined) => sentToDaemon.push(combined),
+    });
+
+    // Spawn, then release for terminal (Open in Terminal). No reacquire ever
+    // arrives — the real incident: the .ack file lingered after the terminal
+    // claude exited, so the poller never signaled reacquire.
+    reg.enqueue("topic-42", "boot");
+    await waitFor(() => sentToDaemon.length >= 1, 5000);
+    await reg.releaseForTerminal("topic-42");
+    expect(reg.getStatus("topic-42")).toBe("released");
+
+    // A message arriving BEFORE the TTL stays queued and does NOT fire — the
+    // terminal might be legitimately in use; we don't yank the daemon back.
+    reg.enqueue("topic-42", "early");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(sentToDaemon.length).toBe(1);
+    expect(reg.getStatus("topic-42")).toBe("released");
+
+    // Past the TTL the orphan is assumed abandoned: the next message
+    // self-heals (auto-reacquire) and flushes the backlog instead of
+    // swallowing it forever.
+    await new Promise((r) => setTimeout(r, 200));
+    reg.enqueue("topic-42", "after ttl");
+    await waitFor(() => sentToDaemon.length >= 2, 5000);
+    expect(sentToDaemon[1]).toContain("early");
+    expect(sentToDaemon[1]).toContain("after ttl");
+  });
+
+  test("inFlight turn that goes silent (no turn-end, no crash) self-heals via inactivity watchdog", async () => {
+    const sentToDaemon: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      inFlightTimeoutMs: 300,               // short inactivity window for the test
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
+      onText: () => {},
+      onFlush: (_t, c) => sentToDaemon.push(c),
+    });
+
+    // Turn 1: daemon posts text then hangs with no result event. The registry
+    // enters inFlight and — without the watchdog — stays stuck there forever
+    // (the General incident: text posted as msg 3012, no turn-end recorded).
+    // Gate on onFlush (fires synchronously when the turn is dispatched) rather
+    // than on a text event, so the test doesn't race the daemon's stdout.
+    reg.enqueue("topic-42", "first");
+    await waitFor(() => sentToDaemon.length >= 1, 5000);
+    expect(reg.getStatus("topic-42")).toBe("inFlight");
+    const spawnsBefore = reg.spawnedCount;
+
+    // Queue a follow-up while inFlight. After inFlightTimeoutMs of silence the
+    // watchdog kills the wedged daemon; the crash path respawns and flushes
+    // the backlog.
+    reg.enqueue("topic-42", "second");
+    await waitFor(() => reg.spawnedCount > spawnsBefore, 8000);
+    await waitFor(() => sentToDaemon.length >= 2, 8000);
+    expect(sentToDaemon[1]).toContain("second");
+  });
+});
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
