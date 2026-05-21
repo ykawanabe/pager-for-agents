@@ -168,6 +168,7 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/poller/package.json" \
      "$REPO_DIR/agent/poller/claude-daemon.ts" \
      "$REPO_DIR/agent/poller/claude-daemon-registry.ts" \
+     "$REPO_DIR/agent/poller/buttons-marker.ts" \
      "$REPO_DIR/agent/poller/slash-commands.ts" \
      "$AGENT_DIR/poller/"
   # Chat-channel modules (ChatTransport migration). Platform-agnostic core

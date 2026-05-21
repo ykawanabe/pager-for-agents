@@ -44,6 +44,7 @@ import {
 } from "./slash-commands";
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
 import type { ClaudeDaemonOptions } from "./claude-daemon";
+import { parseButtonsMarker } from "./buttons-marker";
 // Telegram outbound wire (Bot API egress), extracted in P1 of the ChatTransport
 // migration. `reply` is the adapter's `sendText` (same signature, 58 call sites
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
@@ -318,21 +319,21 @@ function recordTopicName(chat_id: number, thread_id: number, name: string): void
 
 // Typing indicator moved to the ChatTransport (TypingIndicating). The poller
 // calls transport.startTyping at dispatch and transport.clearTypingExternal at
-// turn-end; the keepalive loop + the on-disk marker (still read by mcp-telegram
-// and Pager) live in the transport now.
+// turn-end; the keepalive loop + the on-disk marker (read by Pager's
+// isGenerating) live in the transport now.
 
 // Telegram-friendliness instructions appended via --append-system-prompt
 // on every daemon spawn (Phase 4). No picker-avoidance section because
 // `claude -p --input-format stream-json` has no interactive arrow-key
-// pickers at all. Plain text replies come back via the stream-json
-// `result` event; `send_telegram(buttons=...)` is the right tool for
-// inline keyboards because there's no way to express button choices
-// in plain prose.
+// pickers at all. Plain text replies come back via the stream-json `result`
+// event. P4: claude has no chat tools (mcp-telegram retired); to offer tap
+// choices it emits a `[[buttons]]` marker the poller parses (buttons-marker.ts)
+// and routes to ChatTransport.sendButtons.
 const DAEMON_APPEND_SYSTEM_PROMPT = `You are responding through a Telegram bot. The user is on Telegram; your terminal output is NOT visible to them.
 
-For plain text replies, just write your reply — the bot reads your final text and posts it. You do NOT need to call send_telegram for text replies.
+Just write your reply as plain text — the bot reads your final text and posts it. You have no chat tools to call.
 
-When you need the user to choose between a small fixed set of options (Yes/No, A/B/C, two paths forward), call \`mcp__telegram__send_telegram(buttons=["Option A","Option B",...])\` (up to 8 buttons, each ≤50 chars). The user taps one and the chosen label is dispatched back as their next message. Do NOT use AskUserQuestion — it opens a local modal that the user cannot see or answer.
+When you need the user to choose between a small fixed set of options (Yes/No, A/B/C, two paths forward), end your reply with a marker line in exactly this format: [[buttons]]["Option A","Option B"] — a JSON array of up to 8 short labels (each ≤50 chars). The bot renders them as tap buttons and the tapped label comes back as the user's next message. Put the question in normal text above the marker. Do NOT use AskUserQuestion — it opens a local modal that the user cannot see or answer.
 
 Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.
 
@@ -348,50 +349,12 @@ IMPORTANT — Telegram pairing / access is handled by claude-telegram-agent, NOT
 // the bot's hot path. ClaudeDaemonRegistry owns the lifecycle (spawn,
 // debounce, queue, crash respawn); poller wires only the chat side.
 
-/** Build the --mcp-config JSON. Daemon keeps mcp-telegram wired so claude
- *  can call `send_telegram(buttons=...)` for inline keyboards — plain text
- *  replies come back via the stream-json result event and don't need MCP. */
-function buildMcpConfig(threadId: number | "dm"): string | null {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) return null;
-  const chatId = effectiveChatId();
-  if (!chatId) return null;
-  const serverPath = process.env.TOPIC_WRAPPER_MCP_PATH
-    ?? join(installAgentDir(), "mcp-telegram/server.ts");
-  const cfg = {
-    mcpServers: {
-      telegram: {
-        command: "bun",
-        args: [serverPath],
-        env: {
-          TELEGRAM_BOT_TOKEN: token,
-          TELEGRAM_CHAT_ID: chatId,
-          TELEGRAM_THREAD_ID: String(threadId),
-          CTA_STATE_DIR: STATE_DIR,
-        },
-      },
-    },
-  };
-  return JSON.stringify(cfg);
-}
-
-/** Per-topic stable MCP config path. Daemon re-reads on respawn; we
- *  overwrite each spawn (chat_id might have changed via /pair switch). */
-function mcpConfigPathFor(threadId: number | "dm"): string {
-  const dir = join(STATE_DIR, "tmp");
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  return join(dir, `mcp-config-${threadId}.json`);
-}
-
-/** Write the per-topic MCP config to disk. Idempotent. Returns the path,
- *  or null if env is missing (no bot token / chat) — caller skips --mcp-config. */
-function ensureMcpConfig(threadId: number | "dm"): string | null {
-  const json = buildMcpConfig(threadId);
-  if (!json) return null;
-  const path = mcpConfigPathFor(threadId);
-  writeFileSync(path, json, { mode: 0o600 });
-  return path;
-}
+// P4: the per-topic --mcp-config (which wired the buttons-only mcp-telegram
+// server) is gone. The daemon now spawns with NO poller-supplied --mcp-config,
+// so claude inherits only the user's own ~/.claude.json MCP servers (Notion,
+// browser, gmail, …) and has zero chat tools. Outbound text + buttons both
+// flow back through the stream (buttons via the [[buttons]] marker → poller →
+// ChatTransport.sendButtons). mcp-telegram is retired.
 
 /**
  * Build the daemon options for a topic. Resolves project_path from the
@@ -454,7 +417,6 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
   // --resume needs JSONL to exist; otherwise --session-id starts fresh.
   const jsonlExists = existsSync(jsonlPathForSession(mount.path, uuid));
 
-  const mcpConfigPath = ensureMcpConfig(key);
   const hooksPath = process.env.TOPIC_WRAPPER_HOOKS_PATH
     ?? join(process.env.CTA_INSTALL_DIR ?? join(homedir(), ".local/share/pager"), "bot-hooks.json");
 
@@ -462,7 +424,7 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
     cwd: mount.path,
     sessionUuid: uuid,
     resumeExisting: jsonlExists,
-    mcpConfigPath: mcpConfigPath ?? undefined,
+    // P4: no poller --mcp-config; claude inherits the user's own MCPs only.
     settingsPath: existsSync(hooksPath) ? hooksPath : undefined,
     appendSystemPrompt: process.env.BOT_APPEND_SYSTEM_PROMPT ?? DAEMON_APPEND_SYSTEM_PROMPT,
     effort: resolveEffort(key),
@@ -571,7 +533,20 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
   if (!chatIdStr) return;
   const chat_id = Number(chatIdStr);
   if (!Number.isFinite(chat_id)) return;
-  void reply({ chat_id, thread_id: parseRegistryThreadId(threadIdStr) }, text);
+  const threadId = parseRegistryThreadId(threadIdStr);
+  // P4: claude has no send_telegram tool. To offer tap choices it emits a
+  // [[buttons]] marker in its reply text; parse it out and route to the
+  // transport's ButtonCapable path. No marker → plain text as before.
+  const { body, buttons } = parseButtonsMarker(text);
+  if (buttons && buttons.length > 0) {
+    void transport.sendButtons({
+      to: { channel: "telegram", chatId: chat_id, threadId },
+      text: body || "Choose:",
+      buttons,
+    });
+    return;
+  }
+  void reply({ chat_id, thread_id: threadId }, body);
 }
 
 /** Turn-end hook: clear typing keepalive (mcp-telegram normally does this

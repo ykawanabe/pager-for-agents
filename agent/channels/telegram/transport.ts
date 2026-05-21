@@ -255,11 +255,17 @@ export class TelegramTransport
     buttons: string[];
   }): Promise<MessageRef> {
     if (to.channel !== "telegram") throw new Error("TelegramTransport.sendButtons: wrong channel");
-    // One button per row; callback_data carries the label (P4 refines the
-    // cross-process buttons protocol — for now this mirrors the inline-keyboard
-    // wire the poller already uses for mount prompts).
-    const rows = buttons.map((label) => [{ text: label, callback_data: label.slice(0, 64) }]);
-    const res = await sendInlineKeyboard(to.chatId, text, rows);
+    // One button per row. callback_data carries the thread + label as
+    // `ans:<tid>:<label>` so the poller's callback handler dispatches the
+    // tapped label back into the right topic as the user's next message
+    // (same wire the retired mcp-telegram used). Bot API caps callback_data at
+    // 64 bytes, so the encoded string is trimmed to fit.
+    const tid = to.threadId ?? "dm";
+    const rows = buttons.map((label) => [{
+      text: label,
+      callback_data: `ans:${tid}:${label}`.slice(0, 64),
+    }]);
+    const res = await sendInlineKeyboard(to.chatId, text, rows, to.threadId);
     return { channel: "telegram", chatId: to.chatId, messageId: res?.message_id ?? 0 };
   }
 
