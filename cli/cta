@@ -56,6 +56,7 @@ LEGACY_INSTALL_DIR="$HOME/.local/share/claude-telegram-agent"
 # Regression test in tests/test_cta.sh guards this.
 ENV_FILE="$STATE_DIR/.env"
 CAFFEINATE_PID_FILE="$STATE_DIR/caffeinate.pid"
+SETTINGS_FILE="$STATE_DIR/settings.json"
 PAIRING_CODE_FILE="$STATE_DIR/pairing-code"
 PAIRED_STATE_FILE="$STATE_DIR/paired.json"
 MOUNTS_FILE="$STATE_DIR/mounts.json"
@@ -398,13 +399,14 @@ cmd_config() {
   case "$sub" in
     ack)        _config_ack "${1:-}" ;;
     caffeinate) _config_caffeinate "${1:-}" ;;
+    idle-evict) _config_idle_evict "${1:-}" ;;
     "")
-      echo "Usage: cta config <ack|caffeinate> <on|off>" >&2
+      echo "Usage: cta config <ack|caffeinate|idle-evict> <value>" >&2
       return 1
       ;;
     *)
       echo "Unknown config subcommand: $sub" >&2
-      echo "Usage: cta config <ack|caffeinate> <on|off>" >&2
+      echo "Usage: cta config <ack|caffeinate|idle-evict> <value>" >&2
       return 1
       ;;
   esac
@@ -447,6 +449,62 @@ PY
     echo "ackReaction: $DEFAULT_ACK_EMOJI (takes effect on next message)"
   else
     echo "ackReaction: off"
+  fi
+}
+
+# Idle-daemon eviction threshold, in minutes. 0 (or empty) disables it. Lives in
+# $STATE_DIR/settings.json, which the poller live-reloads each poll loop — so a
+# change applies within ~25s with no restart. With no value, prints the current
+# setting. Mirrors _config_ack's JSON-merge so any other settings keys survive.
+_config_idle_evict() {
+  local val="${1:-}"
+  # No value → print the current threshold (0 when unset/missing/corrupt).
+  if [[ -z "$val" ]]; then
+    if [[ -f "$SETTINGS_FILE" ]]; then
+      python3 - "$SETTINGS_FILE" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    print(int(data.get("idle_evict_minutes", 0) or 0))
+except Exception:
+    print(0)
+PY
+    else
+      echo 0
+    fi
+    return 0
+  fi
+  # Validate: a non-negative integer (0 disables).
+  if [[ ! "$val" =~ ^[0-9]+$ ]]; then
+    echo "Invalid value: $val (expected a non-negative integer of minutes; 0 disables)" >&2
+    return 1
+  fi
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  python3 - "$SETTINGS_FILE" "$val" <<'PY'
+import json, os, sys
+path, val = sys.argv[1], int(sys.argv[2])
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+data["version"] = 1
+data["idle_evict_minutes"] = val
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+  chmod 600 "$SETTINGS_FILE"
+  if [[ "$val" -eq 0 ]]; then
+    echo "idle eviction: off"
+  else
+    echo "idle eviction: ${val} min (live — applies within ~25s, no restart)"
   fi
 }
 

@@ -99,7 +99,7 @@ async function editMessageText(chat_id: number, message_id: number, text: string
 function tgKey(thread_id: ThreadId): string {
   return mountKey("telegram", thread_id);
 }
-import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs } from "../lib/paths";
+import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs, settingsJson } from "../lib/paths";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
@@ -116,6 +116,7 @@ const HEARTBEAT_FILE = heartbeatFile();
 const MOUNTS_JSON = mountsJson();
 const PAIRING_CODE_FILE = pairingCodeFile();
 const PAIRED_STATE_FILE = pairedStateFile();
+const SETTINGS_FILE = settingsJson();
 // Topic-name cache: poller writes, Pager reads. Updated when we see a
 // forum_topic_created / forum_topic_edited service message fly past. Key is
 // "<chat_id>/<message_thread_id>" so multi-chat installs don't collide on
@@ -185,6 +186,12 @@ interface PairedState {
 let pairedCache: PairedState | null = null;
 let pairedMtimeMs = 0;
 
+// Idle-daemon-eviction threshold (minutes; 0 = disabled), live-reloaded from
+// settings.json each poll loop. 0 unless the operator opts in via
+// `cta config idle-evict <min>` (the Pager "Memory" toggle).
+let idleEvictMinutes = 0;
+let settingsMtimeMs = 0;
+
 function refreshPairedIfChanged(): void {
   let mtimeMs = 0;
   try { mtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs; } catch { /* missing */ }
@@ -202,6 +209,35 @@ function refreshPairedIfChanged(): void {
     process.stdout.write(`[${new Date().toISOString()}] paired state reloaded (${pairedCache ? `chat=${pairedCache.chat_id} user=${pairedCache.user_id}` : "unpaired"})\n`);
   } catch (e) {
     process.stderr.write(`poller: paired.json reload failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+/** Live-reload the idle-eviction threshold from settings.json (mtime-gated,
+ *  same pattern as refreshPairedIfChanged). Operator-written via
+ *  `cta config idle-evict <min>` / the Pager Memory toggle; picked up on the
+ *  next poll loop with no poller restart. Missing file, version mismatch, or
+ *  any parse problem leaves the last good value in place; a present-but-zero
+ *  value disables eviction. */
+function refreshSettingsIfChanged(): void {
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(SETTINGS_FILE).mtimeMs; } catch { /* missing → disabled below */ }
+  if (mtimeMs === settingsMtimeMs) return;
+  try {
+    let next = 0;
+    if (mtimeMs !== 0) {
+      const raw = readFileSync(SETTINGS_FILE, "utf8");
+      const parsed = JSON.parse(raw) as { version?: number; idle_evict_minutes?: number };
+      if (parsed.version !== 1) throw new Error("settings.json: unknown version");
+      const n = Number(parsed.idle_evict_minutes ?? 0);
+      next = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+    }
+    settingsMtimeMs = mtimeMs;
+    if (next !== idleEvictMinutes) {
+      idleEvictMinutes = next;
+      process.stdout.write(`[${new Date().toISOString()}] settings reloaded: idle_evict_minutes=${idleEvictMinutes}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`poller: settings.json reload failed: ${e instanceof Error ? e.message : String(e)}\n`);
   }
 }
 
@@ -1921,6 +1957,7 @@ export async function main(): Promise<void> {
   let offset = readOffset();
   refreshMountsIfChanged();
   refreshPairedIfChanged();
+  refreshSettingsIfChanged();
   initDaemonRegistry();
   startInjectWatcher();
   await processInjectFlags(); // drain anything dropped before this poller started
@@ -1932,6 +1969,16 @@ export async function main(): Promise<void> {
     touchHeartbeat();
     refreshMountsIfChanged();
     refreshPairedIfChanged();
+    refreshSettingsIfChanged();
+    // Idle-daemon eviction (opt-in): reclaim RAM from topics quiet ≥ N min.
+    // Reuses resetTopic → the next message respawns + --resumes (cold start,
+    // no context loss). No-op unless the operator set a threshold.
+    if (daemonRegistry && idleEvictMinutes > 0) {
+      const evicted = await daemonRegistry.sweepIdle(idleEvictMinutes * 60_000);
+      if (evicted.length > 0) {
+        process.stdout.write(`[${new Date().toISOString()}] evicted ${evicted.length} idle daemon(s) after ${idleEvictMinutes}m: ${evicted.join(", ")}\n`);
+      }
+    }
     // β handoff: process any release / reacquire flag files written by
     // `cta release-daemon` / Pager. Cheap when the dir is empty (steady
     // state — nobody clicks "Open in Terminal" most of the time).

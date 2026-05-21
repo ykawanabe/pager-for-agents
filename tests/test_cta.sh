@@ -335,6 +335,63 @@ RC=$?
   && ok "cmd_config ack on: missing access.json reports cleanly" \
   || ng "cmd_config ack on: missing-file error (rc=$RC, msg='$ERR')"
 
+# ─── cmd_config idle-evict: threshold round-trip ───────────────────────────────
+#
+# `cta config idle-evict <min>` writes idle_evict_minutes to $STATE_DIR/settings.json
+# (version 1); `0` disables; no-arg prints the current value; invalid input is
+# rejected. The poller live-reloads settings.json so changes are restart-free.
+# Tmp STATE_DIR/SETTINGS_FILE — no risk to the real config.
+
+IE_TMP=$(mktemp -d)
+STATE_DIR="$IE_TMP"
+SETTINGS_FILE="$IE_TMP/settings.json"
+
+# set 30 → idle_evict_minutes present + version stamped
+cmd_config idle-evict 30 >/dev/null 2>&1
+IE_AFTER=$(python3 -c "import json; d=json.load(open('$SETTINGS_FILE')); print(d.get('idle_evict_minutes'), d.get('version'))" 2>/dev/null)
+[[ "$IE_AFTER" == "30 1" ]] \
+  && ok "cmd_config idle-evict 30: writes idle_evict_minutes + version" \
+  || ng "cmd_config idle-evict 30: expected '30 1', got '$IE_AFTER'"
+
+# file written restrictively (mode 600), like the other state files
+IE_MODE=$(stat -f '%Lp' "$SETTINGS_FILE" 2>/dev/null || stat -c '%a' "$SETTINGS_FILE" 2>/dev/null)
+[[ "$IE_MODE" == "600" ]] \
+  && ok "cmd_config idle-evict: settings.json is mode 600" \
+  || ng "cmd_config idle-evict: expected mode 600, got '$IE_MODE'"
+
+# no-arg → prints the current value
+IE_SHOW=$(cmd_config idle-evict 2>/dev/null)
+[[ "$IE_SHOW" == "30" ]] \
+  && ok "cmd_config idle-evict (no arg): prints current value" \
+  || ng "cmd_config idle-evict (no arg): expected 30, got '$IE_SHOW'"
+
+# merge must preserve unrelated keys (mirrors the ack merge contract)
+python3 -c "import json; d=json.load(open('$SETTINGS_FILE')); d['keep_me']='x'; json.dump(d, open('$SETTINGS_FILE','w'))"
+cmd_config idle-evict 45 >/dev/null 2>&1
+IE_KEEP=$(python3 -c "import json; d=json.load(open('$SETTINGS_FILE')); print(d.get('idle_evict_minutes'), d.get('keep_me'))" 2>/dev/null)
+[[ "$IE_KEEP" == "45 x" ]] \
+  && ok "cmd_config idle-evict: merge preserves unrelated keys" \
+  || ng "cmd_config idle-evict: lost unrelated key (got '$IE_KEEP')"
+
+# 0 → disables (persisted as 0, reads back 0)
+cmd_config idle-evict 0 >/dev/null 2>&1
+IE_OFF=$(cmd_config idle-evict 2>/dev/null)
+[[ "$IE_OFF" == "0" ]] \
+  && ok "cmd_config idle-evict 0: disables (reads back 0)" \
+  || ng "cmd_config idle-evict 0: expected 0, got '$IE_OFF'"
+
+# invalid → non-zero exit
+cmd_config idle-evict abc >/dev/null 2>&1 && ng "cmd_config idle-evict abc: should exit non-zero" \
+  || ok "cmd_config idle-evict abc: rejected with non-zero exit"
+
+# no-arg with missing file → prints 0, no python traceback
+rm -f "$SETTINGS_FILE"
+IE_MISSING=$(cmd_config idle-evict 2>/dev/null)
+[[ "$IE_MISSING" == "0" ]] \
+  && ok "cmd_config idle-evict (no arg, missing file): prints 0" \
+  || ng "cmd_config idle-evict (no arg, missing file): expected 0, got '$IE_MISSING'"
+rm -rf "$IE_TMP"
+
 rm -rf "$CFG_TMP"
 
 # ─── _caffeinate_alive: PID-file liveness check ──────────────────────────────

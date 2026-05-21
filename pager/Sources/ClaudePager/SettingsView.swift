@@ -178,6 +178,12 @@ private struct PagerTab: View {
     @AppStorage("caffeinateEnabled") private var caffeinateEnabled = false
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true
 
+    // Idle-daemon eviction is agent state (settings.json via cta), not a Mac
+    // app pref — so it's @State loaded from cta, not @AppStorage. 0 = off.
+    @State private var idleEvictMinutes: Int = 0
+    private let idleEvictPresets = [15, 30, 60, 120]
+    private let defaultIdleEvictMinutes = 30
+
     var body: some View {
         Form {
             Section {
@@ -221,8 +227,68 @@ private struct PagerTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                Toggle("Evict idle sessions to free memory", isOn: Binding(
+                    get: { idleEvictMinutes > 0 },
+                    set: { on in setIdleEvict(on ? defaultIdleEvictMinutes : 0) }
+                ))
+                if idleEvictMinutes > 0 {
+                    Picker("Close a session after", selection: Binding(
+                        get: { idleEvictMinutes },
+                        set: { setIdleEvict($0) }
+                    )) {
+                        ForEach(idleEvictPresets, id: \.self) { m in
+                            Text(idleEvictLabel(m)).tag(m)
+                        }
+                        // Reflect a custom value set via `cta config idle-evict`
+                        // so the menu shows reality instead of going blank.
+                        if !idleEvictPresets.contains(idleEvictMinutes) {
+                            Text(idleEvictLabel(idleEvictMinutes)).tag(idleEvictMinutes)
+                        }
+                    }
+                }
+            } header: {
+                Text("Memory")
+            } footer: {
+                Text("Each active topic keeps a Claude session resident in RAM. When a topic has been quiet this long, its session is closed to free memory — your next message there resumes the same conversation after a brief cold start. Off by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
+        .onAppear { reloadIdleEvict() }
+    }
+
+    /// Load the current idle-eviction threshold from settings.json (off main).
+    private func reloadIdleEvict() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let m = CTAClient.idleEvictMinutes()
+            DispatchQueue.main.async { idleEvictMinutes = m }
+        }
+    }
+
+    /// Persist a new threshold via `cta config idle-evict` (off main). Updates
+    /// local state immediately for a responsive toggle; the poller catches up
+    /// within a poll loop. On failure, re-read so the UI reflects reality.
+    private func setIdleEvict(_ minutes: Int) {
+        idleEvictMinutes = minutes
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                _ = try CTAClient.setIdleEvict(minutes: minutes)
+            } catch {
+                let actual = CTAClient.idleEvictMinutes()
+                DispatchQueue.main.async { idleEvictMinutes = actual }
+            }
+        }
+    }
+
+    private func idleEvictLabel(_ minutes: Int) -> String {
+        if minutes % 60 == 0 {
+            let h = minutes / 60
+            return h == 1 ? "1 hour" : "\(h) hours"
+        }
+        return "\(minutes) min"
     }
 
     /// Same three-state model as the menu label, written for the longer

@@ -68,6 +68,12 @@ interface DaemonHandle {
   /** Inactivity watchdog for the current inFlight turn (B2). Cleared on
    *  turn-end / crash / release / reset; reset on each text block. */
   inFlightTimer: ReturnType<typeof setTimeout> | null;
+  /** Wall-clock ms of the last activity on this topic (enqueue or turn-end).
+   *  Drives idle-daemon eviction (sweepIdle): a topic idle longer than the
+   *  configured threshold is evicted to reclaim RAM. The session UUID on disk
+   *  is preserved, so the next message respawns + --resumes — cold start, no
+   *  context loss. */
+  lastActivityAt: number;
 }
 
 export class ClaudeDaemonRegistry {
@@ -129,10 +135,14 @@ export class ClaudeDaemonRegistry {
         spawnedCount: 0,
         releasedAt: null,
         inFlightTimer: null,
+        lastActivityAt: Date.now(),
       };
       this.handles.set(threadId, handle);
     }
     handle.queue.push(text);
+    // Activity stamp → keeps the idle-eviction sweep from reaping a topic the
+    // user is actively messaging (the eviction clock restarts on every send).
+    handle.lastActivityAt = Date.now();
 
     // If terminal is holding the daemon, the message normally just sits in the
     // queue until reacquireFromTerminal fires. BUT if it's been released
@@ -246,6 +256,34 @@ export class ClaudeDaemonRegistry {
     }
     await Promise.all(promises);
     this.handles.clear();
+  }
+
+  /** Evict daemons that have sat idle (quiescent, empty queue) for at least
+   *  idleMs, reclaiming their RAM. Eviction reuses resetTopic — it SIGTERMs
+   *  the daemon and drops the handle, but leaves the session UUID on disk
+   *  untouched, so the next inbound message lazy-respawns and --resumes the
+   *  same conversation (cold start, no context loss). Idle eviction is thus
+   *  an automatic `/restart` triggered by inactivity.
+   *
+   *  No-op when idleMs <= 0 (feature disabled). Only "idle" handles with an
+   *  alive daemon and an empty queue are eligible — pending/inFlight/released/
+   *  crashed are never touched, so a live turn or a β-handoff is never raced.
+   *  Returns the evicted threadIds (for logging). */
+  async sweepIdle(idleMs: number): Promise<string[]> {
+    if (idleMs <= 0) return [];
+    const now = Date.now();
+    const evictable: string[] = [];
+    for (const [threadId, h] of this.handles) {
+      if (h.state !== "idle") continue;
+      if (h.queue.length > 0) continue;
+      if (!h.daemon || !h.daemon.isAlive) continue;
+      if (now - h.lastActivityAt < idleMs) continue;
+      evictable.push(threadId);
+    }
+    for (const threadId of evictable) {
+      await this.resetTopic(threadId);
+    }
+    return evictable;
   }
 
   // ─── internals ─────────────────────────────────────────────────────────────
@@ -374,6 +412,9 @@ export class ClaudeDaemonRegistry {
       // Healthy turn — reset crash backoff.
       h.backoffMs = 0;
       h.state = "idle";
+      // Idle clock starts now: the daemon just went quiescent. sweepIdle
+      // measures from here.
+      h.lastActivityAt = Date.now();
       // If more messages arrived while we were in-flight, arm next debounce.
       if (h.queue.length > 0) this.armDebounce(threadId, h);
     });

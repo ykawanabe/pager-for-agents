@@ -149,4 +149,30 @@ final class CTAClientTests: XCTestCase {
         XCTAssertEqual(CTAClient.topicName(chatId: -12345, threadId: 42), "Iron Flow")
         XCTAssertNil(CTAClient.topicName(chatId: -12345, threadId: 99))
     }
+
+    // MARK: - settings.json (idle-eviction threshold)
+
+    func test_idleEvictMinutes_readsFromStateDir() throws {
+        let tmp = NSTemporaryDirectory() + "cta-pager-settings-test-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        try #"{"version":1,"idle_evict_minutes":30}"#
+            .write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        XCTAssertEqual(CTAClient.idleEvictMinutes(), 30)
+    }
+
+    func test_idleEvictMinutes_missingFileOrKey_returnsZero() throws {
+        let tmp = NSTemporaryDirectory() + "cta-pager-settings-zero-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        // No settings.json yet → eviction disabled.
+        XCTAssertEqual(CTAClient.idleEvictMinutes(), 0)
+        // File present but key absent (only other settings) → disabled.
+        try #"{"version":1}"#.write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
+        XCTAssertEqual(CTAClient.idleEvictMinutes(), 0)
+    }
 }

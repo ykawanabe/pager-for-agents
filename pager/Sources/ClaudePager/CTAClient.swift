@@ -186,6 +186,18 @@ enum CTAClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    /// Set the idle-daemon-eviction threshold in minutes — `cta config
+    /// idle-evict <minutes>` (0 disables). cta writes $STATE_DIR/settings.json,
+    /// which the poller live-reloads each poll loop, so the change applies
+    /// within ~25s with no restart. Pager mutates this through cta (not a
+    /// direct file write) because STATE_DIR is agent-owned — same idiom as
+    /// mounts + caffeinate.
+    @discardableResult
+    static func setIdleEvict(minutes: Int) throws -> String {
+        let data = try run(args: ["config", "idle-evict", String(max(0, minutes))])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     // MARK: - Mounts (Phase 2: per-topic project bindings)
 
     /// Mirrors a single entry in `cta list --json` → `.mounts[]`. thread_id
@@ -356,6 +368,29 @@ enum CTAClient {
         let path = "\(stateDir)/paired.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
         return try? JSONDecoder().decode(PairedStateJSON.self, from: data)
+    }
+
+    // MARK: - Agent settings (settings.json)
+
+    /// Mirrors $STATE_DIR/settings.json. Read directly from disk (like
+    /// pairedState) because it's a tiny file the UI needs at render time and a
+    /// cta roundtrip isn't worth it. Writes go through `setIdleEvict` — cta
+    /// owns STATE_DIR. `idle_evict_minutes` of 0 / absent = eviction disabled.
+    struct SettingsJSON: Decodable, Equatable {
+        let idleEvictMinutes: Int?
+        enum CodingKeys: String, CodingKey {
+            case idleEvictMinutes = "idle_evict_minutes"
+        }
+    }
+
+    /// Current idle-eviction threshold in minutes (0 = disabled / unset /
+    /// unreadable). Reads $STATE_DIR/settings.json directly.
+    static func idleEvictMinutes() -> Int {
+        let path = "\(stateDir)/settings.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let decoded = try? JSONDecoder().decode(SettingsJSON.self, from: data)
+        else { return 0 }
+        return max(0, decoded.idleEvictMinutes ?? 0)
     }
 
     /// True if the topic's claude daemon appears to be mid-turn, derived from
