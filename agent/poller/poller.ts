@@ -64,16 +64,17 @@ import type {
   TgCallbackQuery,
 } from "../channels/telegram/adapter";
 import { TelegramTransport } from "../channels/telegram/transport";
-import type { AckHandle } from "../channels/types";
+import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatTransport } from "../channels/types";
 
-// ─── ChatTransport (P3, incremental cutover) ─────────────────────────────────
-// The poller drives outbound through the ChatTransport interface, not the wire
-// adapter directly. One instance per process (a poller serves one platform —
-// single getUpdates consumer). This slice routes the primary text egress
-// (reply → sendText) and message edits (editText) through it; ack / typing /
-// buttons / the inbound loop migrate in later P3 slices, so those still call the
-// adapter for now.
-const transport = new TelegramTransport();
+// ─── ChatTransport (P3 — DI'd) ───────────────────────────────────────────────
+// The poller drives ALL inbound + outbound through the ChatTransport interface,
+// never the wire adapter directly. One instance per process (a poller serves one
+// platform — single getUpdates consumer). `transport` is typed as the
+// platform-agnostic ChatTransport; optional capabilities (edit / react / typing /
+// buttons) are reached only behind capability guards (isEditable/isReactable/
+// isTyping/isButtonCapable), so a future platform that lacks one degrades
+// gracefully rather than failing to compile or crashing at runtime.
+const transport: ChatTransport = new TelegramTransport();
 
 /** Outbound plain text. Now flows through transport.sendText (which chunks
  *  >4096 and returns a ref); kept as `reply(target, text)` so the ~58 existing
@@ -90,7 +91,9 @@ async function reply(
 
 /** Edit a sent message's text in place — now via transport.editText (Editable). */
 async function editMessageText(chat_id: number, message_id: number, text: string): Promise<void> {
-  await transport.editText({ channel: "telegram", chatId: chat_id, messageId: message_id }, text);
+  if (isEditable(transport)) {
+    await transport.editText({ channel: "telegram", chatId: chat_id, messageId: message_id }, text);
+  }
 }
 
 // Poller-side cache key for Telegram updates. Hardcoded "telegram" because
@@ -296,7 +299,7 @@ function onDaemonFlush(threadIdStr: string, _combinedText: string): void {
   const list = pendingReadAcks.get(threadIdStr);
   if (!list || list.length === 0) return;
   pendingReadAcks.delete(threadIdStr);
-  void transport.setReadAcks(list);
+  if (isReactable(transport)) void transport.setReadAcks(list);
 }
 
 // ─── topic name cache ────────────────────────────────────────────────────────
@@ -574,7 +577,7 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
   // [[buttons]] marker in its reply text; parse it out and route to the
   // transport's ButtonCapable path. No marker → plain text as before.
   const { body, buttons } = parseButtonsMarker(text);
-  if (buttons && buttons.length > 0) {
+  if (buttons && buttons.length > 0 && isButtonCapable(transport)) {
     void transport.sendButtons({
       to: { channel: "telegram", chatId: chat_id, threadId },
       text: body || "Choose:",
@@ -582,6 +585,7 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
     });
     return;
   }
+  // No buttons, or the platform can't render them → plain text (graceful degrade).
   void reply({ chat_id, thread_id: threadId }, body);
 }
 
@@ -593,7 +597,7 @@ function onDaemonTurnEnd(threadIdStr: string, info: { costUsd: number | null; se
   if (chatIdStr) {
     const chat_id = Number(chatIdStr);
     if (Number.isFinite(chat_id)) {
-      void transport.clearTypingExternal({ channel: "telegram", chatId: chat_id, threadId: parseRegistryThreadId(threadIdStr) });
+      if (isTyping(transport)) void transport.clearTypingExternal({ channel: "telegram", chatId: chat_id, threadId: parseRegistryThreadId(threadIdStr) });
     }
   }
   if (typeof info.costUsd === "number") {
@@ -639,12 +643,14 @@ async function daemonDispatch(threadIdStr: string, msg: TgMessage): Promise<void
   }
   // Typing keepalive (via the transport) — fast Bot API call + disk marker,
   // cleared at turn-end via clearTypingExternal. Fire-and-forget.
-  void transport.startTyping({ channel: "telegram", chatId: msg.chat.id, threadId: msg.message_thread_id });
+  if (isTyping(transport)) void transport.startTyping({ channel: "telegram", chatId: msg.chat.id, threadId: msg.message_thread_id });
   // Delivered ack (👀): the transport reads the operator glyph (access.json) and
   // returns a handle to flip to 👌 on flush — or null if the operator disabled it
   // (skip the ack pipeline). Await so the handle is queued BEFORE enqueue; the
   // flush fires ≥ debounce later, so it always finds it (no race).
-  const ack = await transport.setDeliveredAck({ channel: "telegram", chatId: msg.chat.id, messageId: msg.message_id });
+  const ack = isReactable(transport)
+    ? await transport.setDeliveredAck({ channel: "telegram", chatId: msg.chat.id, messageId: msg.message_id })
+    : null;
   if (ack) trackPendingRead(threadIdStr, ack);
 
   daemonRegistry!.enqueue(threadIdStr, text);
