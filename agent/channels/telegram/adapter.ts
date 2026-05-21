@@ -135,12 +135,18 @@ export async function sendInlineKeyboard(
   chat_id: number,
   text: string,
   buttons: Array<Array<{ text: string; callback_data: string }>>,
+  thread_id?: number,
 ): Promise<{ message_id: number } | null> {
   try {
+    const body: Record<string, unknown> = { chat_id, text, reply_markup: { inline_keyboard: buttons } };
+    // Forum topics: without message_thread_id the keyboard lands in General
+    // instead of the topic. (mcp-telegram set this from THREAD_ID; P4 moves
+    // that responsibility into the transport.)
+    if (thread_id != null) body.message_thread_id = thread_id;
     const resp = await fetch(`${getApiBase()}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id, text, reply_markup: { inline_keyboard: buttons } }),
+      body: JSON.stringify(body),
     });
     const json = (await resp.json()) as { ok: boolean; result?: { message_id: number }; description?: string };
     if (!json.ok) {

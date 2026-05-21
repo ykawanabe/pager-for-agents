@@ -166,10 +166,23 @@ describe("wire methods route at the Bot API", () => {
     expect(edits[0]).toEqual({ chat_id: 3, message_id: 5, text: "edited" });
   });
 
-  test("sendButtons sends an inline keyboard", async () => {
-    const ref = await t.sendButtons({ to: { channel: "telegram", chatId: 8 }, text: "pick", buttons: ["A", "B"] });
+  test("sendButtons sends an inline keyboard with ans:<tid>:<label> callback_data", async () => {
+    const ref = await t.sendButtons({ to: { channel: "telegram", chatId: 8, threadId: 42 }, text: "pick", buttons: ["A", "B"] });
     expect(ref.channel).toBe("telegram");
-    expect(sent[0].reply_markup).toBeDefined();
+    const markup = sent[0].reply_markup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+    expect(markup).toBeDefined();
+    // callback_data encodes the thread so handleCallbackQuery routes the tap
+    // back into the right topic; the keyboard itself posts to the topic.
+    expect(markup.inline_keyboard[0][0]).toEqual({ text: "A", callback_data: "ans:42:A" });
+    expect(markup.inline_keyboard[1][0].callback_data).toBe("ans:42:B");
+    expect(sent[0].message_thread_id).toBe(42);
+  });
+
+  test("sendButtons with no thread → ans:dm:<label> + no message_thread_id", async () => {
+    await t.sendButtons({ to: { channel: "telegram", chatId: 8 }, text: "pick", buttons: ["Yes"] });
+    const markup = sent[0].reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
+    expect(markup.inline_keyboard[0][0].callback_data).toBe("ans:dm:Yes");
+    expect(sent[0].message_thread_id).toBeUndefined();
   });
 
   test("whoami returns the bot identity", async () => {
