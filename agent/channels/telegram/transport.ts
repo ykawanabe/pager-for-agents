@@ -36,14 +36,17 @@ import {
   setReaction,
   editMessageText as wireEditMessageText,
   sendInlineKeyboard,
+  sendChatAction,
   type TgUpdate,
   type TgMessage,
 } from "./adapter";
-import { pollerOffsetFile } from "../../lib/paths";
+import { markTypingActive, markTypingDone, runTypingKeepalive } from "./typing-keepalive";
+import { pollerOffsetFile, stateDir } from "../../lib/paths";
 import type {
   ChatTransport,
   Editable,
   Reactable,
+  TypingIndicating,
   ButtonCapable,
   ProactiveCapable,
   Capabilities,
@@ -53,6 +56,7 @@ import type {
   SenderId,
   InboundEvent,
   AckHandle,
+  TypingToken,
 } from "../types";
 
 /** Telegram's documented free-bot reaction whitelist (non-premium bots may only
@@ -97,7 +101,7 @@ function chunkText(text: string, maxChars: number): string[] {
 }
 
 export class TelegramTransport
-  implements ChatTransport, Editable, Reactable, ButtonCapable, ProactiveCapable
+  implements ChatTransport, Editable, Reactable, TypingIndicating, ButtonCapable, ProactiveCapable
 {
   readonly channel = "telegram" as const;
   readonly transportVersion = 1;
@@ -125,6 +129,12 @@ export class TelegramTransport
     process.env.ACCESS_JSON ?? join(homedir(), ".claude/channels/telegram/access.json");
   private readonly offsetFile = pollerOffsetFile();
   private readonly pollTimeoutSec = Number(process.env.POLL_TIMEOUT_SEC ?? "25");
+  // Typing keepalive: re-fire interval (Telegram clears the bubble at ~5s, so 4s
+  // overlaps) + a hard cap so a loop can't spin forever if the marker is never
+  // cleared. The on-disk marker also powers Pager's isGenerating.
+  private readonly stateDir = stateDir();
+  private readonly typingIntervalMs = Number(process.env.TYPING_INTERVAL_MS ?? "4000");
+  private readonly typingMaxMs = Number(process.env.TYPING_MAX_MS ?? `${10 * 60_000}`);
 
   private handler: ((e: InboundEvent) => Promise<void>) | null = null;
   private running = false;
@@ -259,6 +269,38 @@ export class TelegramTransport
     // Telegram bots may message any chat they're in without a triggering inbound
     // message — identical wire to sendText.
     return this.sendText({ to, text });
+  }
+
+  // ─── TypingIndicating (chat-thread scope, 4s keepalive) ──────────────────────
+  // Writes the on-disk marker ($STATE_DIR/typing/<chat>__<thread>.token) and runs
+  // the keepalive loop, re-firing sendChatAction until the marker is cleared
+  // (turn-end via clearTypingExternal, or a newer dispatch's token) or maxMs
+  // elapses. The marker is also read cross-process: by mcp-telegram (clears it
+  // after a buttons send) and by Pager (isGenerating) — so it stays on disk.
+
+  async startTyping(to: ChatAddress): Promise<TypingToken> {
+    if (to.channel !== "telegram") throw new Error("TelegramTransport.startTyping: wrong channel");
+    const token = markTypingActive(this.stateDir, to.chatId, to.threadId);
+    // Fire-and-forget: the loop returns on its own when the marker clears.
+    void runTypingKeepalive({
+      stateDir: this.stateDir,
+      chatId: to.chatId,
+      threadId: to.threadId,
+      token,
+      send: () => sendChatAction(to.chatId, to.threadId),
+      intervalMs: this.typingIntervalMs,
+      maxMs: this.typingMaxMs,
+    });
+    return { to, token } as TypingToken;
+  }
+
+  async stopTyping(token: TypingToken): Promise<void> {
+    const t = token as { to?: ChatAddress } | null;
+    if (t?.to?.channel === "telegram") markTypingDone(this.stateDir, t.to.chatId, t.to.threadId ?? "dm");
+  }
+
+  async clearTypingExternal(address: ChatAddress): Promise<void> {
+    if (address.channel === "telegram") markTypingDone(this.stateDir, address.chatId, address.threadId ?? "dm");
   }
 
   // ─── offset persistence (atomic; tempfile + fsync + rename) ──────────────────

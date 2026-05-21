@@ -165,7 +165,6 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
-     "$REPO_DIR/agent/poller/typing-keepalive.ts" \
      "$REPO_DIR/agent/poller/package.json" \
      "$REPO_DIR/agent/poller/claude-daemon.ts" \
      "$REPO_DIR/agent/poller/claude-daemon-registry.ts" \
@@ -178,6 +177,7 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   cp "$REPO_DIR/agent/channels/types.ts" "$AGENT_DIR/channels/"
   cp "$REPO_DIR/agent/channels/telegram/adapter.ts" \
      "$REPO_DIR/agent/channels/telegram/transport.ts" \
+     "$REPO_DIR/agent/channels/telegram/typing-keepalive.ts" \
      "$AGENT_DIR/channels/telegram/"
   cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"

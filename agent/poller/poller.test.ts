@@ -13,6 +13,7 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { sendChatAction } from "../channels/telegram/adapter";
 
 // Spin up a fake Telegram Bot API server. Records sendMessage calls so each
 // test can introspect what the poller tried to send.
@@ -380,34 +381,17 @@ describe("plain text (non-command) handling", () => {
   });
 });
 
-describe("typing (UX signal)", () => {
-  test("sendTyping fires sendChatAction with 'typing' action", async () => {
-    await poller.sendTyping(-1001, 42);
-    expect(chatActions.length).toBe(1);
-    expect(chatActions[0].action).toBe("typing");
-    expect(chatActions[0].chat_id).toBe(-1001);
-    expect(chatActions[0].message_thread_id).toBe(42);
-  });
-
-  test("sendTyping omits thread_id when absent (DM case)", async () => {
-    await poller.sendTyping(8000000000);
-    expect(chatActions.length).toBe(1);
-    expect(chatActions[0].chat_id).toBe(8000000000);
-    expect(chatActions[0].message_thread_id).toBeUndefined();
-  });
-
-  // The 2-stage ack (👀→👌) is now owned by the ChatTransport (Reactable):
-  // glyph-from-access.json, null-when-off, and the 👌 read-flip are covered in
-  // channels/telegram/transport.test.ts; the end-to-end poller→daemon→flush
-  // pipeline is covered by tests/e2e/scenarios/ack_reaction.sh.
-});
-
+// sendTyping (poller wrapper) + the 2-stage ack are now owned by the
+// ChatTransport: typing → TypingIndicating.startTyping, ack → Reactable. Their
+// coverage lives in channels/telegram/transport.test.ts + the e2e scenarios
+// (ack_reaction.sh). The keepalive-loop module tests below still run here (they
+// have the fake-Bot-API mock wired) but import the relocated module.
 describe("typing keepalive", () => {
   // The keepalive loop's primary contract: re-fire sendChatAction past
   // Telegram's 5s auto-clear, and stop the moment mcp-telegram clears the
   // marker. We use short intervals to keep the test fast.
   test("re-fires sendChatAction until marker is cleared", async () => {
-    const tk = await import("./typing-keepalive");
+    const tk = await import("../channels/telegram/typing-keepalive");
     const STATE = process.env.CTA_STATE_DIR!;
     chatActions.length = 0;
 
@@ -422,7 +406,7 @@ describe("typing keepalive", () => {
       token,
       send: async () => {
         sendCounts.push(Date.now());
-        await poller.sendTyping(-1001, 42);
+        await sendChatAction(-1001, 42);
       },
       intervalMs: 30,
       maxMs: 5_000,
@@ -449,7 +433,7 @@ describe("typing keepalive", () => {
   });
 
   test("stops when a newer dispatch replaces the marker token", async () => {
-    const tk = await import("./typing-keepalive");
+    const tk = await import("../channels/telegram/typing-keepalive");
     const STATE = process.env.CTA_STATE_DIR!;
 
     const oldToken = tk.markTypingActive(STATE, -1001, 7);
@@ -475,7 +459,7 @@ describe("typing keepalive", () => {
   });
 
   test("dm keepalive uses the 'dm' sentinel path", async () => {
-    const tk = await import("./typing-keepalive");
+    const tk = await import("../channels/telegram/typing-keepalive");
     const STATE = process.env.CTA_STATE_DIR!;
     const expected = tk.typingMarkerPath(STATE, 8000000000, undefined);
     expect(expected.endsWith("8000000000__dm.token")).toBe(true);
