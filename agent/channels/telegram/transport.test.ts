@@ -232,12 +232,17 @@ describe("normalizeUpdate (pure)", () => {
     expect(ev?.kind === "message" && ev.routingKey).toBe("dm");
   });
 
-  test("forum_topic_created → topic-created", () => {
+  test("forum_topic_created → topic-created (with raw)", () => {
     const ev = normalizeUpdate({
       update_id: 3,
       message: { message_id: 1, chat: { id: -100 }, message_thread_id: 7, forum_topic_created: { name: "Plans" } },
     });
-    expect(ev).toEqual({ kind: "topic-created", routingKey: "7", name: "Plans" });
+    expect(ev?.kind).toBe("topic-created");
+    if (ev?.kind === "topic-created") {
+      expect(ev.routingKey).toBe("7");
+      expect(ev.name).toBe("Plans");
+      expect(ev.raw.update_id).toBe(3);
+    }
   });
 
   test("callback_query → button-press", () => {

@@ -347,10 +347,10 @@ export function normalizeUpdate(u: TgUpdate): InboundEvent<TgUpdate> | null {
   const msg = u.message ?? u.edited_message;
   if (msg) {
     if (msg.forum_topic_created) {
-      return { kind: "topic-created", routingKey: threadRoutingKey(msg), name: msg.forum_topic_created.name };
+      return { kind: "topic-created", routingKey: threadRoutingKey(msg), name: msg.forum_topic_created.name, raw: u };
     }
     if (msg.forum_topic_edited?.name) {
-      return { kind: "topic-renamed", routingKey: threadRoutingKey(msg), name: msg.forum_topic_edited.name };
+      return { kind: "topic-renamed", routingKey: threadRoutingKey(msg), name: msg.forum_topic_edited.name, raw: u };
     }
     return {
       kind: "message",
@@ -378,6 +378,7 @@ export function normalizeUpdate(u: TgUpdate): InboundEvent<TgUpdate> | null {
       messageRef: m
         ? { channel: "telegram", chatId: m.chat.id, messageId: m.message_id }
         : { channel: "telegram", chatId: 0, messageId: 0 },
+      raw: u,
     };
   }
 
@@ -386,13 +387,14 @@ export function normalizeUpdate(u: TgUpdate): InboundEvent<TgUpdate> | null {
     const newS = mcm.new_chat_member.status;
     const address: ChatAddress = { channel: "telegram", chatId: mcm.chat.id };
     if (newS === "left" || newS === "kicked") {
-      return { kind: "removed", address };
+      return { kind: "removed", address, raw: u };
     }
     return {
       kind: "joined",
       address,
       invitedBy: { channel: "telegram", id: String(mcm.from.id), displayName: mcm.from.first_name },
       chatTitle: mcm.chat.title,
+      raw: u,
     };
   }
 
