@@ -195,7 +195,7 @@ private struct PagerTab: View {
             } header: {
                 Text("Launch behavior")
             } footer: {
-                Text("With \"Start at login\" off, the Pager won't auto-launch — open this app manually. \"Stop the bot when Pager quits\" cascades a clean Quit (⌘Q) to the companion agent.")
+                Text("With \"Start at login\" off, open Pager yourself each time. \"Stop the bot when Pager quits\" also shuts the bot down on ⌘Q, so it isn't left running in the background.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -223,13 +223,13 @@ private struct PagerTab: View {
             } header: {
                 Text("Sleep prevention")
             } footer: {
-                Text("Spawns `caffeinate -i` while Pager is running so the bot keeps polling Telegram. Leaving \"Only when plugged in\" on means battery is preserved when unplugged — the Mac will sleep normally on battery.")
+                Text("Keeps the Mac awake while Pager runs so the bot stays connected to Telegram. With \"Only when plugged in\" on, the Mac sleeps normally on battery to save power.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             Section {
-                Toggle("Evict idle sessions to free memory", isOn: Binding(
+                Toggle("Close idle sessions to free memory", isOn: Binding(
                     get: { idleEvictMinutes > 0 },
                     set: { on in setIdleEvict(on ? defaultIdleEvictMinutes : 0) }
                 ))
@@ -251,7 +251,7 @@ private struct PagerTab: View {
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Each active topic keeps a Claude session resident in RAM. When a topic has been quiet this long, its session is closed to free memory — your next message there resumes the same conversation after a brief cold start. Off by default.")
+                Text("Each active topic keeps a Claude session in memory. If a topic stays quiet this long, its session closes to free memory; your next message there resumes the same conversation after a short delay. Off by default.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -357,7 +357,7 @@ private struct TelegramTab: View {
             } header: {
                 Text("Access")
             } footer: {
-                Text("In MULTI_TOPIC mode the bot only accepts commands from the paired user (recorded in ~/.pager/paired.json). To switch authorized users, unpair via `/unpair confirm` or `cta unpair` and pair again from the new account.")
+                Text("The bot only responds to the account you paired with (see the Pairing tab). To hand control to another account, unpair and pair again from that account.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
