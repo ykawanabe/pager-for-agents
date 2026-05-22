@@ -174,6 +174,7 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/poller/buttons-marker.ts" \
      "$REPO_DIR/agent/poller/slash-commands.ts" \
      "$REPO_DIR/agent/poller/watch-render.ts" \
+     "$REPO_DIR/agent/poller/file-access-probe.ts" \
      "$AGENT_DIR/poller/"
   # Chat-channel modules (ChatTransport migration). Platform-agnostic core
   # contract (types.ts) + Telegram wire adapter. poller.ts imports the adapter

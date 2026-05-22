@@ -513,6 +513,33 @@ assert caff["pid"] is None, "pid should be null, got " + repr(caff["pid"])
   && ok "cmd_status json: caffeinate.alive=false when no pid file" \
   || ng "cmd_status json: caffeinate=off state wrong"
 
+# ─── cmd_status: file_access field (FDA probe, surfaced from the poller) ──────
+# The poller (launchd TCC context) writes $STATE_DIR/file-access.json; cta status
+# surfaces it as an additive field. Absent file → null (back-compat: older agents
+# don't write it). Field is read straight from disk — cta itself is the wrong TCC
+# context to probe, so it must NOT re-probe.
+FA_TMP=$(mktemp -d)
+STATE_DIR="$FA_TMP"
+_la_loaded()      { return 0; }
+_claude_ps_line() { echo ""; }
+_mcp_alive()      { return 1; }
+_poller_alive()   { return 1; }
+_watchdog_alive() { return 1; }
+_last_activity()  { echo ""; }
+cat > "$FA_TMP/file-access.json" <<'JSON'
+{"protected_ok": true, "probed_path": "/Users/x/Documents", "checked_at": "2026-05-22T00:00:00Z"}
+JSON
+JSON=$(cmd_status json)
+echo "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); fa=d["file_access"]; assert fa["protected_ok"] is True, fa; assert fa["probed_path"]=="/Users/x/Documents", fa' \
+  && ok "cmd_status json: file_access present + protected_ok=true" \
+  || ng "cmd_status json: file_access missing or malformed"
+rm -f "$FA_TMP/file-access.json"
+JSON=$(cmd_status json)
+echo "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["file_access"] is None, d["file_access"]' \
+  && ok "cmd_status json: file_access null when probe file absent" \
+  || ng "cmd_status json: file_access should be null when absent"
+rm -rf "$FA_TMP"
+
 # ─── pipefail+SIGPIPE regression guard ───────────────────────────────────────
 # Under `set -uo pipefail`, the old `launchctl list | grep -q LABEL` (and
 # similar ps|grep|head pipelines for _claude_ps_line / _mcp_alive) flipped

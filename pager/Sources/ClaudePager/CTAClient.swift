@@ -56,6 +56,19 @@ enum CTAClient {
             let alive: Bool
             let pid: Int?
         }
+        /// FDA probe result, written by the poller in the launchd TCC context.
+        /// Optional: older agents (pre-P6d) don't emit it → nil ("unknown").
+        let fileAccess: FileAccess?
+        struct FileAccess: Decodable, Equatable {
+            let protectedOk: Bool
+            let probedPath: String?
+            let checkedAt: String?
+            enum CodingKeys: String, CodingKey {
+                case protectedOk = "protected_ok"
+                case probedPath = "probed_path"
+                case checkedAt = "checked_at"
+            }
+        }
 
         enum CodingKeys: String, CodingKey {
             case schemaVersion = "schema_version"
@@ -65,6 +78,7 @@ enum CTAClient {
             case tmux
             case caffeinate
             case lastActivity = "last_activity"
+            case fileAccess = "file_access"
         }
     }
 

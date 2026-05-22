@@ -103,6 +103,7 @@ function tgKey(thread_id: ThreadId): string {
   return mountKey("telegram", thread_id);
 }
 import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs, settingsJson } from "../lib/paths";
+import { runFileAccessProbe } from "./file-access-probe";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
@@ -194,6 +195,8 @@ let pairedMtimeMs = 0;
 // `cta config idle-evict <min>` (the Pager "Memory" toggle).
 let idleEvictMinutes = 0;
 let settingsMtimeMs = 0;
+// Epoch ms of the last file-access (FDA) probe; throttles re-probing to ~60s.
+let lastFileAccessProbe = 0;
 
 function refreshPairedIfChanged(): void {
   let mtimeMs = 0;
@@ -1967,6 +1970,12 @@ export async function main(): Promise<void> {
   initDaemonRegistry();
   startInjectWatcher();
   await processInjectFlags(); // drain anything dropped before this poller started
+  // File-access (FDA) self-probe: we're in the launchd TCC context here, so this
+  // is the only place that can truthfully report whether claude can reach
+  // protected folders (Documents/Desktop/…). Result → $STATE_DIR/file-access.json
+  // for cta status / Pager. Re-probed periodically in housekeep below.
+  runFileAccessProbe(STATE_DIR);
+  lastFileAccessProbe = Date.now();
 
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
   process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
@@ -1986,6 +1995,12 @@ export async function main(): Promise<void> {
         refreshMountsIfChanged();
         refreshPairedIfChanged();
         refreshSettingsIfChanged();
+        // Re-probe file access at most once a minute (FDA is granted rarely;
+        // no need to readdir the canary every 5s tick).
+        if (Date.now() - lastFileAccessProbe > 60_000) {
+          lastFileAccessProbe = Date.now();
+          runFileAccessProbe(STATE_DIR);
+        }
         // Idle-daemon eviction (opt-in): reclaim RAM from topics quiet ≥ N min.
         // Reuses resetTopic → next message respawns + --resumes (cold start, no
         // context loss). No-op unless the operator set a threshold.
