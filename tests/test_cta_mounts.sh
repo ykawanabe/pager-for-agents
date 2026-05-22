@@ -78,22 +78,29 @@ else
   ng "cta mount: success message (got '$OUT')"
 fi
 
-# Without a poller alive, status message should say "will route on next 'cta start'".
-# Phase 4: cta mount only writes mounts.json; the poller's daemon registry
-# lazy-spawns the claude process on next inbound message.
-if echo "$OUT" | grep -q "will route on next 'cta start'"; then
-  ok "cta mount (no poller): deferred-route message"
+# cta mount only writes mounts.json; the poller's daemon registry lazy-spawns
+# the claude process on next inbound message. The success message has a poller-
+# state-dependent suffix ("daemon spawns on next inbound" vs "will route on next
+# 'cta start'") — P6c computes that from pgrep liveness, which in a subprocess
+# test can't be isolated from a real poller on the host. Assert the stable
+# success line + that one of the two valid suffixes is present.
+if echo "$OUT" | grep -q "Mounted thread 42 at" \
+   && echo "$OUT" | grep -Eq "daemon spawns on next inbound|will route on next 'cta start'"; then
+  ok "cta mount: success message with route hint"
 else
-  ng "cta mount (no poller): deferred-route message (got '$OUT')"
+  ng "cta mount: success message with route hint (got '$OUT')"
 fi
 
 # ─── cta list: with one mount ───────────────────────────────────────────────
 
+# P6c: per-topic tmux/STATUS columns are gone (daemons live inside the poller;
+# there's no per-topic process to probe). The row still surfaces the thread +
+# label + path.
 OUT=$(cta list 2>&1)
-if echo "$OUT" | grep -q "topic-42" && echo "$OUT" | grep -q "dead"; then
-  ok "cta list: shows topic-42 as dead (no tmux session)"
+if echo "$OUT" | grep -q "iron-flow" && echo "$OUT" | grep -q "42"; then
+  ok "cta list: shows the mounted row (thread 42, label iron-flow)"
 else
-  ng "cta list: shows topic-42 as dead (got '$OUT')"
+  ng "cta list: shows the mounted row (got '$OUT')"
 fi
 
 # ─── cta list --json: parseable ─────────────────────────────────────────────
@@ -123,13 +130,16 @@ else
   ng "cta umount missing: friendly no-op (got '$OUT')"
 fi
 
-# ─── cta bind: refuses without TMUX ─────────────────────────────────────────
+# ─── cta bind: removed in P6c ────────────────────────────────────────────────
+# `cta bind` was a tmux-only affordance (pin the current tmux session to a
+# thread). With tmux gone it has no meaning and was removed; assert the
+# subcommand is now unknown.
 
-OUT=$(env -u TMUX "$CTA" bind 42 2>&1 || true)
-if echo "$OUT" | grep -q "not in a tmux session"; then
-  ok "cta bind: refuses outside tmux"
+OUT=$("$CTA" bind 42 2>&1 || true)
+if echo "$OUT" | grep -q "Unknown command: bind"; then
+  ok "cta bind: removed (unknown command)"
 else
-  ng "cta bind: refuses outside tmux (got '$OUT')"
+  ng "cta bind: expected 'Unknown command: bind' (got '$OUT')"
 fi
 
 # ─── result ─────────────────────────────────────────────────────────────────
