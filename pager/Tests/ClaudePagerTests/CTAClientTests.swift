@@ -44,6 +44,40 @@ final class CTAClientTests: XCTestCase {
         XCTAssertEqual(s.lastActivity, "2026-05-12T10:00:00Z")
     }
 
+    /// file_access is an additive field (the FDA probe, P6c/P6d). Present →
+    /// decodes; absent (older agent) → nil. No schema bump.
+    func test_decode_fileAccess_present() throws {
+        let json = """
+        {
+          "schema_version": 1,
+          "launch_agent": {"label": "com.claude-agent", "loaded": true},
+          "claude": {"pid": 1, "rss_mb": 1},
+          "telegram_mcp": {"alive": true},
+          "tmux": {"claude": {"name": "poller", "alive": true}, "watchdog": {"name": "watchdog", "alive": true}},
+          "last_activity": null,
+          "file_access": {"protected_ok": false, "probed_path": "/Users/x/Documents", "checked_at": "2026-05-22T00:00:00Z"}
+        }
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(CTAClient.AgentStatusJSON.self, from: json)
+        XCTAssertEqual(s.fileAccess?.protectedOk, false)
+        XCTAssertEqual(s.fileAccess?.probedPath, "/Users/x/Documents")
+    }
+
+    func test_decode_fileAccess_absent_isNil() throws {
+        let json = """
+        {
+          "schema_version": 1,
+          "launch_agent": {"label": "com.claude-agent", "loaded": true},
+          "claude": {"pid": 1, "rss_mb": 1},
+          "telegram_mcp": {"alive": true},
+          "tmux": {"claude": {"name": "poller", "alive": true}, "watchdog": {"name": "watchdog", "alive": true}},
+          "last_activity": null
+        }
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(CTAClient.AgentStatusJSON.self, from: json)
+        XCTAssertNil(s.fileAccess, "older agents omit file_access → nil")
+    }
+
     /// Everything-down JSON. `pid`, `rss_mb`, and `last_activity` are null
     /// because the agent reports those as null when there's nothing to report
     /// (rather than omitting fields). Confirms Codable handles `null`-vs-int.

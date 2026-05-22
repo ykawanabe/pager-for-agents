@@ -17,7 +17,8 @@
 #       "claude":   {"name": "<session>", "alive": true|false},
 #       "watchdog": {"name": "<session>", "alive": true|false}
 #     },
-#     "last_activity": "<ISO8601>" | null
+#     "last_activity": "<ISO8601>" | null,
+#     "file_access": {"protected_ok": bool, "probed_path": "...", "checked_at": "<ISO8601>"} | null
 #   }
 #
 # Bumps to schema_version are reserved for breaking changes (F1+F2 multi-topic
@@ -247,6 +248,14 @@ cmd_status() {
     caffeinate_alive=false
   fi
 
+  # File-access (FDA) probe result, written by the poller in the launchd TCC
+  # context ($STATE_DIR/file-access.json). cta is the WRONG context to probe, so
+  # we only surface what the poller recorded. Absent → null (older agents).
+  local file_access="null"
+  if [[ -f "$STATE_DIR/file-access.json" ]]; then
+    file_access=$(cat "$STATE_DIR/file-access.json")
+  fi
+
   if [[ "$format" == "json" ]]; then
     local rss_mb=""
     [[ -n "$rss_kb" ]] && rss_mb=$(( rss_kb / 1024 ))
@@ -261,7 +270,8 @@ cmd_status() {
     "watchdog": {"name": $(_json_str_or_null "$TMUX_SESSION_WATCHDOG"), "alive": $tmux_watchdog}
   },
   "caffeinate": {"alive": $caffeinate_alive, "pid": $(_json_int_or_null "$caffeinate_pid")},
-  "last_activity": $(_json_str_or_null "$activity")
+  "last_activity": $(_json_str_or_null "$activity"),
+  "file_access": $file_access
 }
 EOF
   else
