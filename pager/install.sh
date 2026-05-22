@@ -177,6 +177,16 @@ sleep 1  # give launchctl a moment to settle its respawn
 TRACKED_PID=$(launchctl print "$LAUNCHCTL_TARGET" 2>/dev/null | awk '/^\s*pid =/ {print $3; exit}')
 if [[ -n "$TRACKED_PID" ]]; then
     pgrep -f "Claude Pager.app/Contents/MacOS/ClaudePager" 2>/dev/null | while read -r pid; do
+        # Skip the agent-launcher: start_agents.sh runs THIS binary as
+        # `ClaudePager --agent-launcher <poller>` to supervise the bot under
+        # com.claude-agent (the FDA-inheritance trick). It shares the bundle
+        # binary path but is a different service — reaping it SIGTERMs the
+        # poller, which exits 0 cleanly, and com.claude-agent's
+        # KeepAlive(SuccessfulExit=false) then would NOT respawn it: the bot
+        # would silently stay down until the next login or `cta start`.
+        if ps -o args= -p "$pid" 2>/dev/null | grep -q -- '--agent-launcher'; then
+            continue
+        fi
         if [[ "$pid" != "$TRACKED_PID" ]]; then
             kill "$pid" 2>/dev/null && say "Reaped orphan Pager pid=$pid (launchctl-tracked is $TRACKED_PID)"
         fi
