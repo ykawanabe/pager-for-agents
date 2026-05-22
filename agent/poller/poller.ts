@@ -195,6 +195,16 @@ let pairedMtimeMs = 0;
 // `cta config idle-evict <min>` (the Pager "Memory" toggle).
 let idleEvictMinutes = 0;
 let settingsMtimeMs = 0;
+// Idle-clear tuning. When an idle topic's transcript exceeds this many bytes,
+// the idle sweep flushes durable memory then rotates the session UUID (a real
+// /clear, resets cost) instead of merely evicting (which keeps the bloated
+// session). Below the threshold → evict only (RAM reclaim, no context loss).
+const IDLE_CLEAR_MIN_BYTES = Number(process.env.IDLE_CLEAR_MIN_BYTES ?? `${1024 * 1024}`); // 1 MB
+// Hard cap on the memory-flush turn before abandoning it (and leaving the
+// session intact). The flush runs on a bloated session so it can be slow.
+const IDLE_FLUSH_TIMEOUT_MS = Number(process.env.IDLE_FLUSH_TIMEOUT_MS ?? `${3 * 60_000}`);
+// Topics with an in-flight idle flush, so the sweep doesn't launch a second.
+const idleFlushing = new Set<string>();
 // Epoch ms of the last file-access (FDA) probe; throttles re-probing to ~60s.
 let lastFileAccessProbe = 0;
 
@@ -1060,6 +1070,62 @@ async function ensureWildcardMount(): Promise<void> {
 }
 
 
+/** Rotate a topic's per-topic session UUID — the `/clear` lever. The next
+ *  daemon spawn reads this file and uses --session-id with the fresh UUID (no
+ *  --resume) → a cold, empty conversation. Shared by /clear and idle-clear.
+ *  Returns false on write failure (caller decides how to surface it). */
+function rotateSessionUuid(key: number | "dm"): boolean {
+  try {
+    mkdirSync(sessionsDir(), { recursive: true });
+    writeFileSync(join(sessionsDir(), String(key)), randomUUID() + "\n");
+    return true;
+  } catch (e) {
+    process.stderr.write(`poller: rotateSessionUuid failed for ${key}: ${e instanceof Error ? e.message : String(e)}\n`);
+    return false;
+  }
+}
+
+// Prompt for the idle memory-flush turn. Tells claude to persist durable
+// context to ~/.pager/shared-context.md (which every fresh daemon reads via
+// its --append-system-prompt) BEFORE we rotate the session, then post a short
+// user-facing notice. No user is waiting, so latency doesn't matter.
+const IDLE_FLUSH_PROMPT = [
+  "[automated housekeeping — no user is waiting on this]",
+  "This conversation has grown large and is about to be reset to a fresh session so future replies stay fast and cheap.",
+  "First: append anything durable worth keeping to ~/.pager/shared-context.md — the user's preferences, ongoing tasks, open decisions, and key facts from THIS conversation — concisely, and avoid duplicating what's already in the file.",
+  "Then: reply with ONE short, friendly line telling the user you've saved the important context and started a fresh session to keep things fast.",
+].join("\n");
+
+/** Idle memory-flush + clear for one bloated topic. Runs DETACHED (never
+ *  awaited inside the poll tick) so a multi-minute flush turn can't stall
+ *  getUpdates. Flushes durable memory, then — only if the topic is still idle
+ *  (a message arriving mid-flush means the user is back → keep the convo) —
+ *  rotates the session UUID + resets the daemon so the next message is fresh
+ *  and cheap. Guarded against overlapping flushes via idleFlushing. */
+async function idleFlushAndClear(threadIdStr: string): Promise<void> {
+  if (!daemonRegistry || idleFlushing.has(threadIdStr)) return;
+  idleFlushing.add(threadIdStr);
+  try {
+    const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
+    const result = await daemonRegistry.runTurnAndWait(threadIdStr, IDLE_FLUSH_PROMPT, IDLE_FLUSH_TIMEOUT_MS);
+    if (result !== "completed") {
+      process.stdout.write(`[${new Date().toISOString()}] idle-flush ${threadIdStr}: ${result} — leaving session intact\n`);
+      return;
+    }
+    if (!daemonRegistry.isIdleEmpty(threadIdStr)) {
+      process.stdout.write(`[${new Date().toISOString()}] idle-flush ${threadIdStr}: message arrived during flush — skipping clear\n`);
+      return;
+    }
+    if (!rotateSessionUuid(key)) return;
+    await daemonRegistry.resetTopic(threadIdStr);
+    process.stdout.write(`[${new Date().toISOString()}] idle-cleared ${threadIdStr}: memory flushed → fresh session\n`);
+  } catch (e) {
+    process.stderr.write(`poller: idleFlushAndClear ${threadIdStr} failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  } finally {
+    idleFlushing.delete(threadIdStr);
+  }
+}
+
 // /clear over Telegram: rotate the per-topic session UUID and kill the
 // topic's tmux session. The watchdog (kick_dead_topic_sessions) and the
 // wrapper's restart loop respawn claude with the new UUID, so the next
@@ -1095,13 +1161,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
   // Rotate per-topic session UUID. The new daemon (spawned by the registry
   // on the next enqueue) reads this file at start and uses --session-id with
   // a fresh UUID → no --resume → cold conversation.
-  const sessFile = join(sessionsDir(), String(key));
-  const newUuid = randomUUID();
-  try {
-    mkdirSync(sessionsDir(), { recursive: true });
-    writeFileSync(sessFile, newUuid + "\n");
-  } catch (e) {
-    process.stderr.write(`poller: handleClear UUID rotate failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  if (!rotateSessionUuid(key)) {
     await reply(
       { chat_id, thread_id: thread_id_raw },
       "Couldn't rotate the session UUID. Run `cta start` from your Mac to recover.",
@@ -2043,13 +2103,26 @@ export async function main(): Promise<void> {
           lastFileAccessProbe = Date.now();
           runFileAccessProbe(STATE_DIR);
         }
-        // Idle-daemon eviction (opt-in): reclaim RAM from topics quiet ≥ N min.
-        // Reuses resetTopic → next message respawns + --resumes (cold start, no
-        // context loss). No-op unless the operator set a threshold.
+        // Idle sweep (opt-in): for each topic quiet ≥ N min, decide by size.
+        // Large transcript → flush durable memory then clear (rotate UUID →
+        // fresh, cheap session); the flush runs DETACHED so a slow turn never
+        // stalls this tick. Small transcript → evict only (resetTopic keeps the
+        // UUID → next message --resumes, RAM reclaim, no context loss).
+        // No-op unless the operator set a threshold.
         if (daemonRegistry && idleEvictMinutes > 0) {
-          const evicted = await daemonRegistry.sweepIdle(idleEvictMinutes * 60_000);
-          if (evicted.length > 0) {
-            process.stdout.write(`[${new Date().toISOString()}] evicted ${evicted.length} idle daemon(s) after ${idleEvictMinutes}m: ${evicted.join(", ")}\n`);
+          for (const threadIdStr of daemonRegistry.idleCandidates(idleEvictMinutes * 60_000)) {
+            if (idleFlushing.has(threadIdStr)) continue;
+            const key: number | "dm" = threadIdStr === "dm" ? "dm" : Number(threadIdStr);
+            const mount = mountsCache.get(tgKey(key));
+            const jsonl = mount ? jsonlPathForMount(mount) : null;
+            let bytes = 0;
+            if (jsonl) { try { bytes = statSync(jsonl).size; } catch { /* missing → 0 */ } }
+            if (bytes > IDLE_CLEAR_MIN_BYTES) {
+              void idleFlushAndClear(threadIdStr); // detached — must not block the tick
+            } else {
+              await daemonRegistry.resetTopic(threadIdStr);
+              process.stdout.write(`[${new Date().toISOString()}] evicted idle daemon ${threadIdStr} after ${idleEvictMinutes}m (session ${bytes}B ≤ ${IDLE_CLEAR_MIN_BYTES}B)\n`);
+            }
           }
         }
         // β handoff release/reacquire flags + watch-live inject. fs.watch

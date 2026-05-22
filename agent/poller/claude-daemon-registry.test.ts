@@ -330,7 +330,7 @@ describe("ClaudeDaemonRegistry self-heal (incident 2026-05-21)", () => {
   });
 });
 
-describe("ClaudeDaemonRegistry idle eviction", () => {
+describe("ClaudeDaemonRegistry idleCandidates", () => {
   let reg: ClaudeDaemonRegistry | null = null;
   afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
 
@@ -340,7 +340,7 @@ describe("ClaudeDaemonRegistry idle eviction", () => {
     await waitFor(() => r.getStatus(thread) === "idle" && r.daemonCount >= 1, 5000);
   }
 
-  test("evicts a daemon idle past the threshold (SIGTERM + drop handle)", async () => {
+  test("lists a topic idle past the threshold — WITHOUT evicting it", async () => {
     reg = new ClaudeDaemonRegistry({
       claudeBin: FIXTURE,
       debounceMs: 50,
@@ -350,33 +350,28 @@ describe("ClaudeDaemonRegistry idle eviction", () => {
     await spawnIdle(reg, "topic-42");
     expect(reg.daemonCount).toBe(1);
 
-    // Let the idle clock advance well past a tiny threshold, then sweep.
+    // Let the idle clock advance well past a tiny threshold.
     await new Promise((r) => setTimeout(r, 50));
-    const evicted = await reg.sweepIdle(10);
+    expect(reg.idleCandidates(10)).toEqual(["topic-42"]);
 
-    expect(evicted).toEqual(["topic-42"]);
-    expect(reg.daemonCount).toBe(0);
-    expect(reg.getStatus("topic-42")).toBe("absent");
-  });
-
-  test("does NOT evict before the threshold elapses", async () => {
-    reg = new ClaudeDaemonRegistry({
-      claudeBin: FIXTURE,
-      debounceMs: 50,
-      daemonOptsFor: () => ({ cwd: "/tmp" }),
-      onText: () => {},
-    });
-    await spawnIdle(reg, "topic-42");
-
-    // 10s threshold — the daemon has been idle for only milliseconds.
-    const evicted = await reg.sweepIdle(10_000);
-
-    expect(evicted).toEqual([]);
+    // Pure: the daemon is still alive and idle (caller decides what to do).
     expect(reg.daemonCount).toBe(1);
     expect(reg.getStatus("topic-42")).toBe("idle");
   });
 
-  test("idleMs <= 0 disables eviction (no-op)", async () => {
+  test("does NOT list a topic before the threshold elapses", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+    });
+    await spawnIdle(reg, "topic-42");
+    // 10s threshold — the daemon has been idle for only milliseconds.
+    expect(reg.idleCandidates(10_000)).toEqual([]);
+  });
+
+  test("idleMs <= 0 returns [] (feature disabled)", async () => {
     reg = new ClaudeDaemonRegistry({
       claudeBin: FIXTURE,
       debounceMs: 50,
@@ -385,13 +380,11 @@ describe("ClaudeDaemonRegistry idle eviction", () => {
     });
     await spawnIdle(reg, "topic-42");
     await new Promise((r) => setTimeout(r, 50));
-
-    expect(await reg.sweepIdle(0)).toEqual([]);
-    expect(await reg.sweepIdle(-1)).toEqual([]);
-    expect(reg.daemonCount).toBe(1);
+    expect(reg.idleCandidates(0)).toEqual([]);
+    expect(reg.idleCandidates(-1)).toEqual([]);
   });
 
-  test("never evicts a topic with queued / in-flight work", async () => {
+  test("never lists a topic with queued / in-flight work", async () => {
     const sentToDaemon: string[] = [];
     reg = new ClaudeDaemonRegistry({
       claudeBin: FIXTURE,
@@ -400,36 +393,99 @@ describe("ClaudeDaemonRegistry idle eviction", () => {
       onText: () => {},
       onFlush: (_t, c) => sentToDaemon.push(c),
     });
-    // Daemon dispatched but never returns a result → state stays inFlight.
     reg.enqueue("topic-42", "first");
     await waitFor(() => sentToDaemon.length >= 1, 5000);
     expect(reg.getStatus("topic-42")).toBe("inFlight");
-
     // Even with a 0ms threshold, an inFlight turn is off-limits.
-    expect(await reg.sweepIdle(1)).toEqual([]);
-    expect(reg.getStatus("topic-42")).toBe("inFlight");
+    expect(reg.idleCandidates(1)).toEqual([]);
   });
+});
 
-  test("an evicted topic respawns + replies again on the next message (resume)", async () => {
-    const texts: string[] = [];
+describe("ClaudeDaemonRegistry isIdleEmpty", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
+
+  test("true only when the topic is idle with an empty queue", async () => {
     reg = new ClaudeDaemonRegistry({
       claudeBin: FIXTURE,
       debounceMs: 50,
       daemonOptsFor: () => ({ cwd: "/tmp" }),
-      onText: (_t, s) => texts.push(s),
+      onText: () => {},
     });
-    reg.enqueue("topic-42", "hello");
+    expect(reg.isIdleEmpty("absent")).toBe(false);   // no handle
+    reg.enqueue("topic-42", "hi");
     await waitFor(() => reg!.getStatus("topic-42") === "idle", 5000);
-    expect(reg.daemonCount).toBe(1);
+    expect(reg.isIdleEmpty("topic-42")).toBe(true);  // idle, empty
+  });
+});
 
-    await new Promise((r) => setTimeout(r, 50));
-    expect(await reg.sweepIdle(10)).toEqual(["topic-42"]);
-    expect(reg.daemonCount).toBe(0);
+describe("ClaudeDaemonRegistry runTurnAndWait", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
 
-    // Next message lazy-respawns a fresh daemon for the same topic and replies.
-    reg.enqueue("topic-42", "welcome back");
-    await waitFor(() => texts.length >= 2, 5000);
-    expect(reg.daemonCount).toBe(1);
+  async function spawnIdle(r: ClaudeDaemonRegistry, thread: string): Promise<void> {
+    r.enqueue(thread, "hello");
+    await waitFor(() => r.getStatus(thread) === "idle" && r.daemonCount >= 1, 5000);
+  }
+
+  test("sends a turn and resolves 'completed' on turn-end", async () => {
+    const sent: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+      onFlush: (_t, c) => sent.push(c),
+    });
+    await spawnIdle(reg, "topic-42");
+    const result = await reg.runTurnAndWait("topic-42", "flush your memory", 5000);
+    expect(result).toBe("completed");
+    expect(reg.getStatus("topic-42")).toBe("idle"); // back to idle after the turn
+  });
+
+  test("resolves 'timeout' when the turn never ends", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      // hang-on-turn-2: turn 1 (spawnIdle) completes → idle; turn 2 (the flush)
+      // posts text then never ends → runTurnAndWait must time out.
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-on-turn-2" } }),
+      // High watchdog so it doesn't kill the daemon during the short test timeout.
+      inFlightTimeoutMs: 60_000,
+      onText: () => {},
+    });
+    await spawnIdle(reg, "topic-42");
+    const result = await reg.runTurnAndWait("topic-42", "flush", 300);
+    expect(result).toBe("timeout");
+  });
+
+  test("resolves 'skipped' for an absent or non-idle topic", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+    });
+    expect(await reg.runTurnAndWait("never-seen", "x", 1000)).toBe("skipped");
+  });
+
+  test("a timed-out flush bumps activity so the topic does NOT immediately re-qualify (cooldown)", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-on-turn-2" } }),
+      inFlightTimeoutMs: 60_000, // don't let the watchdog kill during the test
+      onText: () => {},
+    });
+    await spawnIdle(reg, "topic-42");
+    // Idle long enough to qualify against a tiny threshold...
+    await new Promise((r) => setTimeout(r, 30));
+    expect(reg.idleCandidates(10)).toEqual(["topic-42"]);
+    // ...but a flush attempt times out and re-stamps activity.
+    expect(await reg.runTurnAndWait("topic-42", "flush", 200)).toBe("timeout");
+    // Topic is inFlight now (turn never ended) AND its idle clock just reset —
+    // either way it must NOT be an idle candidate, so no retry-storm.
+    expect(reg.idleCandidates(10)).toEqual([]);
   });
 });
 

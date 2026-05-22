@@ -69,16 +69,19 @@ interface DaemonHandle {
    *  turn-end / crash / release / reset; reset on each text block. */
   inFlightTimer: ReturnType<typeof setTimeout> | null;
   /** Wall-clock ms of the last activity on this topic (enqueue or turn-end).
-   *  Drives idle-daemon eviction (sweepIdle): a topic idle longer than the
-   *  configured threshold is evicted to reclaim RAM. The session UUID on disk
-   *  is preserved, so the next message respawns + --resumes — cold start, no
-   *  context loss. */
+   *  Drives the idle sweep (idleCandidates): a topic quiet longer than the
+   *  configured threshold becomes eligible for evict (small session) or
+   *  flush-memory + clear (large session). Measured from here. */
   lastActivityAt: number;
   /** True only during stopTurn()'s intentional teardown. The on('crash')
    *  handler checks it to treat the SIGTERM-driven close as a clean stop
    *  (no backoff escalation, no respawn schedule) rather than a real crash —
    *  same idea as the "released" guard, but for /stop. */
   stopping: boolean;
+  /** One-shot resolver set by runTurnAndWait() while it awaits a specific
+   *  turn's end. The turn-end handler fires + clears it so the caller's promise
+   *  resolves. null when no one is waiting. */
+  turnEndResolver: (() => void) | null;
 }
 
 export class ClaudeDaemonRegistry {
@@ -142,6 +145,7 @@ export class ClaudeDaemonRegistry {
         inFlightTimer: null,
         lastActivityAt: Date.now(),
         stopping: false,
+        turnEndResolver: null,
       };
       this.handles.set(threadId, handle);
     }
@@ -309,32 +313,87 @@ export class ClaudeDaemonRegistry {
     this.handles.clear();
   }
 
-  /** Evict daemons that have sat idle (quiescent, empty queue) for at least
-   *  idleMs, reclaiming their RAM. Eviction reuses resetTopic — it SIGTERMs
-   *  the daemon and drops the handle, but leaves the session UUID on disk
-   *  untouched, so the next inbound message lazy-respawns and --resumes the
-   *  same conversation (cold start, no context loss). Idle eviction is thus
-   *  an automatic `/restart` triggered by inactivity.
+  /** List topics that have sat quiescent for at least idleMs — the eligible
+   *  set for the poller's idle sweep. PURE: no side effects, so the caller
+   *  decides per-topic what to do (evict a small session, or flush-memory +
+   *  clear a bloated one). Returns [] when idleMs <= 0 (feature disabled).
    *
-   *  No-op when idleMs <= 0 (feature disabled). Only "idle" handles with an
-   *  alive daemon and an empty queue are eligible — pending/inFlight/released/
-   *  crashed are never touched, so a live turn or a β-handoff is never raced.
-   *  Returns the evicted threadIds (for logging). */
-  async sweepIdle(idleMs: number): Promise<string[]> {
+   *  Only "idle" handles with an alive daemon and an empty queue are eligible —
+   *  pending/inFlight/released/crashed are never returned, so a live turn or a
+   *  β-handoff is never raced. */
+  idleCandidates(idleMs: number): string[] {
     if (idleMs <= 0) return [];
     const now = Date.now();
-    const evictable: string[] = [];
+    const out: string[] = [];
     for (const [threadId, h] of this.handles) {
       if (h.state !== "idle") continue;
       if (h.queue.length > 0) continue;
       if (!h.daemon || !h.daemon.isAlive) continue;
       if (now - h.lastActivityAt < idleMs) continue;
-      evictable.push(threadId);
+      out.push(threadId);
     }
-    for (const threadId of evictable) {
-      await this.resetTopic(threadId);
+    return out;
+  }
+
+  /** True iff the topic is currently idle with an empty queue — the "still safe
+   *  to clear?" check the idle sweep runs AFTER a memory-flush turn, so a real
+   *  message that arrived mid-flush (→ pending/queued) aborts the clear. */
+  isIdleEmpty(threadId: string): boolean {
+    const h = this.handles.get(threadId);
+    return !!h && h.state === "idle" && h.queue.length === 0;
+  }
+
+  /** Run ONE turn on a topic's already-alive idle daemon and wait for it to
+   *  end. Used by the idle memory-flush (send a "save durable context" prompt,
+   *  wait for the write, then the caller clears the session). Bypasses the
+   *  debounce/queue — this is an out-of-band housekeeping turn, not user input.
+   *
+   *  Resolves:
+   *    "completed" — the turn ended within timeoutMs
+   *    "timeout"   — no turn-end before timeoutMs (the inactivity watchdog,
+   *                  armed here, recovers a genuinely wedged daemon)
+   *    "skipped"   — no handle, daemon not alive, or topic not idle (a real
+   *                  turn is in progress — don't stomp it)
+   *
+   *  Never leaves the topic stuck: on timeout the watchdog SIGKILLs a wedged
+   *  daemon (→ crash → respawn → idle); on a normal end the turn-end handler
+   *  transitions back to idle. */
+  async runTurnAndWait(
+    threadId: string,
+    text: string,
+    timeoutMs: number,
+  ): Promise<"completed" | "timeout" | "skipped"> {
+    const handle = this.handles.get(threadId);
+    if (!handle || !handle.daemon || !handle.daemon.isAlive) return "skipped";
+    if (handle.state !== "idle" || handle.queue.length > 0) return "skipped";
+
+    handle.state = "inFlight";
+    // Stamp activity NOW so a flush that wedges (timeout → watchdog SIGKILL →
+    // respawn idle) doesn't re-qualify on the next tick and retry-storm a paid
+    // turn every ~5 min on the most expensive (bloated) session. This buys a
+    // full idle-window cooldown between flush attempts. (Success deletes the
+    // handle via resetTopic, so this only matters for the timeout/wedge path.)
+    handle.lastActivityAt = Date.now();
+    const ended = new Promise<void>((resolve) => { handle.turnEndResolver = resolve; });
+    try {
+      await handle.daemon.send(text);
+    } catch {
+      handle.turnEndResolver = null;
+      handle.state = "idle";
+      return "skipped";
     }
-    return evictable;
+    // Arm the inactivity watchdog so a flush turn that truly wedges (no text,
+    // no end) is SIGKILLed + respawned rather than pinning the topic inFlight.
+    this.armInFlightWatchdog(threadId, handle);
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    });
+    const result = await Promise.race([ended.then(() => "completed" as const), timedOut]);
+    if (timer) clearTimeout(timer);
+    if (result === "timeout") handle.turnEndResolver = null; // stop waiting; watchdog owns recovery
+    return result;
   }
 
   // ─── internals ─────────────────────────────────────────────────────────────
@@ -463,9 +522,12 @@ export class ClaudeDaemonRegistry {
       // Healthy turn — reset crash backoff.
       h.backoffMs = 0;
       h.state = "idle";
-      // Idle clock starts now: the daemon just went quiescent. sweepIdle
+      // Idle clock starts now: the daemon just went quiescent. idleCandidates
       // measures from here.
       h.lastActivityAt = Date.now();
+      // Wake any runTurnAndWait() awaiting THIS turn's end (e.g. the idle
+      // memory-flush) before arming the next debounce.
+      if (h.turnEndResolver) { const r = h.turnEndResolver; h.turnEndResolver = null; r(); }
       // If more messages arrived while we were in-flight, arm next debounce.
       if (h.queue.length > 0) this.armDebounce(threadId, h);
     });
@@ -474,6 +536,11 @@ export class ClaudeDaemonRegistry {
       const h = this.handles.get(threadId);
       if (!h) return;
       this.clearInFlightTimer(h);
+      // Drop any runTurnAndWait resolver: the turn it awaited died with the
+      // daemon. Leaving it set lets a LATER real turn's turn-end fire this
+      // stale resolver → a spurious idle-clear right after the user's reply.
+      // runTurnAndWait's own timeout still resolves it as "timeout".
+      h.turnEndResolver = null;
       // Clean exit during release-for-terminal is expected; don't treat as crash.
       if (h.state === "released") return;
       // Intentional /stop teardown: stopTurn() owns the post-stop transition
