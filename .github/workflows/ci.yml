@@ -42,3 +42,18 @@ jobs:
         uses: oven-sh/setup-bun@v2
       - name: Run shell tests
         run: tests/run.sh
+
+  e2e:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+      - name: Ensure tmux
+        # macOS runners ship tmux, but guard so a runner-image change can't
+        # silently turn the suite off again. jq + curl are preinstalled.
+        run: command -v tmux >/dev/null || brew install tmux
+      - name: Run E2E suite
+        # Self-contained: each scenario sandboxes its own poller against a mock
+        # Bot API + a fake-claude stub, so no real claude / network is needed.
+        run: bash tests/e2e/run.sh
