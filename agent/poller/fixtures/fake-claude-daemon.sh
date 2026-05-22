@@ -15,6 +15,9 @@
 #                          event, staying alive (simulates a daemon wedged
 #                          mid-turn: text posted, no turn-end → registry stuck
 #                          inFlight. Repro of the 2026-05-21 General incident).
+#   hang-on-turn-2       — turn 1 completes normally (registry reaches idle);
+#                          turn 2 posts text then hangs with no result. Lets a
+#                          test reach idle then drive a turn that never ends.
 #
 # Pure-bash implementation: python3 cold-start (1-3s on a loaded mac) was
 # the dominant cost; this fixture is hot-path during test runs, so we use
@@ -78,6 +81,14 @@ while IFS= read -r line; do
   text=$(extract_content "$line")
 
   [[ "$MODE" == "slow" ]] && sleep 1
+
+  if [[ "$MODE" == "hang-on-turn-2" && "$TURN" -ge 2 ]]; then
+    # Turn 1 completes normally (so the registry reaches "idle"); turn 2 posts
+    # text then hangs without a result — lets a test drive a daemon to idle and
+    # THEN exercise a turn that never ends (e.g. runTurnAndWait timeout).
+    emit_assistant_text "You said: $text"
+    continue
+  fi
 
   if [[ "$MODE" == "hang-no-result" ]]; then
     # Post the assistant text, then go silent — no result event — by looping

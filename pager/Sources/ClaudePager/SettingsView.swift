@@ -229,12 +229,12 @@ private struct PagerTab: View {
             }
 
             Section {
-                Toggle("Close idle sessions to free memory", isOn: Binding(
+                Toggle("Reset long idle conversations (saves key context first)", isOn: Binding(
                     get: { idleEvictMinutes > 0 },
                     set: { on in setIdleEvict(on ? defaultIdleEvictMinutes : 0) }
                 ))
                 if idleEvictMinutes > 0 {
-                    Picker("Close a session after", selection: Binding(
+                    Picker("After idle for", selection: Binding(
                         get: { idleEvictMinutes },
                         set: { setIdleEvict($0) }
                     )) {
@@ -249,9 +249,9 @@ private struct PagerTab: View {
                     }
                 }
             } header: {
-                Text("Memory")
+                Text("Idle sessions")
             } footer: {
-                Text("Each active topic keeps a Claude session in memory. If a topic stays quiet this long, its session closes to free memory; your next message there resumes the same conversation after a short delay. Off by default.")
+                Text("When a topic stays quiet this long, its Claude session closes to free memory — your next message resumes the same conversation after a short delay. If the conversation has grown large, it's also reset to a fresh session so replies stay fast and cheap; the bot saves the important context to its memory first, so it doesn't forget what matters. Off by default.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
