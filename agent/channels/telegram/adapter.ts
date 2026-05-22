@@ -117,7 +117,10 @@ export interface BotCommand {
  */
 export async function setMyCommands(commands: BotCommand[]): Promise<void> {
   try {
-    await fetch(`${getApiBase()}/setMyCommands`, {
+    // fetchWithTimeout (not bare fetch): this is awaited at boot BEFORE the
+    // poll loop starts, so a half-open connection to api.telegram.org would
+    // wedge the poller before getUpdates. Same 15s guard getMe uses.
+    await fetchWithTimeout(`${getApiBase()}/setMyCommands`, 15_000, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ commands }),
