@@ -54,6 +54,7 @@ import {
   answerCallback,
   getUpdates,
   getMe,
+  setMyCommands,
 } from "../channels/telegram/adapter";
 // Raw Telegram inbound wire types. The poller still consumes TgUpdate directly
 // in P1; P3's cutover replaces these with the normalized InboundEvent.
@@ -2040,6 +2041,34 @@ async function preflightBotToken(): Promise<void> {
   }
 }
 
+// The "/" autocomplete menu Telegram shows. Static operational commands the
+// paired operator uses most; pairing/edge commands (/pair, /unpair, /cancel,
+// /start) are intentionally omitted to keep the menu focused — they still work
+// when typed. Registered once at boot via setMyCommands (default scope).
+const BOT_COMMAND_MENU = [
+  { command: "help",    description: "Show available commands" },
+  { command: "list",    description: "Show current project mounts" },
+  { command: "mount",   description: "Bind this topic to a project folder" },
+  { command: "dm",      description: "Bind your DM to a project folder" },
+  { command: "unmount", description: "Remove this topic's mount" },
+  { command: "clear",   description: "Reset the conversation (new session)" },
+  { command: "stop",    description: "Abort the running turn (keep session)" },
+  { command: "restart", description: "Restart claude on this topic" },
+  { command: "cost",    description: "Token usage + estimated cost this session" },
+  { command: "usage",   description: "Anthropic 5h / 7d subscription usage" },
+  { command: "status",  description: "Bot and daemon health" },
+  { command: "context", description: "Approx context-window usage for this topic" },
+  { command: "effort",  description: "Set reasoning effort (low|medium|high|xhigh|max)" },
+  { command: "model",   description: "Set model (opus|sonnet|haiku|full-id)" },
+];
+
+/** Publish the "/" command menu once at boot. Best-effort — a failure just
+ *  means no autocomplete menu; every command still works when typed. */
+async function registerBotCommands(): Promise<void> {
+  await setMyCommands(BOT_COMMAND_MENU);
+  process.stdout.write(`[${new Date().toISOString()}] registered ${BOT_COMMAND_MENU.length} bot commands (/ menu)\n`);
+}
+
 export async function main(): Promise<void> {
   // Install signal handlers BEFORE any work — if SIGTERM arrives during
   // preflight/initDaemonRegistry, default node behavior is silent exit,
@@ -2065,6 +2094,7 @@ export async function main(): Promise<void> {
   cleanupStaleReleaseFlags();
   ensureInjectDir();
   await preflightBotToken();
+  await registerBotCommands();
   let offset = readOffset();
   refreshMountsIfChanged();
   refreshPairedIfChanged();
