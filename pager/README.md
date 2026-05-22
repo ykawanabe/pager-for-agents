@@ -6,9 +6,9 @@ Sits in the menu bar as a paperplane icon:
 
 | Icon | Meaning |
 |---|---|
-| `paperplane.fill` | Everything is up: claude is running, the Telegram plugin is polling, both tmux sessions are alive. |
-| `paperplane` | Partial — the bot is up but one of the supporting tmux sessions is missing. |
-| `exclamationmark.triangle.fill` | Down — the Telegram bot isn't running or the MCP plugin has died. |
+| `paperplane.fill` | Everything is up: the poller and watchdog are both running. |
+| `paperplane` | Partial — the bot is up but the poller or watchdog isn't running. |
+| `exclamationmark.triangle.fill` | Down — the poller isn't running. |
 
 Click the icon for details, a one-tap "Watch bot live" terminal, and a Settings… pane to manage the Telegram bot token and allowed user IDs.
 
@@ -30,7 +30,7 @@ cd pager-for-agents/pager
 ./install.sh
 ```
 
-`install.sh` builds a release binary, copies it to `~/.local/bin/claude-pager`, registers a LaunchAgent (`com.claude-pager`), and starts it. The icon appears in the menu bar within a second.
+`install.sh` builds a release binary, wraps it as `~/Applications/Claude Pager.app` (ad-hoc signed with a stable bundle id, so macOS permission grants survive rebuilds), registers a LaunchAgent (`com.claude-pager`), and starts it. The icon appears in the menu bar within a second.
 
 ## What the menu shows
 
@@ -47,11 +47,11 @@ Settings…   ⌘,
 Quit Claude Pager  ⌘Q
 ```
 
-When the bot is degraded or offline the top line changes to `Degraded` / `Offline` and the menu lists the specific broken components (e.g. `Bot not running`, `Plugin not polling`).
+When the bot is degraded or offline the top line changes to `Degraded` / `Offline` and the menu names the broken component (the poller or the watchdog).
 
-- **Watch bot live** — opens Terminal attached to the bot's tmux session. You see exactly what messages Claude is receiving and replying with, in real time.
+- **Watch bot live** — opens Terminal tailing the bot's log (`tail -f ~/.pager/agent.log`). You see exactly what messages Claude is receiving and replying with, in real time.
 - **Show recent activity** — tails the agent log (`~/.pager/agent.log`).
-- **Restart bot** — kicks the underlying `start_agents.sh` to restart both tmux sessions.
+- **Restart bot** — restarts the poller + watchdog (the `launchd` jobs).
 - **Run diagnostics…** — walks the full pipeline (token → Telegram `getMe` → send a test message → local processes) and reports which step failed.
 
 ## Settings

@@ -1,21 +1,23 @@
 # Troubleshooting
 
-## tmux sessions not running after login
+## Agent not running after login
 
-Check the LaunchAgent status:
-
-```sh
-launchctl list | grep com.claude-agent
-```
-
-If it's not listed, reload it:
+The agent is two `launchd` jobs: the poller (`com.claude-agent`) and the
+watchdog (`com.claude-watchdog`). Check them:
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/com.claude-agent.plist 2>/dev/null
-launchctl load   ~/Library/LaunchAgents/com.claude-agent.plist
+cta status
+launchctl list | grep com.claude
 ```
 
-Then inspect the log:
+If a job isn't loaded, `cta start` loads both. To force a clean restart:
+
+```sh
+cta stop
+cta start
+```
+
+Then inspect the logs:
 
 ```sh
 tail -n 100 ~/.pager/agent.log
@@ -24,42 +26,34 @@ tail -n 100 ~/.pager/agent.err.log
 
 ## `claude: command not found` inside the LaunchAgent
 
-LaunchAgents don't inherit your shell's PATH. The plist sets PATH to include
-`/opt/homebrew/bin`, `/usr/local/bin`, and `~/.local/bin`. If you installed
-`claude` somewhere else, edit `~/Library/LaunchAgents/com.claude-agent.plist`
-and add that directory to the PATH key, then reload the agent.
+LaunchAgents don't inherit your shell's PATH. `install.sh` resolves the
+absolute paths to `bun` and `claude` at install time and bakes them into the
+plist / `start_agents.sh`. If you move or reinstall either binary afterward,
+rerun `./install.sh` so the paths are re-resolved.
 
 ## Telegram messages not arriving in Claude
 
-1. Confirm the bot token is configured: inside Claude Code, run
-   `/telegram:configure` and re-paste the token.
-2. Confirm the allowlist matches your Telegram user ID. If you locked the
-   channel to a different account, your messages will be silently dropped.
-3. Confirm `claude` was started with `--channels plugin:telegram@...`. Run
-   `tmux attach -t claude` and check the startup banner.
+1. Confirm the bot token is present: `~/.claude/channels/telegram/.env` should
+   hold `TELEGRAM_BOT_TOKEN=...`. A rejected token fails the poller's startup
+   preflight — `~/.pager/agent.log` says so on the first lines after a restart.
+2. Confirm the allowlist matches your Telegram user ID. Messages from anyone
+   not on the allowlist are silently dropped.
+3. Confirm the chat is paired: `cta status` shows the paired chat, or send
+   `/pair <code>` (run `cta pair-code` to see the code).
+4. Watch it live: `tail -f ~/.pager/agent.log` shows each inbound update being
+   routed to its topic's `claude` daemon.
 
-## Network recovery doesn't restart claude
+## The bot stopped responding after a network blip
 
-The watchdog only kicks the session when state changes from offline → online.
-If the Mac was online the whole time but `claude` itself died, the restart
-loop inside `restart_claude.sh` is what brings it back — check that loop is
-still running with `tmux attach -t claude`.
-
-## "Address already in use" or duplicate-session errors
-
-Run the start script again — it kills existing sessions before spawning new
-ones:
-
-```sh
-~/.local/bin/start_agents.sh
-```
+The watchdog (`com.claude-watchdog`) kickstarts the poller whenever its
+heartbeat (`~/.pager/heartbeat-poller`) goes stale, so a hung poller heals
+itself within a couple of minutes. To force it now: `cta start`. To confirm
+both jobs are alive: `cta status`.
 
 ## How to stop everything temporarily
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/com.claude-agent.plist
-tmux kill-session -t claude
-tmux kill-session -t watchdog
+cta stop      # unloads both LaunchAgents; SIGTERMs the poller + its claude daemons
 ```
 
-Reload the plist to bring it all back.
+Bring it all back with `cta start`.

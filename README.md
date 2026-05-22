@@ -4,19 +4,18 @@ Use [Claude Code](https://code.claude.com/) from your phone, through the chat ap
 
 `install.sh` wires together three things:
 
-1. A `tmux` session that keeps `claude` running in a `while true` loop with the official Telegram channel plugin attached.
-2. A watchdog that restarts the session when the network returns after an outage **or** when the MCP plugin silently dies (claude alive, `bun server.ts` gone).
-3. A `launchd` LaunchAgent so both come up automatically at login.
+1. A `launchd` LaunchAgent that runs the **poller** — one Telegram long-poll loop. With Pager installed, the poller is launched through the menu bar app (`Claude Pager.app --agent-launcher`) so macOS attributes its file access to "Claude Pager"; a CLI-only install runs `bun` directly.
+2. The poller routes each chat — and each forum topic — to its own long-lived `claude` session (`claude -p --input-format stream-json`, one daemon per topic), through a small platform-agnostic `ChatTransport` layer. Replies, the 👀→👌 read receipts, the typing indicator, and inline buttons all flow back through it.
+3. A second LaunchAgent — the **watchdog** — kickstarts the poller if its heartbeat goes stale, catching hangs that `launchd`'s own crash-respawn would miss.
 
-It also (optionally) provisions the bot token and allowlist at the canonical location the Claude Code Telegram plugin auto-discovers — so once `install.sh` finishes, the bot is live.
+No `tmux`, no separate outbound server. `install.sh` also (optionally) provisions the bot token and allowlist under `~/.claude/channels/telegram/` — so once it finishes, the bot is live.
 
 ## Requirements
 
 - macOS (Apple Silicon or Intel)
 - `bash` (the scripts are bash, not zsh)
 - [`claude`](https://code.claude.com/docs/en/getting-started) v2.1.80+ on `PATH`
-- `tmux`
-- `bun` (Claude Code currently requires it for plugin loading)
+- `bun` on `PATH` (runs the poller and the `cta` helpers)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram numeric user ID — DM [@userinfobot](https://t.me/userinfobot), or [@username_to_id_bot](https://t.me/username_to_id_bot) / [@getmyid_bot](https://t.me/getmyid_bot) if the first one's offline
 
@@ -92,7 +91,7 @@ Send these inside Telegram (in the paired chat, as the paired user):
 
 | Command | What |
 |---|---|
-| `cta status` | Health snapshot (LaunchAgent, tmux, MCP, last activity) |
+| `cta status` | Health snapshot (poller + watchdog LaunchAgents, last activity) |
 | `cta start` / `cta stop` | Restart / stop the agent |
 | `cta pair-code` | Re-display the pairing code |
 | `cta pair-code --reset` | Regenerate (invalidates the previous code) |
@@ -109,23 +108,24 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | Bot doesn't respond to anything | Token rejected by Bot API (preflight failed) | Check `~/.claude/channels/telegram/.env`, rerun `./install.sh` |
 | `/mount` says "not a directory" | Path doesn't exist on the Mac | Use full path, no relative or shell-globbed paths |
 | `/mount` says "inside a forum topic" | You sent it in the chat root, not a topic | Open a topic and resend, or use `/dm` for the DM mount |
-| Messages arrive but no claude reply | tmux session crashed / claude died | `tmux attach -t topic-<id>` to inspect; `cta start` to restart |
+| Messages arrive but no claude reply | poller hung, or a topic's claude died | `cta status` to check; `tail -f ~/.pager/agent.log` to inspect; `cta start` to restart |
 | Want to start over | — | `cta stop`, delete `~/.pager/paired.json`, `cta pair-code --reset`, `cta start` |
 
 ## Where the secrets live
 
 | Path | What | Mode |
 |---|---|---|
-| `~/.pager/.env` | Agent config (paths, tmux session names, ping target) | 644 |
+| `~/.pager/.env` | Agent config (paths, ping target) | 644 |
 | `~/.claude/channels/telegram/.env` | `TELEGRAM_BOT_TOKEN=...` | 600 |
 | `~/.claude/channels/telegram/access.json` | Allowlist policy | 600 |
-| `~/Library/LaunchAgents/com.claude-agent.plist` | LaunchAgent definition | 644 |
+| `~/Library/LaunchAgents/com.claude-agent.plist` | Poller LaunchAgent | 644 |
+| `~/Library/LaunchAgents/com.claude-watchdog.plist` | Watchdog LaunchAgent | 644 |
 
-The Telegram plugin path is what Claude Code reads automatically when launched with `--channels plugin:telegram@claude-plugins-official`. You don't need to point it at the file — being in the canonical location is enough.
+The poller reads the bot token from `~/.claude/channels/telegram/.env` directly — there's no separate Telegram channel plugin or MCP server in the loop anymore.
 
 ## Security — read this before you run it
 
-`restart_claude.sh` launches Claude Code with `--dangerously-skip-permissions`. That flag means:
+The poller spawns each topic's `claude` with `--dangerously-skip-permissions`. That flag means:
 
 - **Every tool call is auto-approved.** Claude can read, write, and execute on your system without prompting.
 - **Anyone who can DM the bot has the same privileges Claude has.** If your bot token leaks or your allowlist is empty, that's a remote shell.
@@ -147,7 +147,7 @@ Common issues:
 
 - `claude: command not found` from the LaunchAgent — PATH issue in the plist, see troubleshooting doc.
 - Messages not arriving — check the allowlist matches your Telegram user ID.
-- After network outage, claude doesn't reconnect — verify both `claude` and `watchdog` tmux sessions are alive: `tmux ls`.
+- After a network outage, the bot doesn't reconnect — run `cta status`; the watchdog kickstarts a stale poller on its own, or `cta start` forces it.
 
 ## Development
 
@@ -157,7 +157,7 @@ Run the shell test suite locally:
 tests/run.sh
 ```
 
-Covers `mcp_healthy`, `kick_claude_session`, and the `check-no-secrets` pre-commit hook. CI runs the same suite on every push.
+Covers the `cta` CLI, the mount-store, the LaunchAgent entrypoints, the watchdog, and the `check-no-secrets` pre-commit hook. CI runs the same suite on every push. The TypeScript unit tests live alongside the code (`cd agent && bun test`); the agent-runnable end-to-end harness is `tests/e2e/run.sh`.
 
 ## Uninstall
 
@@ -175,16 +175,14 @@ Both modes back up `.env` files into `~/.pager-backup-<timestamp>/` first.
 ├── install.sh / uninstall.sh        Top-level installers (chains pager/ optionally)
 ├── cli/cta                          User-facing CLI (status, mount, pair, …)
 ├── agent/                           Runtime
-│   ├── start_agents.sh              LaunchAgent entry — spawns tmux sessions
-│   ├── watch_network.sh             Watchdog (network + MCP plugin health)
-│   ├── restart_claude.sh            Single-topic v0 claude restart loop
-│   ├── topic-wrapper.sh             Per-topic claude launcher (MULTI_TOPIC)
-│   ├── poller/                      Telegram long-poll → tmux dispatch
-│   ├── mcp-telegram/                MCP outbound server (one per topic)
+│   ├── start_agents.sh              LaunchAgent entry — exec's the poller (launchd-supervised)
+│   ├── watch_network.sh             Watchdog — kickstarts the poller if its heartbeat goes stale
+│   ├── poller/                      Telegram long-poll → per-topic claude daemons (stream-json)
+│   ├── channels/                    ChatTransport — platform-agnostic core + the Telegram adapter
 │   └── mount-store/                 mounts.json read/write with O_EXCL lock
 ├── launchagent/                     com.claude-agent.plist template
 ├── tests/                           bun + shell test suite
-├── docs/                            Prose docs + (currently un-published) landing
+├── docs/                            Prose docs + the published landing page (GitHub Pages)
 │   ├── test-plan.md                 Failure-mode matrix
 │   └── troubleshooting.md
 ├── scripts/                         Dev tooling (check-no-secrets pre-commit)
