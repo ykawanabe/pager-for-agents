@@ -55,12 +55,12 @@ final class CTAClientTests: XCTestCase {
           "telegram_mcp": {"alive": true},
           "tmux": {"claude": {"name": "poller", "alive": true}, "watchdog": {"name": "watchdog", "alive": true}},
           "last_activity": null,
-          "file_access": {"protected_ok": false, "probed_path": "/Users/x/Documents", "checked_at": "2026-05-22T00:00:00Z"}
+          "file_access": {"protected_ok": false, "probed": [{"path": "/Users/x/Documents", "ok": true}, {"path": "/Users/x/Desktop", "ok": false}], "checked_at": "2026-05-22T00:00:00Z"}
         }
         """.data(using: .utf8)!
         let s = try JSONDecoder().decode(CTAClient.AgentStatusJSON.self, from: json)
         XCTAssertEqual(s.fileAccess?.protectedOk, false)
-        XCTAssertEqual(s.fileAccess?.probedPath, "/Users/x/Documents")
+        XCTAssertEqual(s.fileAccess?.blockedPaths, ["/Users/x/Desktop"])
     }
 
     func test_decode_fileAccess_absent_isNil() throws {

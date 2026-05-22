@@ -527,11 +527,11 @@ _poller_alive()   { return 1; }
 _watchdog_alive() { return 1; }
 _last_activity()  { echo ""; }
 cat > "$FA_TMP/file-access.json" <<'JSON'
-{"protected_ok": true, "probed_path": "/Users/x/Documents", "checked_at": "2026-05-22T00:00:00Z"}
+{"protected_ok": false, "probed": [{"path": "/Users/x/Documents", "ok": true}, {"path": "/Users/x/Desktop", "ok": false}], "checked_at": "2026-05-22T00:00:00Z"}
 JSON
 JSON=$(cmd_status json)
-echo "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); fa=d["file_access"]; assert fa["protected_ok"] is True, fa; assert fa["probed_path"]=="/Users/x/Documents", fa' \
-  && ok "cmd_status json: file_access present + protected_ok=true" \
+echo "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); fa=d["file_access"]; assert fa["protected_ok"] is False, fa; assert any(p["path"]=="/Users/x/Desktop" and p["ok"] is False for p in fa["probed"]), fa' \
+  && ok "cmd_status json: file_access present + per-folder probed array" \
   || ng "cmd_status json: file_access missing or malformed"
 rm -f "$FA_TMP/file-access.json"
 JSON=$(cmd_status json)
