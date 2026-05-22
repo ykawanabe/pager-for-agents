@@ -163,6 +163,7 @@ Bun.serve({
       case "sendChatAction":
       case "setMessageReaction":
       case "answerCallbackQuery":
+      case "setMyCommands":
         // No interesting return shape; the poller checks for `ok` only.
         return Response.json({ ok: true, result: true });
       case "getChatMember": {

@@ -104,6 +104,29 @@ export async function sendChatAction(chat_id: number, thread_id?: number): Promi
   }
 }
 
+export interface BotCommand {
+  command: string;     // without the leading slash, 1-32 chars, lowercase
+  description: string; // 1-256 chars
+}
+
+/**
+ * Register the bot's command list (the "/" autocomplete menu Telegram shows)
+ * via setMyCommands. Default scope — these are static command names + English
+ * descriptions, not user data, so global scope is fine for a single-operator
+ * bot. Best-effort: a failed call just means no "/" menu, not a delivery loss.
+ */
+export async function setMyCommands(commands: BotCommand[]): Promise<void> {
+  try {
+    await fetch(`${getApiBase()}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands }),
+    });
+  } catch (e) {
+    process.stderr.write(`poller: setMyCommands failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
 /**
  * Edit a sent message's text in-place. Omitting reply_markup also drops any
  * inline keyboard on the original — one call covers "append the user's choice
