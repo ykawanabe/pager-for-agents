@@ -433,6 +433,81 @@ describe("ClaudeDaemonRegistry idle eviction", () => {
   });
 });
 
+describe("ClaudeDaemonRegistry stopTurn", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
+
+  test("stopTurn aborts an in-flight turn and returns true; topic stays usable", async () => {
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      // hang-no-result keeps the fake daemon in-flight: it posts text then
+      // never emits a result event, so the registry stays in "inFlight".
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
+      // High watchdog so the inactivity timer never fires during the test.
+      inFlightTimeoutMs: 60_000,
+      onText: (_t, s) => texts.push(s),
+    });
+
+    reg.enqueue("topic-42", "long running");
+    await waitFor(() => texts.length >= 1, 5000);          // turn is now in-flight
+    expect(reg.getStatus("topic-42")).toBe("inFlight");
+
+    const stopped = await reg.stopTurn("topic-42");
+    expect(stopped).toBe(true);
+    expect(reg.getStatus("topic-42")).toBe("idle");        // back to idle, NOT crashed
+    expect(reg.daemonCount).toBe(0);                        // subprocess gone
+
+    // Session/topic preserved: a new message lazy-respawns and processes.
+    const spawnsBefore = reg.spawnedCount;
+    reg.enqueue("topic-42", "after stop");
+    await waitFor(() => texts.some((t) => t.includes("after stop")), 5000);
+    expect(reg.spawnedCount).toBe(spawnsBefore + 1);        // respawned, not reused
+  });
+
+  test("stopTurn returns false when nothing is running (idle topic)", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+    });
+    reg.enqueue("topic-7", "hi");
+    await waitFor(() => reg!.getStatus("topic-7") === "idle", 5000); // turn finished
+    expect(await reg.stopTurn("topic-7")).toBe(false);
+  });
+
+  test("stopTurn returns false for an absent topic", async () => {
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+    });
+    expect(await reg.stopTurn("never-seen")).toBe(false);
+  });
+
+  test("messages queued during the in-flight turn survive the stop", async () => {
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
+      inFlightTimeoutMs: 60_000,
+      onText: (_t, s) => texts.push(s),
+    });
+
+    reg.enqueue("topic-42", "first");
+    await waitFor(() => texts.length >= 1, 5000);          // in-flight
+    reg.enqueue("topic-42", "queued during turn");          // sits in the queue
+
+    expect(await reg.stopTurn("topic-42")).toBe(true);
+    // The preserved queue flushes on respawn → the queued message is processed.
+    await waitFor(() => texts.some((t) => t.includes("queued during turn")), 5000);
+  });
+});
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {

@@ -1256,6 +1256,46 @@ async function handleRestartCmd(msg: TgMessage): Promise<void> {
 }
 
 /**
+ * Abort the in-flight claude turn for this topic. The session UUID is left
+ * untouched, so the next message --resumes the same conversation — only the
+ * running turn is dropped. Idempotent: replies "Nothing running to stop." when
+ * no turn is in-flight.
+ *
+ * v1 is kill-and-respawn (registry.stopTurn → SIGTERM→SIGKILL the subprocess,
+ * lazy respawn on the next message). The raw stream-json CLI has no in-band
+ * interrupt, so there is no "graceful leave-it-alive" path yet (CLI v2.1.148).
+ */
+async function handleStop(msg: TgMessage): Promise<void> {
+  const chat_id = msg.chat.id;
+  const thread_id = msg.message_thread_id;
+  const key: number | "dm" = thread_id != null ? thread_id : "dm";
+  const threadIdStr = String(key);
+
+  let stopped = false;
+  if (daemonRegistry) {
+    try {
+      stopped = await daemonRegistry.stopTurn(threadIdStr);
+    } catch (e) {
+      process.stderr.write(`poller: handleStop stopTurn failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
+
+  // The aborted turn emits no turn-end, so onDaemonTurnEnd's clearTypingExternal
+  // never fires — clear the typing indicator here so it doesn't keepalive to its
+  // cap. (Read-ack glyphs need no handling: onDaemonFlush already flipped the
+  // in-flight turn's messages to 👌 at flush time; messages queued during the
+  // turn keep their 👀 and flip naturally when the resumed turn flushes.)
+  if (isTyping(transport)) {
+    void transport.clearTypingExternal({ channel: "telegram", chatId: chat_id, threadId: thread_id });
+  }
+
+  await reply(
+    { chat_id, thread_id },
+    stopped ? "⏹ Stopped." : "Nothing running to stop.",
+  );
+}
+
+/**
  * Run `cta status` and post its output. The cta CLI knows about every
  * component (LaunchAgent, poller heartbeat, MCP, watchdog) — this is the
  * source of truth for "is the bot alive."
@@ -1584,6 +1624,7 @@ async function handleHelp(msg: TgMessage): Promise<void> {
       "  /model <name>   — set model for this topic (opus|sonnet|haiku|full-id)",
       "  /context        — approx context-window usage for this topic",
       "  /restart        — restart claude on this topic (keep session)",
+      "  /stop           — abort the running turn (keeps session; queued messages stay)",
       "  /status         — show bot/daemon health (cta status output)",
       "",
       "Any non-command message is forwarded to the claude session for that mount.",
@@ -1686,6 +1727,7 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
     case "/dm":    await handleDm(msg, args); return true;
     case "/unmount": await handleUnmount(msg); return true;
     case "/cancel": await handleCancel(msg); return true;
+    case "/stop":   await handleStop(msg); return true;
     case "/list":  await handleList(msg); return true;
     case "/effort": await handleEffort(msg, args); return true;
     case "/model": await handleModel(msg, args); return true;
