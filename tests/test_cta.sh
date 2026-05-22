@@ -169,6 +169,20 @@ else
   ng "cmd_start (poller down): expected 'kickstart gui/<uid>/$PLIST_LABEL' (got: $(tr '\n' ';' <<<"$calls"))"
 fi
 
+# Case 3: watchdog plist missing (e.g. upgrade without re-running install.sh).
+# cmd_start must WARN on the missing plist instead of silently reporting health
+# while hang-recovery supervision is absent (codex P2, 2026-05-22).
+: > "$LAUNCHCTL_LOG"
+_poller_alive()   { return 0; }
+_watchdog_alive() { return 0; }
+WATCHDOG_PLIST_PATH="/nonexistent/com.claude-watchdog.plist"
+START_WARN=$(cmd_start 2>&1 >/dev/null)
+if grep -qiE "watchdog|com.claude-watchdog" <<<"$START_WARN"; then
+  ok "cmd_start (watchdog plist missing): warns about the missing plist"
+else
+  ng "cmd_start (watchdog plist missing): expected a stderr warning (got: '$START_WARN')"
+fi
+
 rm -f "$LAUNCHCTL_LOG" "$AGENT_PLIST" "$WATCHDOG_PLIST"
 unset -f _poller_alive _watchdog_alive launchctl 2>/dev/null
 

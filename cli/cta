@@ -294,6 +294,11 @@ cmd_start() {
     if [[ -f "$plist" ]]; then
       launchctl load "$plist" 2>/dev/null || true
       loaded_any=1
+    else
+      # A missing plist means supervision is incomplete (e.g. an upgrade that
+      # didn't re-run install.sh — the watchdog gives no hang-recovery without
+      # its job). Warn rather than silently report health.
+      echo "Warning: $(basename "$plist") not found — run install.sh to (re)install it." >&2
     fi
   done
   if [[ "$loaded_any" -eq 0 ]]; then
