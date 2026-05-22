@@ -33,7 +33,16 @@ final class SetupWizardModel: ObservableObject {
     @Published private(set) var currentStep: Int = 1
     @Published private(set) var botUsername: String?
 
-    /// True once every step is done — the wizard's "complete" screen.
+    /// Optional, NON-BLOCKING file-access (Full Disk Access) status, derived
+    /// from the poller's $STATE_DIR/file-access.json probe. nil = unknown (older
+    /// agent, or the probe hasn't run). true = the agent runtime (bun) has FDA;
+    /// false = it doesn't and macOS will keep prompting. Deliberately NOT part
+    /// of `steps`/`isComplete` — projects in ~/ work without it; it only matters
+    /// for protected folders (Documents/Desktop/Downloads/iCloud).
+    @Published private(set) var fileAccessGranted: Bool? = nil
+
+    /// True once every REQUIRED step is done — the wizard's "complete" screen.
+    /// File access is optional and intentionally excluded.
     var isComplete: Bool { steps.allSatisfy { $0.status == .done } }
 
     private var timer: Timer?
@@ -90,6 +99,20 @@ final class SetupWizardModel: ObservableObject {
         ]
         // Current step = first pending; if all done, point past the last.
         currentStep = steps.first(where: { $0.status == .pending })?.number ?? 6
+
+        fileAccessGranted = readFileAccess()
+    }
+
+    /// Read the poller's FDA probe result. nil when the file is absent (older
+    /// agent / not yet probed); otherwise the `protected_ok` boolean.
+    func readFileAccess() -> Bool? {
+        let file = stateDir.appendingPathComponent("file-access.json")
+        guard let data = try? Data(contentsOf: file),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ok = json["protected_ok"] as? Bool else {
+            return nil
+        }
+        return ok
     }
 
     // MARK: - Step predicates

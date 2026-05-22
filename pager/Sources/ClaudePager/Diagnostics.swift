@@ -111,6 +111,27 @@ enum Diagnostics {
             detail: "poller=\(mark(s.tmuxClaudeAlive)) watchdog=\(mark(s.tmuxWatchdogAlive))"
         ))
 
+        // 9. File access (FDA). Read the poller's probe via cta status. The
+        //    agent runtime (bun) needs Full Disk Access to work in protected
+        //    folders without macOS re-prompting. Optional — non-protected
+        //    projects (~/ghq etc.) work without it, so a ✗ isn't fatal.
+        let fa = (try? CTAClient.status())?.fileAccess
+        if let fa = fa {
+            out.append(.init(
+                label: "Full Disk Access (bun)",
+                ok: fa.protectedOk,
+                detail: fa.protectedOk
+                    ? "granted"
+                    : "Add `bun` to Full Disk Access in System Settings to stop file-access prompts (optional — only needed for Documents/Desktop/Downloads/iCloud projects)."
+            ))
+        } else {
+            out.append(.init(
+                label: "Full Disk Access (bun)",
+                ok: false,
+                detail: "unknown — update the agent (rerun install.sh) to enable the probe."
+            ))
+        }
+
         return out
     }
 

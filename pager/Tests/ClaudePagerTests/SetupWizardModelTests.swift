@@ -35,6 +35,32 @@ final class SetupWizardModelTests: XCTestCase {
         SetupWizardModel(stateDir: stateDir, pluginEnvPath: pluginEnv)
     }
 
+    // MARK: - file access (optional, non-blocking)
+
+    func test_fileAccess_nilWhenProbeFileMissing() {
+        let m = makeModel()
+        m.refresh()
+        XCTAssertNil(m.fileAccessGranted, "no file-access.json → unknown (nil)")
+    }
+
+    func test_fileAccess_reflectsProbeResult_andIsNotAWizardStep() throws {
+        try #"{"protected_ok": false, "probed": [], "checked_at": "2026-05-22T00:00:00Z"}"#
+            .write(to: stateDir.appendingPathComponent("file-access.json"), atomically: true, encoding: .utf8)
+        let m = makeModel()
+        m.refresh()
+        XCTAssertEqual(m.fileAccessGranted, false)
+        XCTAssertFalse(m.steps.contains { $0.title.lowercased().contains("disk") },
+                       "file access must not appear as a required wizard step")
+    }
+
+    func test_fileAccess_trueWhenGranted() throws {
+        try #"{"protected_ok": true, "probed": [], "checked_at": "2026-05-22T00:00:00Z"}"#
+            .write(to: stateDir.appendingPathComponent("file-access.json"), atomically: true, encoding: .utf8)
+        let m = makeModel()
+        m.refresh()
+        XCTAssertEqual(m.fileAccessGranted, true)
+    }
+
     // MARK: - step1: bot token presence
 
     func test_step1_falseWhenPluginEnvMissing() {

@@ -526,15 +526,15 @@ private struct MountsTab: View {
             Form {
                 // What this screen is for, in one plain sentence.
                 Section {
-                    Text("Telegram の各トピックを、Mac のどのフォルダで作業させるか割り当てます。")
+                    Text("Map each Telegram topic to the Mac folder it works in.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
 
-                // Current bindings, each shown as `トピック → フォルダ`.
+                // Current bindings, each shown as `Topic → Folder`.
                 Section {
                     if mounts.isEmpty {
-                        Label("まだ割り当てがありません", systemImage: "tray")
+                        Label("No projects yet", systemImage: "tray")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(mounts) { m in
@@ -564,19 +564,19 @@ private struct MountsTab: View {
                                     Image(systemName: "minus.circle")
                                 }
                                 .buttonStyle(.borderless)
-                                .help("割り当てを解除")
+                                .help("Remove")
                             }
                         }
                     }
                 } header: {
                     HStack {
-                        Text("現在の割り当て")
+                        Text("Current projects")
                         Spacer()
                         Button { showHelp.toggle() } label: {
                             Image(systemName: "questionmark.circle")
                         }
                         .buttonStyle(.borderless)
-                        .help("用語の説明")
+                        .help("What these mean")
                         .popover(isPresented: $showHelp, arrowEdge: .bottom) { helpPopover }
                     }
                 } footer: {
@@ -591,7 +591,7 @@ private struct MountsTab: View {
                     // Stacked vertical layout so each input gets the full row
                     // width (LabeledContent's split squeezes the path + button).
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("トピック").font(.subheadline).foregroundStyle(.secondary)
+                        Text("Topic").font(.subheadline).foregroundStyle(.secondary)
                         Picker("", selection: $threadSelection) {
                             ForEach(threadOptions) { opt in
                                 Text(opt.label).tag(opt.value)
@@ -600,40 +600,40 @@ private struct MountsTab: View {
                         .labelsHidden()
                         .pickerStyle(.menu)
                         if threadSelection == MountsPresentation.customSentinel {
-                            TextField("トピックID (例: 42) / dm / *", text: $newThreadId)
+                            TextField("topic id (e.g. 42), dm, or *", text: $newThreadId)
                                 .textFieldStyle(.roundedBorder)
                         }
                     }
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("フォルダ").font(.subheadline).foregroundStyle(.secondary)
+                        Text("Folder").font(.subheadline).foregroundStyle(.secondary)
                         HStack(spacing: 6) {
                             TextField("~/projects/foo", text: $newPath)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(.body, design: .monospaced))
-                            Button("選択…") { pickFolder() }
+                            Button("Choose…") { pickFolder() }
                         }
                     }
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("ラベル (任意)").font(.subheadline).foregroundStyle(.secondary)
-                        TextField("例: iron-flow", text: $newLabel)
+                        Text("Label (optional)").font(.subheadline).foregroundStyle(.secondary)
+                        TextField("e.g. iron-flow", text: $newLabel)
                             .textFieldStyle(.roundedBorder)
                     }
                     HStack {
                         Spacer()
-                        Button("追加") { add() }
+                        Button("Add") { add() }
                             .keyboardShortcut(.defaultAction)
                             .disabled(effectiveNewThreadId.isEmpty
                                       || newPath.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
                 } header: {
-                    Text("プロジェクトを追加")
+                    Text("Add a project")
                 } footer: {
                     if let e = actionError {
                         Label(e, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.red)
                     } else {
-                        Text("探しているトピックが一覧に出てこない場合は、そのトピックで一度メッセージを送ると表示されます。")
+                        Text("If the topic you want isn't listed, send one message in it and it'll show up here.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -653,10 +653,10 @@ private struct MountsTab: View {
     /// wants the underlying detail.
     private var helpPopover: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("用語").font(.headline)
-            Text("**General / DM** — トピックを使わないメッセージ。グループでは General、個別チャットでは DM になります。")
-            Text("**新しいトピックの初期設定 (catch-all)** — 個別の割り当てがないトピックすべてに使われる既定フォルダです。")
-            Text("**トピック** — フォーラムのトピック。名前は Bot がそのトピックを見たあとに表示されます（Telegram の仕様で、参加前のトピックは一度メッセージが来るまで番号のままです）。")
+            Text("What these mean").font(.headline)
+            Text("**General / DM** — messages with no topic (Telegram sends these without a topic id). Shows as General in a group, DM in a private chat.")
+            Text("**Default for new topics (catch-all)** — the folder used by any topic that doesn't have its own binding.")
+            Text("**Topic** — a forum topic. Its name appears once the bot has seen it (Telegram can't list topics created before the bot joined, so those stay as numbers until a message arrives).")
         }
         .font(.callout)
         .padding()

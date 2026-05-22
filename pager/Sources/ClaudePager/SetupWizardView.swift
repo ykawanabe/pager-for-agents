@@ -61,6 +61,45 @@ struct SetupWizardView: View {
             ForEach(model.steps, id: \.number) { step in
                 stepRow(step)
             }
+            // Optional, non-blocking: file access (Full Disk Access). Shown below
+            // the 5 required steps; never gates completion.
+            Divider().padding(.vertical, 2)
+            fileAccessRow
+        }
+    }
+
+    @ViewBuilder
+    private var fileAccessRow: some View {
+        let granted = model.fileAccessGranted
+        HStack(spacing: 10) {
+            Image(systemName: granted == true ? "checkmark.circle.fill"
+                            : (granted == false ? "exclamationmark.triangle.fill" : "circle.dotted"))
+                .foregroundColor(granted == true ? .green : (granted == false ? .orange : .secondary))
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("File access (optional)").font(.body)
+                Text(fileAccessDetail(granted)).font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+            if granted != true {
+                Button("Grant…") {
+                    // Reveal bun (hidden ~/.bun path) THEN open the pane, so the
+                    // user has the binary ready to drag into the FDA list.
+                    FullDiskAccess.revealBunInFinder()
+                    FullDiskAccess.openSettings()
+                }
+            }
+        }
+    }
+
+    private func fileAccessDetail(_ granted: Bool?) -> String {
+        switch granted {
+        case .some(true):
+            return "Full Disk Access granted — the bot can work in protected folders."
+        case .some(false):
+            return "To work in Documents / Desktop / Downloads / iCloud, grant `bun` Full Disk Access (not needed if your projects live in ~/ghq etc.)."
+        case .none:
+            return "Unknown — will show once the agent has been updated."
         }
     }
 
