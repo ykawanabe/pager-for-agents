@@ -52,7 +52,7 @@ h_setup_sandbox() {
   SCENARIO_DIR=$(mktemp -d "/tmp/e2e-${name}.XXXXXX")
   export CTA_STATE_DIR="$SCENARIO_DIR/state"
   export CTA_INSTALL_DIR="$SCENARIO_DIR/install"
-  mkdir -p "$CTA_STATE_DIR" "$CTA_INSTALL_DIR/agent/poller" "$CTA_INSTALL_DIR/agent/mcp-telegram" "$CTA_INSTALL_DIR/agent/mount-store" "$CTA_INSTALL_DIR/agent/lib" "$CTA_INSTALL_DIR/agent/channels/telegram"
+  mkdir -p "$CTA_STATE_DIR" "$CTA_INSTALL_DIR/agent/poller" "$CTA_INSTALL_DIR/agent/mount-store" "$CTA_INSTALL_DIR/agent/lib" "$CTA_INSTALL_DIR/agent/channels/telegram"
 
   # Mirror agent sources into the install dir so the poller and friends
   # resolve their helpers under the standard $CTA_INSTALL_DIR layout.
@@ -74,14 +74,9 @@ h_setup_sandbox() {
      "$REPO_DIR/agent/channels/telegram/typing-keepalive.ts" \
      "$CTA_INSTALL_DIR/agent/channels/telegram/"
   cp "$REPO_DIR/agent/poller/package.json" "$CTA_INSTALL_DIR/agent/poller/"
-  cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$CTA_INSTALL_DIR/agent/mcp-telegram/"
-  cp "$REPO_DIR/agent/mcp-telegram/package.json" "$CTA_INSTALL_DIR/agent/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$CTA_INSTALL_DIR/agent/mount-store/"
   cp "$REPO_DIR/agent/mount-store/package.json" "$CTA_INSTALL_DIR/agent/mount-store/"
   cp "$REPO_DIR/agent/lib/paths.ts" "$CTA_INSTALL_DIR/agent/lib/"
-  cp "$REPO_DIR/agent/topic-wrapper.sh" "$CTA_INSTALL_DIR/agent/" 2>/dev/null || true
-  cp "$REPO_DIR/agent/helper-prompt.md" "$CTA_INSTALL_DIR/agent/" 2>/dev/null || true
-  cp "$REPO_DIR/agent/helper-permissions.json" "$CTA_INSTALL_DIR/agent/" 2>/dev/null || true
 
   # Plugin .env (the canonical TELEGRAM_BOT_TOKEN source).
   mkdir -p "$SCENARIO_DIR/plugin"
@@ -147,7 +142,7 @@ h_seed_mount() {
   bun run "$CTA_INSTALL_DIR/agent/mount-store/mount-store.ts" add "${args[@]}" >/dev/null
 }
 
-# Seed a per-thread session UUID file (what topic-wrapper.sh reads for
+# Seed a per-thread session UUID file (what the poller reads for
 # --resume vs --session-id).
 h_seed_session_uuid() {
   local thread_id="$1" uuid="$2"
@@ -163,9 +158,9 @@ h_spawn_poller() {
   local env_file="$CTA_STATE_DIR/.env"
   local plugin_env="$SCENARIO_DIR/plugin/.env"
 
-  # The poller respects TELEGRAM_API_BASE (no /bot<TOKEN> suffix because
-  # mcp-telegram appends that itself; for the poller we keep the api-base
-  # exactly matching the getApiBase() return shape).
+  # The poller respects TELEGRAM_API_BASE: we keep the api-base exactly
+  # matching the getApiBase() return shape (no /bot<TOKEN> suffix — the
+  # adapter appends that).
   export MAIN_CHAT_ID="-1001234"
 
   tmux -S "$TMUX_SOCKET" new-session -d -s poller \

@@ -142,9 +142,8 @@ chmod 600 "$CONFIG_DIR/.env" 2>/dev/null || true
 #   cli/cta                       — user-facing CLI
 #   agent/{start,watch,restart}.sh — runtime entry points (LaunchAgent calls
 #                                    agent/start_agents.sh)
-#   agent/{poller,mcp-telegram,   — runtime modules (data, copied to
-#         mount-store, lib,           $INSTALL_DIR/agent)
-#         topic-wrapper.sh}
+#   agent/{poller,mount-store,    — runtime modules (data, copied to
+#         lib,channels}              $INSTALL_DIR/agent)
 mkdir -p "$BIN_DIR"
 cp "$REPO_DIR/cli/cta" "$BIN_DIR/cta"
 chmod +x "$BIN_DIR/cta"
@@ -160,12 +159,12 @@ done
 rm -f "$BIN_DIR/restart_claude.sh" 2>/dev/null || true
 
 # ---- 3b. Install MULTI_TOPIC runtime modules --------------------------------
-# Layout: $INSTALL_DIR/agent/{lib,poller,mcp-telegram,mount-store,
-# topic-wrapper.sh}. Honors XDG-ish convention (executables in
-# ~/.local/bin, data/code in ~/.local/share).
+# Layout: $INSTALL_DIR/agent/{lib,poller,mount-store,channels}. Honors
+# XDG-ish convention (executables in ~/.local/bin, data/code in
+# ~/.local/share).
 AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
-  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mcp-telegram" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
+  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
      "$REPO_DIR/agent/poller/package.json" \
@@ -185,25 +184,14 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/channels/telegram/transport.ts" \
      "$REPO_DIR/agent/channels/telegram/typing-keepalive.ts" \
      "$AGENT_DIR/channels/telegram/"
-  cp "$REPO_DIR/agent/mcp-telegram/server.ts" "$REPO_DIR/agent/mcp-telegram/package.json" "$AGENT_DIR/mcp-telegram/"
   cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$REPO_DIR/agent/mount-store/package.json" "$AGENT_DIR/mount-store/"
-  cp "$REPO_DIR/agent/topic-wrapper.sh" "$AGENT_DIR/topic-wrapper.sh"
-  chmod +x "$AGENT_DIR/topic-wrapper.sh"
-  # Phase 4 (2026-05-19): picker-watcher.ts removed. The regular per-topic
-  # claude TUI is gone — daemons via stream-json now own dispatch — so there
-  # are no interactive pickers to surface. Delete any leftover so an old
-  # topic-wrapper.sh from a stale install can't try to spawn it.
+  # Phase 4 (2026-05-19): picker-watcher.ts removed (daemons via stream-json
+  # own dispatch now). Delete any leftover from a stale install.
   rm -f "$AGENT_DIR/picker-watcher.ts" 2>/dev/null || true
-  # mount-helper (auto-mount) artifacts: read by topic-wrapper.sh when invoked
-  # in helper mode (4th positional arg). Without these files in $INSTALL_DIR/
-  # agent/, a fresh install would `exit 1` on the first message to an
-  # unmounted topic. Read-only; no chmod +x.
-  cp "$REPO_DIR/agent/helper-prompt.md" "$AGENT_DIR/helper-prompt.md"
-  cp "$REPO_DIR/agent/helper-permissions.json" "$AGENT_DIR/helper-permissions.json"
 
   # Bot-scoped Claude Code hooks: PreCompact/PostCompact/Notification fire
   # status messages to Telegram during otherwise-silent windows. Passed to
-  # claude via --settings from topic-wrapper.sh so they only affect bot
+  # claude via --settings by the poller daemon so they only affect bot
   # sessions, not the user's desktop Claude Code.
   HOOKS_DIR="$AGENT_DIR/../hooks"
   mkdir -p "$HOOKS_DIR"
@@ -216,14 +204,13 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   # the .claude-telegram-agent → pager rename — hooks silently stopped firing).
   sed "s|__HOOKS_DIR__|$HOOKS_DIR|g" "$REPO_DIR/agent/bot-hooks.json" > "$AGENT_DIR/../bot-hooks.json"
 
-  # Resolve mcp-telegram's runtime deps (the SDK). Poller has no deps but
-  # `bun install` is a cheap no-op there. If bun is missing, warn and skip
-  # — the v0 path still works; only MULTI_TOPIC=1 needs bun-resolved deps.
+  # The poller and its modules have no third-party deps (bun ships what they
+  # need), so there's nothing to `bun install`. Still verify bun is present —
+  # the agent runtime won't start without it.
   if command -v bun >/dev/null 2>&1; then
-    ( cd "$AGENT_DIR/mcp-telegram" && bun install --silent ) || say "WARN: bun install failed in mcp-telegram"
-    say "Installed services under $AGENT_DIR"
+    say "Installed agent modules under $AGENT_DIR"
   else
-    say "WARN: bun not found on PATH — F1+F2 MULTI_TOPIC mode will not start until bun is installed"
+    say "WARN: bun not found on PATH — the agent will not start until bun is installed"
   fi
 fi
 
@@ -245,7 +232,7 @@ if [[ -n "$DEFAULT_MOUNT_PATH" && -f "$AGENT_DIR/mount-store/mount-store.ts" ]];
 fi
 
 # Cross-session shared memory file. claude reads/appends notes here so context
-# survives across topics + project switches. topic-wrapper.sh's system prompt
+# survives across topics + project switches. The daemon's system prompt
 # tells claude this file exists; nothing on the host writes it automatically.
 SHARED_CTX="$CONFIG_DIR/shared-context.md"
 if [[ ! -f "$SHARED_CTX" ]]; then
