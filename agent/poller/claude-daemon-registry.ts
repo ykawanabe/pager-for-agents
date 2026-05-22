@@ -74,6 +74,11 @@ interface DaemonHandle {
    *  is preserved, so the next message respawns + --resumes — cold start, no
    *  context loss. */
   lastActivityAt: number;
+  /** True only during stopTurn()'s intentional teardown. The on('crash')
+   *  handler checks it to treat the SIGTERM-driven close as a clean stop
+   *  (no backoff escalation, no respawn schedule) rather than a real crash —
+   *  same idea as the "released" guard, but for /stop. */
+  stopping: boolean;
 }
 
 export class ClaudeDaemonRegistry {
@@ -136,6 +141,7 @@ export class ClaudeDaemonRegistry {
         releasedAt: null,
         inFlightTimer: null,
         lastActivityAt: Date.now(),
+        stopping: false,
       };
       this.handles.set(threadId, handle);
     }
@@ -236,6 +242,51 @@ export class ClaudeDaemonRegistry {
       await handle.daemon.stop("SIGTERM");
     }
     this.handles.delete(threadId);
+  }
+
+  /** Abort the in-flight turn for a topic WITHOUT discarding the session or
+   *  queue. Mirrors the kill side of resetTopic but PRESERVES the handle and
+   *  does NOT rotate the session UUID — the on-disk session is untouched, so
+   *  the next enqueue lazy-respawns and --resumes the SAME conversation. Only
+   *  the running turn is dropped.
+   *
+   *  Returns true if a turn was actually aborted, false if nothing was running
+   *  (idle/pending/released/crashed/absent) — lets the caller pick the reply
+   *  copy ("Stopped." vs "Nothing running to stop.").
+   *
+   *  v1 is the reliable fallback (SIGTERM→SIGKILL the subprocess, lazy respawn
+   *  on next message). The raw `claude -p --input-format stream-json` CLI has
+   *  no in-band interrupt control message and SIGINT kills the whole headless
+   *  process (verified 2026-05-22, CLI v2.1.148), so a "leave the subprocess
+   *  alive" graceful path is not available yet. */
+  async stopTurn(threadId: string): Promise<boolean> {
+    const handle = this.handles.get(threadId);
+    if (!handle) return false;
+    if (handle.state !== "inFlight") return false;
+    this.clearInFlightTimer(handle);
+    if (handle.debounceTimer) {
+      clearTimeout(handle.debounceTimer);
+      handle.debounceTimer = null;
+    }
+    // Mark intentional stop BEFORE awaiting stop() so the on('crash') handler
+    // that fires during teardown takes the clean-stop branch (mirrors how
+    // releaseForTerminal sets "released" before the await).
+    handle.stopping = true;
+    if (handle.daemon) {
+      // SIGTERM (not SIGKILL): gives claude a chance to release its session
+      // .lock cleanly so the next --resume doesn't refuse with "Session ID
+      // already in use". stop() escalates to SIGKILL after 5s if needed.
+      await handle.daemon.stop("SIGTERM");
+      handle.daemon = null;
+    }
+    handle.stopping = false;
+    handle.state = "idle";
+    handle.backoffMs = 0;
+    handle.lastActivityAt = Date.now();
+    // Preserve the queue: any messages that arrived during the aborted turn
+    // resume processing on the lazy respawn.
+    if (handle.queue.length > 0) this.armDebounce(threadId, handle);
+    return true;
   }
 
   /** Tear down all daemons. Called on poller graceful exit. */
@@ -425,6 +476,9 @@ export class ClaudeDaemonRegistry {
       this.clearInFlightTimer(h);
       // Clean exit during release-for-terminal is expected; don't treat as crash.
       if (h.state === "released") return;
+      // Intentional /stop teardown: stopTurn() owns the post-stop transition
+      // and re-arming. Don't apply crash backoff or schedule a respawn here.
+      if (h.stopping) { h.daemon = null; return; }
       h.daemon = null;
       h.state = "crashed";
       // Schedule a respawn attempt with exponential backoff. If the queue

@@ -289,6 +289,26 @@ describe("post-pair state", () => {
     expect(state.chat_id).toBe(-1001); // unchanged
     expect(state.user_id).toBe(99);
   });
+
+  test("/stop with no running turn replies 'Nothing running to stop.'", async () => {
+    pair();
+    sent.length = 0;
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/stop", chat_id: -1001, thread_id: 42, from_id: 99 }),
+    );
+    expect(handled).toBe(true);
+    expect(sent.some((m) => m.text.includes("Nothing running to stop"))).toBe(true);
+  });
+
+  test("/stop from a non-paired user is silently dropped (no reply)", async () => {
+    pair({ user_id: 99 });
+    sent.length = 0;
+    const handled = await poller.tryHandleCommand(
+      msg({ text: "/stop", chat_id: -1001, thread_id: 42, from_id: 12345 }),
+    );
+    expect(handled).toBe(true);  // consumed so claude doesn't see it
+    expect(sent.length).toBe(0); // but no reply leaked
+  });
 });
 
 describe("bot-added intro (/pair <code> flow)", () => {
