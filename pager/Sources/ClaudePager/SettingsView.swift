@@ -159,7 +159,7 @@ struct SettingsView: View {
                 .tabItem { Label("Pairing", systemImage: "link") }
 
             MountsTab()
-                .tabItem { Label("Mounts", systemImage: "folder.badge.gearshape") }
+                .tabItem { Label("Projects", systemImage: "folder.badge.gearshape") }
 
             AboutTab()
                 .tabItem { Label("About", systemImage: "info.circle") }
@@ -488,124 +488,110 @@ private struct PairingTab: View {
 /// the first time a thread without a specific mount sees traffic.
 private struct MountsTab: View {
     @State private var mounts: [CTAClient.MountJSON] = []
+    // Cached inputs for the picker, refreshed on the reload timer. Computing
+    // these inside a render-time `var` (the old design) hit disk on every
+    // SwiftUI render + every 3s tick, which churned the list and made the
+    // picker feel unstable. Caching in @State keeps render pure.
+    @State private var knownTopics: [(threadId: Int, name: String)] = []
+    @State private var isGroup: Bool = false
     @State private var loadError: String? = nil
     @State private var newThreadId: String = ""
     @State private var newPath: String = ""
     @State private var newLabel: String = ""
     @State private var refreshTimer: Timer? = nil
     @State private var actionError: String? = nil
+    @State private var showHelp: Bool = false
 
-    /// Picker selection. Mirrors newThreadId but adds a "custom" sentinel
-    /// that swaps the dropdown for a free-text TextField — covers thread_ids
-    /// the bot hasn't observed yet (topics created before joining the group)
-    /// without forcing every user through manual ID lookup.
+    /// Picker selection. The custom sentinel (MountsPresentation.customSentinel)
+    /// swaps the dropdown for a free-text field — covers topics the bot hasn't
+    /// observed yet (Telegram can't enumerate topics created before it joined).
     @State private var threadSelection: String = ""
 
-    /// Options offered in the Thread picker. Computed at render time off
-    /// paired state + known topics + existing mounts so the menu refreshes
-    /// as the bot learns new topics. "dm" picker label depends on chat type
-    /// — General in a group, DM in a private chat — matching how mount rows
-    /// are labeled by the CLI's topic_name join.
-    private struct ThreadOption: Identifiable, Hashable {
-        let value: String   // the thread_id string written to mounts.json
-        let label: String   // displayed in the menu
-        var id: String { value }
-    }
-    private var threadOptions: [ThreadOption] {
-        let mounted = Set(mounts.map { $0.threadId.stringValue })
-        let isGroup = (CTAClient.pairedState()?.chatId ?? 0) < 0
-        var opts: [ThreadOption] = []
-        // dm sentinel: General in a group, DM in a private chat.
-        if !mounted.contains("dm") {
-            opts.append(.init(value: "dm", label: isGroup ? "General" : "DM"))
-        }
-        // Forum topics the poller has seen, sorted by name.
-        for t in CTAClient.knownTopics() where !mounted.contains(String(t.threadId)) {
-            opts.append(.init(value: String(t.threadId), label: "\(t.name) (#\(t.threadId))"))
-        }
-        // Wildcard catch-all.
-        if !mounted.contains("*") {
-            opts.append(.init(value: "*", label: "Wildcard (catch-all)"))
-        }
-        // Always-available custom escape hatch. Empty value flags "use the
-        // TextField below" — see `effectiveNewThreadId`.
-        opts.append(.init(value: "__custom__", label: "Custom topic ID…"))
-        return opts
+    /// Picker options, derived purely from cached @State (no disk I/O at render).
+    private var threadOptions: [MountsPresentation.ThreadOption] {
+        MountsPresentation.threadOptions(
+            mountedIds: Set(mounts.map { $0.threadId.stringValue }),
+            knownTopics: knownTopics,
+            isGroup: isGroup
+        )
     }
     private var effectiveNewThreadId: String {
-        threadSelection == "__custom__" || threadSelection.isEmpty
+        threadSelection == MountsPresentation.customSentinel || threadSelection.isEmpty
             ? newThreadId.trimmingCharacters(in: .whitespaces)
             : threadSelection
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Table-style list. We use a Form so the styling matches the other
-            // tabs; List would feel inconsistent inside a TabView with Form
-            // children. Each row is a Section so the remove button can sit
-            // inside its own footer for visual separation.
             Form {
+                // What this screen is for, in one plain sentence.
+                Section {
+                    Text("Telegram の各トピックを、Mac のどのフォルダで作業させるか割り当てます。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                // Current bindings, each shown as `トピック → フォルダ`.
                 Section {
                     if mounts.isEmpty {
-                        LabeledContent("Status") {
-                            Label("No mounts yet", systemImage: "tray")
-                                .foregroundStyle(.secondary)
-                        }
+                        Label("まだ割り当てがありません", systemImage: "tray")
+                            .foregroundStyle(.secondary)
                     } else {
                         ForEach(mounts) { m in
-                            LabeledContent(threadLabel(m)) {
-                                HStack(spacing: 8) {
-                                    Text(m.path)
-                                        .truncationMode(.middle)
-                                        .lineLimit(1)
-                                        .foregroundStyle(.secondary)
-                                        .help(m.path)
-                                    if let lbl = m.label, !lbl.isEmpty {
-                                        Text(lbl)
-                                            .font(.caption)
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.secondary.opacity(0.15))
-                                            .cornerRadius(4)
+                            let lbl = MountsPresentation.rowLabel(
+                                threadId: m.threadId, topicName: m.topicName, isGroup: isGroup)
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(lbl.primary)
+                                    if let sub = lbl.subtitle {
+                                        Text(sub).font(.caption).foregroundStyle(.secondary)
                                     }
-                                    Button {
-                                        remove(thread: m.threadId.stringValue)
-                                    } label: { Image(systemName: "minus.circle") }
-                                        .buttonStyle(.borderless)
-                                        .help("Unmount")
                                 }
+                                Image(systemName: "arrow.right")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Text(m.path)
+                                    .truncationMode(.middle).lineLimit(1)
+                                    .foregroundStyle(.secondary).help(m.path)
+                                if let l = m.label, !l.isEmpty {
+                                    Text(l)
+                                        .font(.caption)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(Color.secondary.opacity(0.15))
+                                        .cornerRadius(4)
+                                }
+                                Spacer()
+                                Button { remove(thread: m.threadId.stringValue) } label: {
+                                    Image(systemName: "minus.circle")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("割り当てを解除")
                             }
                         }
                     }
                 } header: {
-                    Text("Current mounts")
+                    HStack {
+                        Text("現在の割り当て")
+                        Spacer()
+                        Button { showHelp.toggle() } label: {
+                            Image(systemName: "questionmark.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("用語の説明")
+                        .popover(isPresented: $showHelp, arrowEdge: .bottom) { helpPopover }
+                    }
                 } footer: {
                     if let e = loadError {
                         Label(e, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.red)
-                    } else {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("`*` = wildcard (catch-all); `dm` = the bot's DM in a private chat, or the General topic in a group (Telegram sends both without a topic id, so the agent uses the same sentinel); numbers = forum topic IDs. The agent spawns one claude session per mount.")
-                            Text("Topic names appear automatically once the bot sees the topic (creation or rename). Telegram's Bot API doesn't expose names retroactively, so topics that existed before the bot joined will show as bare IDs until renamed.")
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                     }
                 }
 
                 Section {
-                    // Stacked vertical layout — LabeledContent's left-label /
-                    // right-content split squeezes the path field + Choose…
-                    // button into an unusable column. Vertical stacks give each
-                    // input the full row width.
+                    // Stacked vertical layout so each input gets the full row
+                    // width (LabeledContent's split squeezes the path + button).
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Thread").font(.subheadline).foregroundStyle(.secondary)
-                        // Picker over observed topics + sentinels. Falls back
-                        // to a free-text TextField via the "Custom…" option
-                        // when the desired thread_id isn't in the menu (e.g.
-                        // a forum topic created before the bot joined the
-                        // group — Telegram has no API to enumerate those).
+                        Text("トピック").font(.subheadline).foregroundStyle(.secondary)
                         Picker("", selection: $threadSelection) {
                             ForEach(threadOptions) { opt in
                                 Text(opt.label).tag(opt.value)
@@ -613,41 +599,41 @@ private struct MountsTab: View {
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
-                        if threadSelection == "__custom__" {
-                            TextField("topic id (e.g. 42) or dm or *", text: $newThreadId)
+                        if threadSelection == MountsPresentation.customSentinel {
+                            TextField("トピックID (例: 42) / dm / *", text: $newThreadId)
                                 .textFieldStyle(.roundedBorder)
                         }
                     }
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Path").font(.subheadline).foregroundStyle(.secondary)
+                        Text("フォルダ").font(.subheadline).foregroundStyle(.secondary)
                         HStack(spacing: 6) {
                             TextField("~/projects/foo", text: $newPath)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(.body, design: .monospaced))
-                            Button("Choose…") { pickFolder() }
+                            Button("選択…") { pickFolder() }
                         }
                     }
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Label").font(.subheadline).foregroundStyle(.secondary)
-                        TextField("optional, e.g. iron-flow", text: $newLabel)
+                        Text("ラベル (任意)").font(.subheadline).foregroundStyle(.secondary)
+                        TextField("例: iron-flow", text: $newLabel)
                             .textFieldStyle(.roundedBorder)
                     }
                     HStack {
                         Spacer()
-                        Button("Add mount") { add() }
+                        Button("追加") { add() }
                             .keyboardShortcut(.defaultAction)
                             .disabled(effectiveNewThreadId.isEmpty
                                       || newPath.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
                 } header: {
-                    Text("Add a mount")
+                    Text("プロジェクトを追加")
                 } footer: {
                     if let e = actionError {
                         Label(e, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.red)
                     } else {
-                        Text("To find a topic id: open the topic in Telegram → tap topic name → the integer in the URL bar is the thread_id. For the bot's DM, use `dm`. For a default that auto-spawns on first message in any new topic, use `*`.")
+                        Text("探しているトピックが一覧に出てこない場合は、そのトピックで一度メッセージを送ると表示されます。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -657,41 +643,46 @@ private struct MountsTab: View {
         }
         .onAppear {
             reload()
-            // Default the picker to the first available option so the menu
-            // doesn't render with an empty selection (which would also leave
-            // the Add button disabled with no visible cause).
-            if threadSelection.isEmpty, let first = threadOptions.first {
-                threadSelection = first.value
-            }
             refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in reload() }
         }
         .onDisappear { refreshTimer?.invalidate(); refreshTimer = nil }
     }
 
-    private func threadLabel(_ m: CTAClient.MountJSON) -> String {
-        // Prefer the topic_name joined in by `cta list --json` — the CLI
-        // already knows when "dm" should display as "General" (paired to a
-        // group) and what each numeric topic is called. Re-deriving here
-        // would risk drift.
-        switch m.threadId {
-        case .string("*"):
-            return "* (wildcard)"
-        case .string("dm"):
-            if let name = m.topicName, !name.isEmpty { return "\(name) (dm)" }
-            return "dm"
-        case .string(let s):
-            return s
-        case .number(let n):
-            if let name = m.topicName, !name.isEmpty { return "\(name) (#\(n))" }
-            return "topic \(n)"
+    /// Glossary popover behind the "?" in the section header — replaces the old
+    /// wall of footer text. De-jargons the plain-language labels for anyone who
+    /// wants the underlying detail.
+    private var helpPopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("用語").font(.headline)
+            Text("**General / DM** — トピックを使わないメッセージ。グループでは General、個別チャットでは DM になります。")
+            Text("**新しいトピックの初期設定 (catch-all)** — 個別の割り当てがないトピックすべてに使われる既定フォルダです。")
+            Text("**トピック** — フォーラムのトピック。名前は Bot がそのトピックを見たあとに表示されます（Telegram の仕様で、参加前のトピックは一度メッセージが来るまで番号のままです）。")
         }
+        .font(.callout)
+        .padding()
+        .frame(width: 360)
     }
 
     private func reload() {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let list = try CTAClient.listMounts()
-                DispatchQueue.main.async { mounts = list; loadError = nil }
+                // Cache the picker inputs here (off-main) so render stays pure
+                // and the 3s tick doesn't hit disk on the main thread.
+                let topics = CTAClient.knownTopics()
+                let group = (CTAClient.pairedState()?.chatId ?? 0) < 0
+                DispatchQueue.main.async {
+                    mounts = list
+                    knownTopics = topics
+                    isGroup = group
+                    loadError = nil
+                    // Selection stability: keep a valid pick across the reload,
+                    // default an empty selection to the first option.
+                    let opts = threadOptions
+                    threadSelection = threadSelection.isEmpty
+                        ? (opts.first?.value ?? "")
+                        : MountsPresentation.survivingSelection(current: threadSelection, in: opts)
+                }
             } catch {
                 DispatchQueue.main.async { loadError = String(describing: error) }
             }
