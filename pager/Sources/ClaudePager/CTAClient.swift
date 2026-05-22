@@ -160,15 +160,16 @@ enum CTAClient {
         return decoded
     }
 
-    /// Start the agent: load LaunchAgent + spawn tmux sessions. Idempotent —
-    /// `cta start` itself is safe to call when already running.
+    /// Start the agent: load the poller + watchdog LaunchAgents. Idempotent —
+    /// `cta start` is safe to call when already running (a healthy poller is
+    /// never restarted).
     @discardableResult
     static func start() throws -> String {
         let data = try run(args: ["start"])
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    /// Stop the agent: kill tmux sessions + unload LaunchAgent. Idempotent.
+    /// Stop the agent: boot out the poller + watchdog LaunchAgents. Idempotent.
     @discardableResult
     static func stop() throws -> String {
         let data = try run(args: ["stop"])
@@ -312,8 +313,8 @@ enum CTAClient {
     }
 
     /// `cta watch <thread> [--lines N] [--ansi]` — snapshot of the topic's
-    /// tmux pane content. Single-shot (Phase A of pager-watch-live.md);
-    /// streaming variant lands in Phase B.
+    /// recent session transcript (P6b renders it from the daemon's JSONL;
+    /// there's no tmux pane anymore). Single-shot.
     static func watch(thread: String, lines: Int = 200, ansi: Bool = false) -> WatchResult {
         var args = ["watch", thread, "--lines", String(lines)]
         if ansi { args.append("--ansi") }

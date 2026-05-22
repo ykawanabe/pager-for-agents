@@ -10,8 +10,10 @@ import AppKit
 ///   then execs `claude --resume <uuid>` in the project dir. When the
 ///   user exits the TUI, `cta open`'s EXIT trap signals reacquire so the
 ///   daemon respawns lazily on the next inbound message.
-/// - **`openTmux`**: legacy + system rows. Used for the synthetic
-///   "poller log" sidebar row, which is a real tmux session.
+/// - **`openLogTail`**: system rows. Used for the synthetic "Poller log"
+///   sidebar row. P6c made the runtime launchd-direct (no tmux), so the
+///   poller's output lives in $STATE_DIR/agent.log — we `tail -f` it
+///   instead of attaching a tmux session.
 ///
 /// macOS's Terminal.app exposes AppleScript via the `do script` verb,
 /// which opens a fresh window and runs the command in it.
@@ -48,25 +50,31 @@ enum TerminalLauncher {
         return runOsascript(script)
     }
 
-    /// Open Terminal.app and attach to a literal tmux session name. Used
-    /// for system rows (poller, watchdog) — those are real tmux sessions.
+    /// Open Terminal.app and `tail -f` a log file. Used for the synthetic
+    /// "Poller log" system row — P6c's launchd-direct poller writes its
+    /// stdout/stderr to $STATE_DIR/agent.log (StandardOutPath + the exec
+    /// redirect), so following that file is the live view of the poller.
     /// Returns immediately; Terminal.app launches asynchronously.
-    static func openTmux(session: String) -> LaunchResult {
-        // Use the absolute tmux path so the spawned shell finds it even
-        // though Terminal.app inherits its own PATH (Homebrew may or may
-        // not be on it depending on the user's shell rc).
-        let tmuxPath = resolveTmux() ?? "/opt/homebrew/bin/tmux"
-        // The double-quote-escape is needed because the AppleScript string
-        // is itself inside the osascript -e single-quoted argument.
-        let command = "\(tmuxPath) attach -t \(session)"
+    static func openLogTail(path: String) -> LaunchResult {
+        return runOsascript(logTailScript(path: path))
+    }
+
+    /// Build the AppleScript that opens Terminal.app and tails `path`.
+    /// Factored out (pure) so the command construction is testable without
+    /// actually spawning Terminal.app. Single-quotes the path for the shell
+    /// and escapes embedded single-quotes + double-quotes for the nested
+    /// AppleScript string.
+    static func logTailScript(path: String) -> String {
+        // Shell-quote: wrap in single quotes, escaping any embedded ' as '\''.
+        let shellQuoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let command = "tail -n 200 -f \(shellQuoted)"
         let escaped = command.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = """
+        return """
         tell application "Terminal"
             activate
             do script "\(escaped)"
         end tell
         """
-        return runOsascript(script)
     }
 
     /// Probe known cta install paths. Same ordering as CTAClient.
@@ -75,23 +83,6 @@ enum TerminalLauncher {
             NSHomeDirectory() + "/.local/bin/cta",
             "/opt/homebrew/bin/cta",
             "/usr/local/bin/cta",
-        ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    /// Probe known tmux install paths. Mirrors the pattern in CTAClient for
-    /// resolving `cta`. Bundled Pager.app/Contents/MacOS/tmux comes first
-    /// so the launched tmux inherits Pager's Full Disk Access grant — see
-    /// CTAClient.resolvedTmuxPath for the same logic. Nil if not found —
-    /// caller falls back to the default.
-    private static func resolveTmux() -> String? {
-        let bundled = Bundle.main.bundlePath + "/Contents/MacOS/tmux"
-        let candidates = [
-            bundled,
-            "/opt/homebrew/bin/tmux",
-            "/usr/local/bin/tmux",
-            "/opt/local/bin/tmux",
-            "/usr/bin/tmux",
         ]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
