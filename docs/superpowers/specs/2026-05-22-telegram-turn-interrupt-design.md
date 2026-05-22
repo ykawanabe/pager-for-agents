@@ -1,7 +1,7 @@
 # Telegram turn-interrupt (`/stop`) — design
 
 Date: 2026-05-22
-Status: design approved (Yusuke), not yet planned/implemented
+Status: planned (docs/superpowers/plans/2026-05-22-telegram-turn-interrupt.md); v1 = fallback only
 Decision owner: Yusuke ("Bでいいかな" — B locked)
 
 ## Problem
@@ -83,12 +83,22 @@ control-message support is confirmed.
   indicator. Adds a posted message; weigh intrusiveness.
 - Option C (steer mid-turn) once graceful interrupt + message-injection is proven.
 
-## Open questions to resolve at plan time
+## Open questions — RESOLVED at plan time (2026-05-22)
 
-1. Does the installed `claude -p --input-format stream-json` accept an interrupt
-   control message? (Determines whether stage-1 graceful is available at v1 or the
-   fallback ships alone.)
-2. On mid-turn SIGTERM, does claude persist the partial turn to the session JSONL,
-   and does `--resume` stay consistent? (Affects what the user sees after `/stop`.)
-3. Exact `/stop` reply copy + whether to also accept `/cancel` as an alias (note:
-   `/cancel` currently means "drop a pending mount" — don't overload).
+1. **In-band stream-json interrupt? NO.** Verified against CLI v2.1.148: the
+   raw `claude -p --input-format stream-json` accepts no documented interrupt
+   control message, and SIGINT kills the whole headless process. v1 ships the
+   kill-and-respawn fallback ONLY; the graceful stage-1 is deferred until the
+   CLI gains the capability.
+2. **`--resume` consistent after a mid-turn kill? YES (already proven).** The
+   inactivity watchdog (shipped 2026-05-21) already SIGKILLs daemons mid-turn
+   and respawns via `--resume` in production. `/stop` uses the gentler SIGTERM
+   (with the existing 5s→SIGKILL escalation), which releases the session lock
+   cleanly — strictly safer than the watchdog path.
+3. **`/stop` copy + `/cancel` alias?** Reply is `⏹ Stopped.` (turn aborted) or
+   `Nothing running to stop.` (idempotent no-op). `/cancel` is NOT aliased — it
+   already means "drop a pending mount."
+
+Note: the spec's "resolve pending ack glyphs on stop" step proved unnecessary —
+`onDaemonFlush` flips 👀→👌 at flush time, so an in-flight turn's glyphs are
+already resolved. `/stop` clears only the orphaned typing indicator.
