@@ -60,12 +60,20 @@ enum CTAClient {
         /// Optional: older agents (pre-P6d) don't emit it → nil ("unknown").
         let fileAccess: FileAccess?
         struct FileAccess: Decodable, Equatable {
+            /// True only when every probed protected folder is readable.
             let protectedOk: Bool
-            let probedPath: String?
+            /// Per-folder result so the UI can name what's still blocked.
+            let probed: [Folder]?
             let checkedAt: String?
+            struct Folder: Decodable, Equatable {
+                let path: String
+                let ok: Bool
+            }
+            /// Folders the agent still can't reach (the prompt-prone set).
+            var blockedPaths: [String] { (probed ?? []).filter { !$0.ok }.map(\.path) }
             enum CodingKeys: String, CodingKey {
                 case protectedOk = "protected_ok"
-                case probedPath = "probed_path"
+                case probed
                 case checkedAt = "checked_at"
             }
         }
