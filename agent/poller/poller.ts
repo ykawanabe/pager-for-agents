@@ -200,10 +200,16 @@ let settingsMtimeMs = 0;
 // the idle sweep flushes durable memory then rotates the session UUID (a real
 // /clear, resets cost) instead of merely evicting (which keeps the bloated
 // session). Below the threshold → evict only (RAM reclaim, no context loss).
-const IDLE_CLEAR_MIN_BYTES = Number(process.env.IDLE_CLEAR_MIN_BYTES ?? `${1024 * 1024}`); // 1 MB
+const IDLE_CLEAR_MIN_BYTES = ((): number => {
+  const n = Number(process.env.IDLE_CLEAR_MIN_BYTES);
+  return Number.isFinite(n) && n >= 0 ? n : 1024 * 1024; // 1 MB; malformed/unset env → default
+})();
 // Hard cap on the memory-flush turn before abandoning it (and leaving the
 // session intact). The flush runs on a bloated session so it can be slow.
-const IDLE_FLUSH_TIMEOUT_MS = Number(process.env.IDLE_FLUSH_TIMEOUT_MS ?? `${3 * 60_000}`);
+const IDLE_FLUSH_TIMEOUT_MS = ((): number => {
+  const n = Number(process.env.IDLE_FLUSH_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 3 * 60_000; // malformed/unset env → default
+})();
 // Topics with an in-flight idle flush, so the sweep doesn't launch a second.
 const idleFlushing = new Set<string>();
 // Epoch ms of the last file-access (FDA) probe; throttles re-probing to ~60s.
