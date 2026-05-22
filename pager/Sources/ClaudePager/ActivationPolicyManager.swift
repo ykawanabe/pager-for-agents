@@ -24,10 +24,22 @@ enum ActivationPolicyManager {
         openWindowCount += 1
         if openWindowCount == 1 {
             NSApp.setActivationPolicy(.regular)
+            // The Command+Tab switcher is a most-recently-used stack, and it
+            // does NOT re-sort within the same runloop tick the activation
+            // policy changed on. A synchronous activate() here lands the
+            // freshly-promoted app at the TAIL of the switcher (the reported
+            // "Settings shows up last in Command+Tab" bug) — visually frontmost
+            // but last in the MRU order. Defer activation one runloop tick so
+            // the app registers as frontmost AFTER the policy takes effect and
+            // shows at the front of Command+Tab.
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        } else {
+            // Already .regular (another window was open) — no policy change, so
+            // the MRU timing quirk doesn't apply; activate immediately.
+            NSApp.activate(ignoringOtherApps: true)
         }
-        // Pull the app + its window to the front so Command+Tab / a menu click
-        // lands on the window immediately instead of leaving it behind.
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     /// Call from a window content view's `.onDisappear`.
