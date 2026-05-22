@@ -118,11 +118,11 @@ enum Diagnostics {
         let fa = (try? CTAClient.status())?.fileAccess
         if let fa = fa {
             out.append(.init(
-                label: "Full Disk Access (bun)",
+                label: "Full Disk Access (Claude Pager)",
                 ok: fa.protectedOk,
                 detail: fa.protectedOk
                     ? "granted"
-                    : "Add `bun` to Full Disk Access in System Settings to stop file-access prompts (optional — only needed for Documents/Desktop/Downloads/iCloud projects)."
+                    : "Add Claude Pager to Full Disk Access in System Settings to stop file-access prompts (optional — only needed for Documents/Desktop/Downloads/iCloud projects)."
             ))
         } else {
             out.append(.init(

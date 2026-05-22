@@ -1,7 +1,28 @@
 import SwiftUI
 import AppKit
 
+/// Process entry point. The same Pager binary serves two roles:
+///   - normal: the menu-bar app (SwiftUI).
+///   - `--agent-launcher <poller.ts>`: a headless supervisor that spawns + waits
+///     on `bun <poller.ts>`. start_agents.sh execs us this way under launchd so
+///     macOS attributes the poller's file access to Claude Pager.app (Full Disk
+///     Access shows "Claude Pager", not "bun"; bun stays un-bundled on $PATH).
+///     This branch never starts SwiftUI.
 @main
+struct PagerMain {
+    static func main() {
+        let args = CommandLine.arguments
+        if AgentLauncher.isLauncherInvocation(args) {
+            guard let poller = AgentLauncher.pollerPath(from: args) else {
+                FileHandle.standardError.write(Data("agent-launcher: missing poller.ts path\n".utf8))
+                exit(2)
+            }
+            AgentLauncher.run(pollerPath: poller)  // never returns
+        }
+        ClaudePagerApp.main()  // SwiftUI app (App protocol's default main)
+    }
+}
+
 struct ClaudePagerApp: App {
     // ObservedObject — StateObject is for SwiftUI-owned lifetimes; the
     // StatusMonitor is a long-lived singleton elsewhere.
