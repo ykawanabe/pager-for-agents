@@ -106,9 +106,9 @@ enum Diagnostics {
                 : "Watchdog will restart claude in <30s if it stays missing."
         ))
         out.append(.init(
-            label: "tmux sessions: claude + watchdog",
+            label: "poller + watchdog running",
             ok: s.tmuxClaudeAlive && s.tmuxWatchdogAlive,
-            detail: "claude=\(mark(s.tmuxClaudeAlive)) watchdog=\(mark(s.tmuxWatchdogAlive))"
+            detail: "poller=\(mark(s.tmuxClaudeAlive)) watchdog=\(mark(s.tmuxWatchdogAlive))"
         ))
 
         return out

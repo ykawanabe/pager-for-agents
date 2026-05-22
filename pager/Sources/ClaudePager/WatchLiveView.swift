@@ -173,15 +173,13 @@ struct WatchLiveView: View {
     @ViewBuilder
     private var paneBody: some View {
         if let id = vm.focusedThreadId {
-            // System rows (Poller log) use tmuxPane — they're real tmux
-            // sessions and the capture-pane snapshot is the right view.
-            // Topic rows always use messagesPane (JSONL bubble view):
-            // Phase 4 has no per-topic tmux session so the old tmuxPane
-            // fallback would show a misleading "Topic's tmux session is
-            // not running" status. Empty-state when no claude turns yet
-            // is handled inside messagesPane.
+            // System rows (Poller log) use logPane — a tail of agent.log
+            // (P6c: the poller is launchd-direct, no tmux session). Topic
+            // rows always use messagesPane (JSONL bubble view); the daemon
+            // lives inside the poller, so there's no per-topic pane to show.
+            // Empty-state when no claude turns yet is handled in messagesPane.
             if id == WatchLiveViewModel.pollerThreadId {
-                tmuxPane
+                logPane
             } else {
                 messagesPane
             }
@@ -190,14 +188,12 @@ struct WatchLiveView: View {
         }
     }
 
-    /// tmux capture-pane renderer — used for the "Poller log" synthetic row
-    /// (a real tmux session) and as the fallback for topics whose JSONL
-    /// transcript hasn't materialized yet. Phase 4 has no per-topic tmux
-    /// session, so for regular topics this path only renders the VM's
-    /// "no session" status until the JSONL bubble path takes over on the
-    /// first claude turn.
+    /// Plain-text log renderer — used for the "Poller log" synthetic row,
+    /// which streams the launchd-direct poller's agent.log tail (P6c). The
+    /// VM's captureProvider routes _poller to CTAClient.watchSystemSession,
+    /// which reads $STATE_DIR/agent.log.
     @ViewBuilder
-    private var tmuxPane: some View {
+    private var logPane: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 paneText
@@ -390,7 +386,7 @@ struct WatchLiveView: View {
             Text("Topic just started — waiting for claude to print.")
                 .foregroundColor(.secondary)
         case .sessionDead(let stderr):
-            Text("Topic's tmux session is not running.\n\nStart it with:\n  cta start\n\nDetails: \(stderr)")
+            Text("Poller log unavailable (agent.log not found).\n\nStart the agent with:\n  cta start\n\nDetails: \(stderr)")
         case .noMount(let stderr):
             Text("No mount for this thread.\n\nDetails: \(stderr)")
         case .error(let msg):
@@ -517,8 +513,9 @@ struct WatchLiveView: View {
         launchError = nil
         let result: TerminalLauncher.LaunchResult
         if id == WatchLiveViewModel.pollerThreadId {
-            // Synthetic poller-log row is a real tmux session, attach directly.
-            result = TerminalLauncher.openTmux(session: "poller")
+            // P6c: the poller is launchd-direct (no tmux). Its stdout/stderr
+            // land in $STATE_DIR/agent.log — tail that for the live view.
+            result = TerminalLauncher.openLogTail(path: "\(CTAClient.stateDir)/agent.log")
         } else {
             // Phase 4: regular topic rows don't have a per-topic tmux session
             // anymore — claude lives inside the poller's ClaudeDaemonRegistry.
