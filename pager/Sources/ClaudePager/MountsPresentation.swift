@@ -27,8 +27,8 @@ enum MountsPresentation {
                          isGroup: Bool) -> (primary: String, subtitle: String?) {
         switch threadId {
         case .string("*"):
-            return ("新しいトピックの初期設定",
-                    "個別の割り当てがないトピックはここが使われます (catch-all)")
+            return ("Default for new topics",
+                    "Used by any topic without its own folder (catch-all)")
         case .string("dm"):
             // Telegram sends General-topic + DM messages without a topic id, so
             // both share the "dm" sentinel; the label depends on chat type.
@@ -39,7 +39,7 @@ enum MountsPresentation {
             if let name = topicName, !name.isEmpty {
                 return (name, "#\(n)")
             }
-            return ("トピック \(n)", nil)
+            return ("Topic \(n)", nil)
         }
     }
 
@@ -58,9 +58,9 @@ enum MountsPresentation {
             opts.append(.init(value: String(t.threadId), label: "\(t.name) (#\(t.threadId))"))
         }
         if !mountedIds.contains("*") {
-            opts.append(.init(value: "*", label: "新しいトピックの初期設定 (catch-all)"))
+            opts.append(.init(value: "*", label: "Default for new topics (catch-all)"))
         }
-        opts.append(.init(value: customSentinel, label: "別のトピックを手動で指定…"))
+        opts.append(.init(value: customSentinel, label: "Enter a topic ID manually…"))
         return opts
     }
 
