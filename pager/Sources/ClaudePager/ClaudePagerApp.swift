@@ -46,7 +46,8 @@ struct ClaudePagerApp: App {
 
         Settings {
             SettingsView(caffeinate: caffeinate, monitor: monitor)
-                .onAppear { syncCaffeinate() }
+                .onAppear { syncCaffeinate(); ActivationPolicyManager.windowOpened() }
+                .onDisappear { ActivationPolicyManager.windowClosed() }
         }
 
         // Singleton "watch live" window. Opened via openWindow(id:) from the
@@ -54,6 +55,8 @@ struct ClaudePagerApp: App {
         // re-opening from the menu focuses or recreates the singleton.
         Window("Watch live", id: "watch-live") {
             WatchLiveView()
+                .onAppear { ActivationPolicyManager.windowOpened() }
+                .onDisappear { ActivationPolicyManager.windowClosed() }
         }
         .defaultSize(width: 1000, height: 600)
         .windowResizability(.contentMinSize)
@@ -62,6 +65,8 @@ struct ClaudePagerApp: App {
         // first launch when no plugin .env exists (see init() observer).
         Window("Pager Setup", id: "setup-wizard") {
             SetupWizardView()
+                .onAppear { ActivationPolicyManager.windowOpened() }
+                .onDisappear { ActivationPolicyManager.windowClosed() }
         }
         .defaultSize(width: 600, height: 520)
         .windowResizability(.contentMinSize)
