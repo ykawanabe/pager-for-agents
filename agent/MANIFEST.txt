@@ -39,24 +39,12 @@ channels/telegram/adapter.ts	agent	644
 channels/telegram/transport.ts	agent	644
 channels/telegram/typing-keepalive.ts	agent	644
 
-# Outbound MCP server
-mcp-telegram/server.ts	agent	644
-mcp-telegram/package.json	agent	644
-
 # Mount-store library + CLI entrypoint
 mount-store/mount-store.ts	agent	644
 mount-store/package.json	agent	644
 
 # Shared path resolver
 lib/paths.ts	agent	644
-
-# Mount-helper supervisor — Phase 4 only spawns this in helper mode for
-# unmounted topics where claude TUI walks the user through project selection.
-topic-wrapper.sh	agent	755
-
-# Mount-helper (auto-mount) artifacts
-helper-prompt.md	agent	644
-helper-permissions.json	agent	644
 
 # Claude Code hooks
 hooks/pager-notify.sh	hooks	755

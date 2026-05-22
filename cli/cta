@@ -134,12 +134,11 @@ _claude_ps_line() {
 
 # Outbound liveness: "can the bot send a message to Telegram right now?"
 #
-# Phase 4 daemon mode: the poller sends plain-text replies directly via
-# Bot API HTTP — no persistent MCP server needed. mcp-telegram only spawns
-# transiently when a claude turn invokes `send_telegram(buttons=…)`, so
-# pgrep'ing for it would flicker false between turns and flap Pager status
-# red constantly. The semantic answer for "is outbound alive?" is "is the
-# poller alive?" — same liveness as claude.pid in this mode.
+# Daemon mode (P4+): the poller sends every reply directly via Bot API HTTP.
+# There's no separate outbound process to probe, so the honest answer to
+# "is outbound alive?" is "is the poller alive?" — same liveness as the
+# daemon. `_mcp_alive` is kept only as a back-compat name for the status
+# JSON field Pager still reads; in MULTI_TOPIC mode it pgreps the poller.
 #
 # v0 / pre-Phase-4: the official plugin's persistent bun server.ts was
 # the canonical outbound process; grep for it.
@@ -808,11 +807,6 @@ _mount_store_path() {
 _watch_render_path() {
   local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
   echo "$d/poller/watch-render.ts"
-}
-
-_topic_wrapper_path() {
-  local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
-  echo "$d/topic-wrapper.sh"
 }
 
 cmd_mount() {
