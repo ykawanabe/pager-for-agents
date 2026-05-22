@@ -3,31 +3,31 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claude-agent</string>
+    <string>com.claude-watchdog</string>
 
+    <!-- Network + poller-health watchdog. Runs the connectivity loop and,
+         on a stale/absent poller heartbeat, force-restarts the poller job
+         via `launchctl kickstart -k com.claude-agent`. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__BIN_DIR__/start_agents.sh</string>
+        <string>__BIN_DIR__/watch_network.sh</string>
     </array>
 
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- Respawn only on unsuccessful exit (crash). A clean `cta stop`
-         (launchctl unload) is treated as intentional and the agent stays
-         dead until the next login or explicit `cta start`. Matches the
-         Pager LaunchAgent's policy. -->
+    <!-- Always keep the watchdog alive. Unlike the poller (which stays down
+         after a clean `cta stop`), the watchdog is pure supervision with no
+         conversational state, so an unconditional KeepAlive is correct: if it
+         dies for any reason, relaunch it. A clean `cta stop` boots it out
+         explicitly so this never fights an intentional shutdown. -->
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
 
     <key>EnvironmentVariables</key>
     <dict>
         <!-- PATH must include:
-             - ~/.bun/bin — bun (start_agents.sh execs `bun poller.ts`; if
-               missing, the poller never starts)
+             - ~/.bun/bin — bun
              - /opt/homebrew/bin — Apple Silicon Homebrew
              - /usr/local/bin — Intel Homebrew
              so the same plist works on both architectures. -->
@@ -37,6 +37,8 @@
         <string>__HOME__</string>
     </dict>
 
+    <!-- Watchdog connectivity logs join the poller's agent.log so Pager's
+         "Show recent activity" tail surfaces both streams. -->
     <key>StandardOutPath</key>
     <string>__STATE_DIR__/agent.log</string>
 

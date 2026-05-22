@@ -1,115 +1,84 @@
 #!/bin/bash
-# P1.7 / D12 — kick_poller_session must propagate the full project .env
-# to the spawned poller, not just TELEGRAM_BOT_TOKEN + MAIN_CHAT_ID.
+# P1.7 / D12 — a watchdog-triggered poller restart must propagate the FULL
+# project .env to the poller, not a cherry-picked subset. Custom vars like
+# PAGER_DISABLE_HELPER (operator opt-out for auto-mount) must survive a restart;
+# otherwise a user who set the flag finds the helper re-enabled after one kick.
 #
-# Today only those two vars are forwarded via `-e`. Custom env vars like
-# PAGER_DISABLE_HELPER (operator opt-out for auto-mount) are silently
-# dropped on every watchdog kick — a user who set the flag to 1 finds
-# the helper re-enabled after a single poller respawn.
+# P6c (2026-05-22): the watchdog no longer respawns a tmux session with a hand-
+# built env. It force-restarts the launchd job (`launchctl kickstart -k
+# com.claude-agent`), and launchd re-runs start_agents.sh, which sources the
+# ENTIRE $STATE_DIR/.env (set -a; source …) before exec'ing the poller. So the
+# D12 invariant is now guaranteed by start_agents.sh's wholesale env source.
 #
-# Test strategy: source watch_network.sh, mock tmux to capture the
-# new-session call, assert the command string sources $STATE_DIR/.env
-# (so all .env vars propagate, not just the two cherry-picked ones).
+# This test pins both halves of the new contract:
+#   1. kick_poller_session restarts via launchctl (not a cherry-picked env).
+#   2. start_agents.sh sources the full .env wholesale, so EVERY var propagates.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-
-SANDBOX=$(mktemp -d)
-trap 'rm -rf "$SANDBOX"' EXIT
-
-export CTA_STATE_DIR="$SANDBOX/state"
-export CTA_INSTALL_DIR="$SANDBOX/install"
-mkdir -p "$CTA_STATE_DIR" "$CTA_INSTALL_DIR/agent/poller"
-
-# Project .env (sourced by start_agents.sh and load_env). Custom flag we
-# want to see propagated end-to-end.
-cat > "$CTA_STATE_DIR/.env" <<'EOF'
-MAIN_CHAT_ID=12345
-MULTI_TOPIC=1
-PAGER_DISABLE_HELPER=1
-EOF
-
-# Plugin .env (where kick_poller_session reads TELEGRAM_BOT_TOKEN from).
-mkdir -p "$HOME/.claude/channels/telegram"  # may already exist on dev hosts
-PLUGIN_ENV_BACKUP=""
-if [[ -f "$HOME/.claude/channels/telegram/.env" ]]; then
-  PLUGIN_ENV_BACKUP=$(mktemp)
-  cp "$HOME/.claude/channels/telegram/.env" "$PLUGIN_ENV_BACKUP"
-fi
-echo 'TELEGRAM_BOT_TOKEN=fake-token-for-test' > "$HOME/.claude/channels/telegram/.env"
-restore_plugin_env() {
-  if [[ -n "$PLUGIN_ENV_BACKUP" ]]; then
-    mv "$PLUGIN_ENV_BACKUP" "$HOME/.claude/channels/telegram/.env"
-  else
-    rm -f "$HOME/.claude/channels/telegram/.env"
-  fi
-}
-trap 'restore_plugin_env; rm -rf "$SANDBOX"' EXIT
-
-# Stub poller.ts so the install-dir check passes
-touch "$CTA_INSTALL_DIR/agent/poller/poller.ts"
-
-# Need MAIN_CHAT_ID in the environment too (kick_poller_session reads it
-# from env directly, not from .env — it's load_env's job to set it).
-export MAIN_CHAT_ID="12345"
-
-# shellcheck source=../agent/watch_network.sh
-source "$SCRIPT_DIR/agent/watch_network.sh"
-
-# Mock tmux + sleep. Capture every call.
-TMUX_CALLS=()
-tmux() {
-  TMUX_CALLS+=("$*")
-  case "$1" in
-    has-session) return 0 ;;
-    *)           return 0 ;;
-  esac
-}
-sleep() { :; }
-
-kick_poller_session "unit test"
-
-# Find the new-session call.
-NEW_CALL=""
-for c in "${TMUX_CALLS[@]}"; do
-  case "$c" in
-    "new-session"*) NEW_CALL="$c" ;;
-  esac
-done
 
 PASS=0
 FAIL=0
 ok() { echo "  ok  $1";   PASS=$((PASS + 1)); }
 ng() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 
-if [[ -n "$NEW_CALL" ]]; then
-  ok "kick_poller_session: called tmux new-session"
+# ─── 1. kick restarts via launchctl, carrying no per-var env ─────────────────
+# shellcheck source=../agent/watch_network.sh
+source "$SCRIPT_DIR/agent/watch_network.sh"
+
+LAUNCHCTL_CALLS=()
+launchctl() { LAUNCHCTL_CALLS+=("$*"); return 0; }
+
+kick_poller_session "unit test" >/dev/null 2>&1 || true
+
+kick_via_launchctl=0
+for c in "${LAUNCHCTL_CALLS[@]:-}"; do
+  case "$c" in kickstart*com.claude-agent*) kick_via_launchctl=1 ;; esac
+done
+if [[ "$kick_via_launchctl" -eq 1 ]]; then
+  ok "kick_poller_session: restarts the poller via launchctl kickstart"
 else
-  ng "kick_poller_session: did not call tmux new-session. All calls: ${TMUX_CALLS[*]}"
+  ng "kick_poller_session: expected a launchctl kickstart of com.claude-agent (got '${LAUNCHCTL_CALLS[*]:-}')"
+fi
+unset -f launchctl
+
+# ─── 2. start_agents.sh sources the whole .env (full propagation) ────────────
+# Functional check: seed a custom var in .env, source start_agents.sh's env
+# block, and confirm the var lands in the environment. This is the actual
+# mechanism by which a kicked poller inherits PAGER_DISABLE_HELPER et al.
+
+SANDBOX=$(mktemp -d)
+mkdir -p "$SANDBOX/.pager" "$SANDBOX/install/agent/poller" "$SANDBOX/install/agent/mount-store"
+cat > "$SANDBOX/.pager/.env" <<'EOF'
+MAIN_CHAT_ID=12345
+MULTI_TOPIC=1
+PAGER_DISABLE_HELPER=1
+EOF
+touch "$SANDBOX/install/agent/poller/poller.ts" "$SANDBOX/install/agent/mount-store/mount-store.ts"
+
+PROPAGATED=$(
+  HOME="$SANDBOX" CTA_STATE_DIR="$SANDBOX/.pager" CTA_INSTALL_DIR="$SANDBOX/install" \
+  bash -c "
+    source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
+    echo \"\${PAGER_DISABLE_HELPER:-UNSET}\"
+  "
+)
+if [[ "$PROPAGATED" == "1" ]]; then
+  ok "start_agents.sh: sources full .env (custom PAGER_DISABLE_HELPER propagates)"
+else
+  ng "start_agents.sh: custom .env var did NOT propagate (got '$PROPAGATED') — D12 regression"
 fi
 
-# The fix uses `bash -c 'set -a; . "$STATE_DIR/.env"; set +a; exec bun ...'`
-# so the command string must reference both the .env file and bun. We
-# check for the .env path AND for bun in the command string.
-
-if [[ "$NEW_CALL" == *".env"* ]]; then
-  ok "new-session command references .env (env-source pattern present)"
+# Structural guard: the env source must be a wholesale `source …/.env`, not a
+# grep/cut of two cherry-picked vars (the original D12 bug shape).
+if grep -Eq 'source +"\$ENV_FILE"|\. +"\$ENV_FILE"' "$SCRIPT_DIR/agent/start_agents.sh"; then
+  ok "start_agents.sh: sources \$ENV_FILE wholesale (not cherry-picked)"
 else
-  ng "new-session command does NOT reference .env — env vars from \$STATE_DIR/.env are NOT propagated (D12 regression). Command: $NEW_CALL"
+  ng "start_agents.sh: no wholesale '\$ENV_FILE' source found — vars may be cherry-picked again"
 fi
 
-if [[ "$NEW_CALL" == *"$CTA_STATE_DIR/.env"* ]]; then
-  ok "new-session command sources \$STATE_DIR/.env specifically"
-else
-  ng "new-session command does NOT source \$STATE_DIR/.env. Command: $NEW_CALL"
-fi
-
-if [[ "$NEW_CALL" == *"bun"* ]] && [[ "$NEW_CALL" == *"poller.ts"* ]]; then
-  ok "new-session command still runs bun + poller.ts"
-else
-  ng "new-session command lost bun/poller.ts invocation. Command: $NEW_CALL"
-fi
+rm -rf "$SANDBOX"
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then

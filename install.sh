@@ -40,6 +40,9 @@ BIN_DIR="$HOME/.local/bin"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_LABEL="com.claude-agent"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/${PLIST_LABEL}.plist"
+# P6c: the network/heartbeat watchdog is its own launchd job (was a tmux session).
+WATCHDOG_LABEL="com.claude-watchdog"
+WATCHDOG_PLIST_PATH="$LAUNCH_AGENTS_DIR/${WATCHDOG_LABEL}.plist"
 
 # Canonical path the Claude Code Telegram plugin reads from.
 TELEGRAM_DIR="$HOME/.claude/channels/telegram"
@@ -262,20 +265,13 @@ EOF
   say "Initialized $SHARED_CTX"
 fi
 
-# ---- 3c. Install bind-telegram-topic skill (Phase 2) -----------------------
-# Ships a Claude Code slash command that wraps `cta bind`. Installed into the
-# user's global skills dir so it's available from any project. Don't clobber
-# user edits — `diff` and skip if changed.
-SKILLS_SRC="$REPO_DIR/skills/bind-telegram-topic"
+# ---- 3c. Remove the retired bind-telegram-topic skill ----------------------
+# P6c: `cta bind` is gone (it was tmux-only), so its slash-command wrapper is
+# retired. Clean up any previously-installed copy so stale skills don't linger.
 SKILLS_DST="$HOME/.claude/skills/bind-telegram-topic"
-if [[ -d "$SKILLS_SRC" ]]; then
-  mkdir -p "$SKILLS_DST"
-  if [[ -f "$SKILLS_DST/SKILL.md" ]] && ! cmp -s "$SKILLS_SRC/SKILL.md" "$SKILLS_DST/SKILL.md"; then
-    say "Skill bind-telegram-topic has local edits at $SKILLS_DST/SKILL.md — leaving alone"
-  else
-    cp "$SKILLS_SRC/SKILL.md" "$SKILLS_DST/SKILL.md"
-    say "Installed skill bind-telegram-topic"
-  fi
+if [[ -d "$SKILLS_DST" ]]; then
+  rm -rf "$SKILLS_DST"
+  say "Removed retired skill bind-telegram-topic"
 fi
 
 # ---- 4. Provision Telegram plugin secrets (optional) -----------------------
@@ -353,17 +349,29 @@ EOF
   chmod 600 "$TELEGRAM_ACCESS"
 fi
 
-# ---- 5. Generate and load LaunchAgent ---------------------------------------
+# ---- 5. Generate and load LaunchAgents --------------------------------------
+# Two jobs (P6c, launchd-direct, no tmux):
+#   com.claude-agent     → start_agents.sh → exec bun poller.ts
+#   com.claude-watchdog  → watch_network.sh (network + heartbeat; kickstarts
+#                          the agent job on a stale poller heartbeat)
 mkdir -p "$LAUNCH_AGENTS_DIR"
-sed -e "s|__BIN_DIR__|$BIN_DIR|g" \
-    -e "s|__HOME__|$HOME|g" \
-    -e "s|__STATE_DIR__|$STATE_DIR|g" \
-    "$REPO_DIR/launchagent/com.claude-agent.plist.template" > "$PLIST_PATH"
-say "Wrote $PLIST_PATH"
+render_plist() {  # <template-basename> <dest-path>
+  sed -e "s|__BIN_DIR__|$BIN_DIR|g" \
+      -e "s|__HOME__|$HOME|g" \
+      -e "s|__STATE_DIR__|$STATE_DIR|g" \
+      "$REPO_DIR/launchagent/$1" > "$2"
+  say "Wrote $2"
+}
+render_plist "com.claude-agent.plist.template"    "$PLIST_PATH"
+render_plist "com.claude-watchdog.plist.template" "$WATCHDOG_PLIST_PATH"
 
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 launchctl load "$PLIST_PATH"
 say "Loaded LaunchAgent $PLIST_LABEL"
+
+launchctl unload "$WATCHDOG_PLIST_PATH" 2>/dev/null || true
+launchctl load "$WATCHDOG_PLIST_PATH"
+say "Loaded LaunchAgent $WATCHDOG_LABEL"
 
 # ---- 6. Generate pairing code (Phase 3 zero-config onboarding) -------------
 # Generate (or display existing) one-time pairing code so the user can claim

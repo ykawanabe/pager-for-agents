@@ -36,7 +36,8 @@ ng() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 _la_loaded()         { return 0; }
 _claude_ps_line()    { echo "12345 524288"; }   # PID=12345, RSS=524288 KB = 512 MB
 _mcp_alive()         { return 0; }
-_tmux_session_alive() { return 0; }
+_poller_alive()      { return 0; }
+_watchdog_alive()    { return 0; }
 _last_activity()     { echo "2026-05-12T10:00:00Z"; }
 
 TMUX_SESSION_CLAUDE="claude"
@@ -67,7 +68,8 @@ echo "$JSON" | grep -q '"last_activity": "2026-05-12T10:00:00Z"' && ok "json: la
 _la_loaded()         { return 1; }
 _claude_ps_line()    { echo ""; }
 _mcp_alive()         { return 1; }
-_tmux_session_alive() { return 1; }
+_poller_alive()      { return 1; }
+_watchdog_alive()    { return 1; }
 _last_activity()     { echo ""; }
 
 JSON=$(cmd_status json)
@@ -85,7 +87,8 @@ echo "$JSON" | grep -q '"last_activity": null' && ok "json (down): last_activity
 MULTI_TOPIC=0
 TMUX_SESSION_CLAUDE="my-bot"
 TMUX_SESSION_WATCHDOG="my-watchdog"
-_tmux_session_alive() { return 0; }
+_poller_alive()   { return 0; }
+_watchdog_alive() { return 0; }
 JSON=$(cmd_status json)
 echo "$JSON" | grep -q '"name": "my-bot"'      && ok "json: respects custom claude session name"   || ng "json: respects custom claude session name"
 echo "$JSON" | grep -q '"name": "my-watchdog"' && ok "json: respects custom watchdog session name" || ng "json: respects custom watchdog session name"
@@ -112,67 +115,62 @@ TEXT=$(cmd_status text)
 echo "$TEXT" | grep -q "claude PID:.*999" && ok "cmd_status text: shows pid" || ng "cmd_status text: shows pid"
 echo "$TEXT" | grep -q "MB"                && ok "cmd_status text: shows RSS in MB" || ng "cmd_status text: shows RSS in MB"
 
-# ─── cmd_start idempotency (regression: bot kill on Pager launch) ────────────
-# Regression: v0.1.0 — Pager's ensureBotRunning() calls `cta start`, which
-# called start_agents.sh, which kills both tmux sessions before respawning.
-# Result: every Pager launch took the live bot offline for ~3 seconds and
-# churned the claude PID. Found by /qa on 2026-05-12 when Pager restarted
-# during the live install and the watchdog log showed claude respawned.
+# ─── cmd_start: idempotent, non-destructive launchd load ─────────────────────
+# Regression (v0.1.0): Pager's ensureBotRunning() calls `cta start` on every
+# launch. The old path ran start_agents.sh, which killed + respawned the tmux
+# sessions, taking the live bot offline for ~3s and churning the claude PID.
 #
-# Contract: `cta start` is idempotent. When both sessions are alive, it
-# does NOT invoke start_agents.sh. Test by stubbing the session check to
-# return alive, then asserting START_SCRIPT was never called.
+# P6c contract: `cta start` loads BOTH LaunchAgents (com.claude-agent +
+# com.claude-watchdog). Loading an already-loaded job is a no-op, and a healthy
+# (alive) poller is never kickstarted — so the call is fully non-destructive.
+# Only a DOWN poller gets a `launchctl kickstart` to bring it up. It must NEVER
+# bootout/unload/kickstart -k a running poller.
 
-# Override session check to report both alive.
-_tmux_session_alive() { return 0; }
-# Stub launchctl so cmd_start's "load LaunchAgent" call doesn't actually run.
-launchctl() { return 0; }
-# Capture whether start_agents.sh would have been invoked. We override the
-# variable to point at a tripwire script — if cmd_start invokes it, the
-# tripwire writes a sentinel file we can grep for.
-TRIPWIRE=$(mktemp)
-rm -f "$TRIPWIRE"   # ensure absent before test
-START_SCRIPT="/bin/bash"   # use a real executable; trick is the arg below
-# Bash invocation as "start script": writes the tripwire file. If cmd_start
-# invokes START_SCRIPT, the tripwire appears.
-cmd_start_test() {
-  # Inline replacement that records invocation. Simulates what start_agents.sh
-  # would do (the destructive thing we want to prevent when already alive).
-  touch "$TRIPWIRE"
-}
-# Redefine START_SCRIPT path to a faux executable that touches the tripwire.
-# Use a here-doc to write a tiny script.
-FAUX_START=$(mktemp)
-cat > "$FAUX_START" <<EOF
-#!/bin/bash
-touch "$TRIPWIRE"
-EOF
-chmod +x "$FAUX_START"
-START_SCRIPT="$FAUX_START"
-PLIST_PATH="/nonexistent/com.claude-agent.plist"   # avoid touching real plist
+LAUNCHCTL_LOG=$(mktemp)
+launchctl() { echo "$*" >> "$LAUNCHCTL_LOG"; return 0; }
 
+# Real temp files so cmd_start's [[ -f ]] plist guards pass.
+AGENT_PLIST=$(mktemp)
+WATCHDOG_PLIST=$(mktemp)
+PLIST_PATH="$AGENT_PLIST"
+WATCHDOG_PLIST_PATH="$WATCHDOG_PLIST"
+
+# Case 1: poller already alive → load both, but do NOT touch a healthy poller.
+: > "$LAUNCHCTL_LOG"
+_poller_alive()   { return 0; }
+_watchdog_alive() { return 0; }
 cmd_start >/dev/null
-
-if [[ -f "$TRIPWIRE" ]]; then
-  ng "cmd_start (both sessions alive): MUST NOT invoke start_agents.sh"
+calls=$(cat "$LAUNCHCTL_LOG")
+if grep -q "^load .*$AGENT_PLIST" <<<"$calls" && grep -q "^load .*$WATCHDOG_PLIST" <<<"$calls"; then
+  ok "cmd_start: loads both LaunchAgents"
 else
-  ok "cmd_start (both sessions alive): correctly skipped start_agents.sh"
+  ng "cmd_start: should load both plists (got: $(tr '\n' ';' <<<"$calls"))"
+fi
+if grep -Eq "bootout|unload|kickstart -k" <<<"$calls"; then
+  ng "cmd_start (poller alive): MUST NOT bootout/unload/kickstart -k (got: $(tr '\n' ';' <<<"$calls"))"
+else
+  ok "cmd_start (poller alive): non-destructive (no bootout/unload/kickstart -k)"
+fi
+if grep -q "kickstart gui/.*$PLIST_LABEL" <<<"$calls"; then
+  ng "cmd_start (poller alive): should NOT kickstart a healthy poller (got: $(tr '\n' ';' <<<"$calls"))"
+else
+  ok "cmd_start (poller alive): skips kickstart of healthy poller"
 fi
 
-# Now invert: report sessions as DOWN. cmd_start MUST invoke start_agents.sh.
-rm -f "$TRIPWIRE"
-_tmux_session_alive() { return 1; }
+# Case 2: poller down → load + kickstart the agent job to bring it up.
+: > "$LAUNCHCTL_LOG"
+_poller_alive()   { return 1; }
+_watchdog_alive() { return 1; }
 cmd_start >/dev/null
-
-if [[ -f "$TRIPWIRE" ]]; then
-  ok "cmd_start (sessions down): invoked start_agents.sh as expected"
+calls=$(cat "$LAUNCHCTL_LOG")
+if grep -Eq "kickstart gui/[0-9]+/$PLIST_LABEL" <<<"$calls"; then
+  ok "cmd_start (poller down): kickstarts the agent job"
 else
-  ng "cmd_start (sessions down): SHOULD have invoked start_agents.sh"
+  ng "cmd_start (poller down): expected 'kickstart gui/<uid>/$PLIST_LABEL' (got: $(tr '\n' ';' <<<"$calls"))"
 fi
 
-# Cleanup tripwire + faux scripts.
-rm -f "$TRIPWIRE" "$FAUX_START"
-unset -f _tmux_session_alive launchctl 2>/dev/null
+rm -f "$LAUNCHCTL_LOG" "$AGENT_PLIST" "$WATCHDOG_PLIST"
+unset -f _poller_alive _watchdog_alive launchctl 2>/dev/null
 
 # ─── cmd_stop bun cleanup (regression: orphan bun → double-poller race) ─────
 # Regression: v0.1.1 — cta stop killed the tmux session but left the bun MCP
@@ -209,9 +207,10 @@ kill() {
 tmux() { return 0; }
 launchctl() { return 0; }
 
-# Plist path doesn't exist so the launchctl-unload branch's if-guard returns
-# false. Same shape as a fresh install before install.sh has written the plist.
+# Plist paths don't exist so the launchctl-unload branch's if-guard returns
+# false. Same shape as a fresh install before install.sh has written the plists.
 PLIST_PATH="/nonexistent/com.claude-agent.plist"
+WATCHDOG_PLIST_PATH="/nonexistent/com.claude-watchdog.plist"
 
 cmd_stop >/dev/null
 
@@ -471,7 +470,8 @@ _config_caffeinate "" >/dev/null 2>&1 && ng "_config_caffeinate (empty): should 
 _la_loaded()          { return 0; }
 _claude_ps_line()     { echo ""; }
 _mcp_alive()          { return 1; }
-_tmux_session_alive() { return 1; }
+_poller_alive()       { return 1; }
+_watchdog_alive()     { return 1; }
 _last_activity()      { echo ""; }
 
 CAFFEINATE_PID_FILE=$(mktemp)

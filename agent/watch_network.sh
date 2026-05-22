@@ -1,29 +1,37 @@
 #!/bin/bash
 # Watchdog: network connectivity + poller health.
 #
-# Phase 4 (2026-05-19): the v0 single-topic recovery paths (kick_claude_session,
-# MCP plugin health monitoring) are gone — there is no `claude` tmux session
-# to monitor anymore. The poller owns claude lifecycle in-process via the
-# ClaudeDaemonRegistry. This watchdog only needs to:
-#   1. Notice when the poller's bun process has died (heartbeat stale) and
-#      respawn it via kick_poller_session.
-#   2. Respawn helper-<id> tmux sessions that died mid-mount-pick (rare).
+# P6c (2026-05-22): runtime is launchd-direct, no terminal multiplexer.
+# This watchdog runs as its own launchd job (com.claude-watchdog) and the
+# poller runs as com.claude-agent. launchd's KeepAlive respawns the poller
+# when its process *crashes* (non-zero exit), but it can't notice a poller
+# that is alive-but-hung. That is this watchdog's remaining job:
+#   1. Notice when the poller's heartbeat has gone stale/absent and force a
+#      clean restart of the launchd job via `launchctl kickstart -k`.
+#   2. Log network reachability (general internet + Telegram) for diagnosis.
+#
+# Helper-session respawning is gone: the poller no longer spawns per-topic or
+# helper subprocesses outside its in-process ClaudeDaemonRegistry (project
+# picking for unmounted topics is an in-process buttons prompt now).
 #
 # The loop itself never exits — failures inside the loop are caught with
-# `|| true` so a single ping or tmux error can't take the watchdog down.
+# `|| true` so a single ping or launchctl error can't take the watchdog down.
 #
 # NOTE: We intentionally do NOT enable `set -e` here because the main loop
 # must survive transient errors.
 set -uo pipefail
 
-# Defensive PATH augmentation. tmux and pgrep live outside launchd's stripped
-# default PATH; ensure they resolve when this script is spawned by the
-# LaunchAgent or by a launchd-spawned caller. See cli/cta for context.
+# Defensive PATH augmentation. bun / pgrep / launchctl must resolve when this
+# script is spawned by launchd (which hands down a stripped default PATH).
+# See cli/cta for the full explanation.
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
 
-# Startup grace period before we treat a missing poller session or stale
-# heartbeat as a real problem worth kicking. 60s covers slow boots, bun's
-# cold-start window, and the watchdog's own first loop iteration.
+# launchd label of the poller job we supervise. Overridable for tests/dev.
+AGENT_LABEL="${AGENT_LABEL:-com.claude-agent}"
+
+# Startup grace period before we treat a missing poller or stale heartbeat
+# as a real problem worth kicking. 60s covers slow boots, bun's cold-start
+# window, and the watchdog's own first loop iteration.
 WATCHDOG_STARTUP_GRACE_SECS=60
 
 STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
@@ -50,100 +58,26 @@ load_env() {
   set +a
 }
 
-# Respawn helper-<id> mount-helper tmux sessions that died mid-pick. The
-# poller spawns these on-demand when a user messages an unmounted topic;
-# their lifecycle is short (claude TUI runs to completion or user cancels).
-# A crash mid-pick leaves the topic in "provisional mount" state with no
-# live helper to drive it — without this respawn, the user has to send a
-# fresh message to trigger spawnHelper again, which is unintuitive.
-#
-# We only respawn helper-* (provisional) entries; non-provisional mounts
-# are handled by the poller's daemon registry, which auto-respawns on
-# crash without any tmux involvement.
-kick_dead_helper_sessions() {
-  local mounts_file="$STATE_DIR/mounts.json"
-  [[ -f "$mounts_file" ]] || return 0
-  local wrapper="$INSTALL_DIR/agent/topic-wrapper.sh"
-  [[ -x "$wrapper" ]] || return 0
-  local entries
-  entries=$(jq -r '.mounts[] | select(.thread_id != "*") | select((.provisional // false) == true) | [(.thread_id|tostring), .path, .tmux_session] | @tsv' "$mounts_file" 2>/dev/null) || return 0
-  [[ -z "$entries" ]] && return 0
-  while IFS=$'\t' read -r thread_id project_path tmux_session; do
-    [[ -z "$thread_id" ]] && continue
-    [[ -d "$project_path" ]] || continue
-    # Only kick sessions that look like helpers; defensive against stale
-    # mounts.json entries from before Phase 4.
-    [[ "$tmux_session" == helper-* ]] || continue
-    if tmux has-session -t "$tmux_session" 2>/dev/null; then
-      continue
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] respawning dead helper session: $tmux_session (thread $thread_id)"
-    local quoted_cmd
-    quoted_cmd=$(printf '%q ' "$wrapper" "$thread_id" "$project_path" "$tmux_session" "helper")
-    tmux new-session -d -s "$tmux_session" "$quoted_cmd" 2>/dev/null || {
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ failed to respawn $tmux_session" >&2
-      continue
-    }
-    sleep 0.2
-    tmux pipe-pane -t "$tmux_session" -o "cat >> $STATE_DIR/agent.log" 2>/dev/null || true
-  done <<< "$entries"
-}
-
-# Respawn the `poller` tmux session in place. Used when the poller's bun
-# process has died (heartbeat went stale) — the LaunchAgent only watches
-# start_agents.sh, which exits successfully after spawning, so launchd's
-# KeepAlive never fires for a poller death. Without this, a dead poller
-# stays dead until the next login (no inbound messages reach any topic).
+# Force a clean restart of the poller launchd job. Used when the poller's
+# heartbeat went stale/absent — the process is hung or gone in a way launchd's
+# KeepAlive didn't catch (KeepAlive only fires on a process *exit*; a hung but
+# live process never exits). `kickstart -k` SIGKILLs the running instance (if
+# any) and immediately relaunches it under launchd, so the restarted poller is
+# still fully supervised. Pure launchctl — no terminal multiplexer involved.
 kick_poller_session() {
   local reason="$1"
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $reason — restarting poller session"
-  # Pull token from the plugin .env, same source start_agents.sh uses.
-  local plugin_env="$HOME/.claude/channels/telegram/.env"
-  local token=""
-  if [[ -f "$plugin_env" ]]; then
-    token=$(grep '^TELEGRAM_BOT_TOKEN=' "$plugin_env" | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//')
-  fi
-  if [[ -z "$token" ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick aborted — TELEGRAM_BOT_TOKEN missing in $plugin_env" >&2
-    return 1
-  fi
-  if [[ -z "${MAIN_CHAT_ID:-}" ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick aborted — MAIN_CHAT_ID missing in env" >&2
-    return 1
-  fi
-  local poller_path="$INSTALL_DIR/agent/poller/poller.ts"
-  if [[ ! -f "$poller_path" ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick aborted — $poller_path missing" >&2
-    return 1
-  fi
-  tmux kill-session -t poller 2>/dev/null || true
-  sleep 1
-  # Source both project and plugin .env files at spawn time so the poller's
-  # bun process inherits the full project env — operator settings plus the
-  # canonical TELEGRAM_BOT_TOKEN from the plugin .env (freshly read, picks
-  # up rotations). Previously only two vars were forwarded via `-e`, dropping
-  # every other operator setting on each watchdog kick (D12 in docs/plans/
-  # multi-topic-stability-plan.md).
-  local env_file="$STATE_DIR/.env"
-  local wrapper_cmd
-  wrapper_cmd="set -a; [ -f '$env_file' ] && . '$env_file'; [ -f '$plugin_env' ] && . '$plugin_env'; set +a; exec bun '$poller_path'"
-  tmux new-session -d -s poller "$wrapper_cmd" || true
-  # Brief settle before pipe-pane attach — start_agents.sh hit an intermittent
-  # "can't find pane: poller" without this on first launch.
-  sleep 0.2
-  tmux pipe-pane -t poller -o "cat >> $STATE_DIR/agent.log" 2>/dev/null || true
-  if tmux has-session -t poller 2>/dev/null; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] poller kick complete — session active"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $reason — kickstarting $AGENT_LABEL"
+  if launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] poller kick complete ($AGENT_LABEL)"
     return 0
   fi
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick failed — session not present after restart" >&2
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠ poller kick failed — launchctl kickstart $AGENT_LABEL returned non-zero" >&2
   return 1
 }
 
-# Has the watchdog been up long enough that a missing poller session is a
-# real problem worth kicking, vs a slow boot we should wait out? Pure
-# arithmetic so the unit test can pin specific now/started values without
-# sleeping.
+# Has the watchdog been up long enough that a missing/stale poller is a real
+# problem worth kicking, vs a slow boot we should wait out? Pure arithmetic so
+# the unit test can pin specific now/started values without sleeping.
 #   $1 = now (epoch seconds)
 #   $2 = watchdog start time (epoch seconds)
 #   $3 = grace window in seconds
@@ -190,7 +124,7 @@ main_loop() {
         local hb_age=$(( $(date +%s) - $(stat -f %m "$STATE_DIR/heartbeat-poller" 2>/dev/null || echo 0) ))
         if [[ "$hb_age" -gt "$POLLER_STALE_THRESHOLD_SECS" ]]; then
           if past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
-            kick_poller_session "poller heartbeat stale (${hb_age}s)"
+            kick_poller_session "poller heartbeat stale (${hb_age}s)" || true
           else
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat stale (${hb_age}s, in startup grace)"
           fi
@@ -199,16 +133,10 @@ main_loop() {
         fi
       elif past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
         # Heartbeat file absent past startup grace — poller never spawned
-        # or its first touchHeartbeat() call hasn't landed. Respawn.
-        kick_poller_session "poller heartbeat absent"
+        # or its first touchHeartbeat() call hasn't landed. Kick it.
+        kick_poller_session "poller heartbeat absent" || true
       else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Online — poller heartbeat absent (in startup grace)"
-      fi
-      # Independent of poller health: respawn any helper-* tmux session
-      # that has gone missing mid-mount-pick. Mount-helpers are the only
-      # tmux sessions still spawned outside the poller's in-process daemons.
-      if past_startup_grace "$(date +%s)" "$WATCHDOG_STARTED_AT" "$WATCHDOG_STARTUP_GRACE_SECS"; then
-        kick_dead_helper_sessions
       fi
     fi
     sleep "$PING_INTERVAL"

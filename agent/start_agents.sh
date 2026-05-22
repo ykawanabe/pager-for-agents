@@ -1,28 +1,29 @@
 #!/bin/bash
-# Entry point — starts the poller (which owns per-topic claude daemons)
-# and the network watchdog inside detached tmux sessions. Safe to call
-# multiple times: existing sessions are killed first.
+# Entry point — the launchd ProgramArguments for com.claude-agent.
 #
-# Phase 4 (2026-05-19) rewrite: regular per-topic claude TUI sessions are
-# gone — poller.ts owns one long-lived `claude -p --input-format stream-json`
-# subprocess per active topic via ClaudeDaemonRegistry. The only tmux
-# sessions we spawn are infrastructure:
-#   tmux poller     — bun .../agent/poller/poller.ts (process supervision)
-#   tmux watchdog   — agent/watch_network.sh (network + heartbeat)
-# Mount-helper sessions (helper-<id>, briefly during project picking) are
-# spawned on-demand by the poller, not here.
+# P6c (2026-05-22) rewrite: no terminal multiplexer. This script does preflight
+# (env, log rotation, sanity checks) and then `exec`s the poller in the
+# FOREGROUND so the launchd job *is* the poller process. launchd's KeepAlive
+# (SuccessfulExit=false) respawns it on a crash; a clean `cta stop`
+# (launchctl bootout) leaves it down. The network/heartbeat watchdog runs as
+# its own launchd job (com.claude-watchdog → watch_network.sh) and force-
+# restarts this job via `launchctl kickstart -k` if the heartbeat goes stale.
+#
+# The poller owns one long-lived `claude -p --input-format stream-json`
+# subprocess per active topic via ClaudeDaemonRegistry — there are no per-topic
+# or helper subprocesses to spawn here.
 set -euo pipefail
 
-# Tighten umask so every file created downstream (agent.log via pipe-pane,
-# log rotation archives, etc.) lands at 0600/0700 instead of the system
-# default 0644/0755. agent.log mirrors poller stdout — world-readable mode
-# would expose chat metadata to other users on the Mac and cloud-backup
-# tooling that walks $HOME.
+# Tighten umask so every file created downstream (agent.log via the exec
+# redirect below, log rotation archives, etc.) lands at 0600/0700 instead of
+# the system default 0644/0755. agent.log carries the full chat transcript —
+# a world-readable mode would expose it to other users on the Mac and to
+# cloud-backup tooling that walks $HOME.
 umask 077
 
 # Defensive PATH augmentation: launchd-spawned callers (Pager via `cta start`,
-# the LaunchAgent itself) inherit a stripped PATH that doesn't include tmux's
-# Homebrew location. See cli/cta for the full explanation.
+# the LaunchAgent itself) inherit a stripped PATH. See cli/cta for the full
+# explanation.
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
 
 STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
@@ -38,28 +39,15 @@ set -a
 source "$ENV_FILE"
 set +a
 
-BIN_DIR="$HOME/.local/bin"
 LOG_FILE="$STATE_DIR/agent.log"
 LOG_DIR="$(dirname "$LOG_FILE")"
 LOG_ROTATE_MAX_BYTES=$((10 * 1024 * 1024))  # 10 MB
 LOG_ARCHIVE_RETAIN_DAYS=30
 
-# `tmux pipe-pane` mirrors pane output to a file while still rendering it in
-# the pane itself. agent.log is the Pager's "Show recent activity" tail.
-#
-# Pre-create the log at 0600 so the file mode is locked in regardless of
-# whatever umask the redirect inside `cat >>` actually honors.
-pipe_to_log() {
-  local session="$1"
-  touch "$LOG_FILE"
-  chmod 600 "$LOG_FILE" 2>/dev/null || true
-  tmux pipe-pane -t "$session" -o "cat >> $LOG_FILE" || true
-}
-
 # Archive the active log if it has grown past the size threshold, then prune
-# archives older than $LOG_ARCHIVE_RETAIN_DAYS. In-place rotation during a
-# tmux pipe-pane run isn't safe (the writer's fd holds the old inode), so
-# we only rotate at startup.
+# archives older than $LOG_ARCHIVE_RETAIN_DAYS. We rotate at startup only:
+# the live poller appends to agent.log via the exec redirect below, and the
+# fresh `>>` open after this rename creates a new agent.log at 0600 (umask).
 rotate_logs() {
   if [[ -f "$LOG_FILE" ]]; then
     local size
@@ -91,60 +79,36 @@ main() {
     fi
   done
 
-  # Tear down prior poller / watchdog so re-runs are idempotent.
-  tmux kill-session -t poller 2>/dev/null || true
-  tmux kill-session -t "${TMUX_SESSION_WATCHDOG:-watchdog}" 2>/dev/null || true
-  # v0 leftover: a `claude` session from the long-dead main_single_topic
-  # path would race our poller (409 Conflict on getUpdates → silent drops).
-  # ONLY kill it if it's actually running the v0 restart_claude.sh — never
-  # kill an unrelated session a user named "claude" themselves. We test
-  # the pane command for the v0 signature; if it doesn't match, leave alone.
-  local v0_session="${TMUX_SESSION_CLAUDE:-}"
-  if [[ -n "$v0_session" ]] && tmux has-session -t "$v0_session" 2>/dev/null; then
-    local pane_cmd
-    pane_cmd=$(tmux list-panes -t "$v0_session" -F '#{pane_current_command} #{pane_start_command}' 2>/dev/null | head -1)
-    if [[ "$pane_cmd" == *"restart_claude.sh"* ]]; then
-      tmux kill-session -t "$v0_session" 2>/dev/null || true
-    fi
-  fi
-
-  # Sanity: bot token must be reachable for the poller.
+  # Sanity: bot token must be reachable for the poller. Source the plugin .env
+  # here so the exec'd poller inherits the canonical TELEGRAM_BOT_TOKEN (and
+  # picks up rotations) alongside the project .env sourced above.
   local plugin_env="$HOME/.claude/channels/telegram/.env"
   local token=""
   if [[ -f "$plugin_env" ]]; then
-    token=$(grep '^TELEGRAM_BOT_TOKEN=' "$plugin_env" | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//')
+    set -a
+    # shellcheck source=/dev/null
+    source "$plugin_env"
+    set +a
+    token="${TELEGRAM_BOT_TOKEN:-}"
   fi
   if [[ -z "$token" ]]; then
     echo "TELEGRAM_BOT_TOKEN missing in $plugin_env" >&2
     exit 1
   fi
 
-  # Source project + plugin .env at spawn time. tmux's `-e` flag forwards
-  # only explicitly-listed vars, dropping operator settings; sourcing here
-  # keeps the poller's env in sync with kick_poller_session (watch_network.sh)
-  # so the two spawn paths stay environmentally consistent.
-  local env_file="$STATE_DIR/.env"
-  local poller_wrapper_cmd
-  poller_wrapper_cmd="set -a; [ -f '$env_file' ] && . '$env_file'; [ -f '$plugin_env' ] && . '$plugin_env'; set +a; exec bun '$poller_path'"
-  tmux new-session -d -s poller "$poller_wrapper_cmd"
-  # Brief settle before pipe-pane — the live install showed an intermittent
-  # "can't find pane: poller" when pipe_to_log ran immediately after new-
-  # session before the pane was fully attached.
-  sleep 0.2
-  pipe_to_log poller
-
-  sleep 1
-
-  tmux new-session -d -s "${TMUX_SESSION_WATCHDOG:-watchdog}" "$BIN_DIR/watch_network.sh"
-  pipe_to_log "${TMUX_SESSION_WATCHDOG:-watchdog}"
-
-  echo "Started tmux sessions: poller, ${TMUX_SESSION_WATCHDOG:-watchdog}"
-  echo "Watch poller: tmux attach -t poller"
-  echo "Recent activity: tail -f $LOG_FILE"
+  # Pre-create the log at 0600 so the mode is locked in regardless of how the
+  # `>>` redirect's open() honors umask, then become the poller. The redirect
+  # reopens agent.log fresh (post-rotation) and carries the poller's stdout +
+  # stderr — replacing the old pipe-pane log mirror. launchd now supervises
+  # this very process: when the poller exits non-zero, KeepAlive respawns it.
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] start_agents: exec poller ($poller_path)" >> "$LOG_FILE"
+  exec bun "$poller_path" >> "$LOG_FILE" 2>&1
 }
 
 # Sourcing (tests/test_start_agents.sh) exposes the helpers without running
-# the destructive tmux dance. Direct execution still behaves identically.
+# the exec. Direct execution still becomes the poller.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   main
 fi

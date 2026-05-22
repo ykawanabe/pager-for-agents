@@ -1,14 +1,21 @@
 #!/bin/bash
 # Unit tests for agent/watch_network.sh helpers.
 #
-# Phase 4 (2026-05-19): mcp_healthy + kick_claude_session deleted along with
-# the v0 single-topic recovery path. Tests now cover what remains:
+# P6c (2026-05-22): tmux removed at runtime. The watchdog is now its own
+# launchd job (com.claude-watchdog) supervising a launchd-direct poller
+# (com.claude-agent). On a stale/absent heartbeat it force-restarts the
+# poller via `launchctl kickstart -k` instead of respawning a tmux session.
+# kick_dead_helper_sessions is gone — the poller no longer spawns helper-*
+# tmux sessions (project-picking moved in-process to a buttons prompt).
+#
+# Tests cover what remains:
 #   - past_startup_grace boundary arithmetic
-#   - kick_dead_helper_sessions only fires on provisional / helper-* entries
+#   - kick_poller_session issues `launchctl kickstart -k` for the agent label
+#   - the script carries no tmux references
 #
 # Strategy: source the script (which exposes the functions but skips the
-# main_loop because of the BASH_SOURCE guard), then stub tmux/jq/sleep
-# with shell functions to inspect the side-effects.
+# main_loop because of the BASH_SOURCE guard), then stub launchctl with a
+# shell function to inspect the side-effects.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,8 +30,8 @@ ng()   { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 
 # ─── past_startup_grace ──────────────────────────────────────────────────────
 # Gates kick_poller_session so a slow-booting Mac doesn't get its still-
-# spawning poller "rescued" before start_agents.sh has even finished. Below
-# the window → don't kick. At or past it → kick.
+# spawning poller "rescued" before launchd has even finished. Below the
+# window → don't kick. At or past it → kick.
 
 GRACE=60
 
@@ -53,65 +60,51 @@ else
   ng "past_startup_grace: 120s uptime → kick"
 fi
 
-# ─── kick_dead_helper_sessions ──────────────────────────────────────────────
-# Only respawns provisional helper-* tmux sessions. Non-provisional mounts
-# (regular Phase 4 topics) live entirely inside the poller's daemon registry
-# and have no tmux session to respawn; touching them would be wrong.
+# ─── kick_poller_session → launchctl kickstart -k ───────────────────────────
+# A stale poller heartbeat (process hung, not crashed — launchd's KeepAlive
+# only catches crashes) is recovered by force-restarting the launchd job.
+# kick_poller_session must call `launchctl kickstart -k` against the agent's
+# gui/<uid>/<label> service target, and must NOT shell out to tmux.
 
-TMP_STATE=$(mktemp -d)
-TMP_INSTALL=$(mktemp -d)
-mkdir -p "$TMP_INSTALL/agent"
-# Stub topic-wrapper so the executable-existence guard passes; we only
-# need to assert tmux is called.
-echo '#!/bin/bash' > "$TMP_INSTALL/agent/topic-wrapper.sh"
-chmod +x "$TMP_INSTALL/agent/topic-wrapper.sh"
-STATE_DIR="$TMP_STATE"
-INSTALL_DIR="$TMP_INSTALL"
+LAUNCHCTL_CALLS=()
+launchctl() { LAUNCHCTL_CALLS+=("$*"); return 0; }
+# Trip the test if kick_poller_session reaches for tmux at all.
+tmux() { LAUNCHCTL_CALLS+=("TMUX:$*"); return 0; }
 
-# Two mounts: one provisional (helper-99, should be kicked) and one
-# non-provisional (topic-42, must NOT be kicked).
-mkdir -p "$TMP_STATE"
-cat > "$TMP_STATE/mounts.json" <<EOF
-{"mounts":[
-  {"thread_id":"99","path":"$HOME","label":"helper","tmux_session":"helper-99","provisional":true},
-  {"thread_id":"42","path":"$HOME","label":"proj","tmux_session":"topic-42","provisional":false}
-]}
-EOF
+kick_poller_session "test reason" > /dev/null 2>&1 || true
 
-TMUX_CALLS=()
-tmux() {
-  TMUX_CALLS+=("$*")
-  case "$1" in
-    has-session) return 1 ;;  # both reported dead
-    *)           return 0 ;;
-  esac
-}
-sleep() { :; }
-
-kick_dead_helper_sessions > /dev/null 2>&1 || true
-
-# Assert tmux was invoked for helper-99 but never for topic-42.
-helper_kicked=0
-topic_touched=0
-for call in "${TMUX_CALLS[@]:-}"; do
+kickstart_seen=0
+tmux_seen=0
+for call in "${LAUNCHCTL_CALLS[@]:-}"; do
   case "$call" in
-    *helper-99*) helper_kicked=1 ;;
-    *topic-42*)  topic_touched=1 ;;
+    TMUX:*) tmux_seen=1 ;;
+    kickstart\ -k\ *com.claude-agent*) kickstart_seen=1 ;;
   esac
 done
-if [[ "$helper_kicked" -eq 1 ]]; then
-  ok "kick_dead_helper_sessions: respawns dead provisional helper-* session"
+
+if [[ "$kickstart_seen" -eq 1 ]]; then
+  ok "kick_poller_session: launchctl kickstart -k against com.claude-agent"
 else
-  ng "kick_dead_helper_sessions: respawns dead provisional helper-* session"
-fi
-if [[ "$topic_touched" -eq 0 ]]; then
-  ok "kick_dead_helper_sessions: ignores non-provisional topic-* (daemon-owned)"
-else
-  ng "kick_dead_helper_sessions: ignores non-provisional topic-* (daemon-owned, got '${TMUX_CALLS[*]}')"
+  ng "kick_poller_session: expected 'launchctl kickstart -k …com.claude-agent' (got '${LAUNCHCTL_CALLS[*]:-}')"
 fi
 
-unset -f tmux sleep
-rm -rf "$TMP_STATE" "$TMP_INSTALL"
+if [[ "$tmux_seen" -eq 0 ]]; then
+  ok "kick_poller_session: does not invoke tmux"
+else
+  ng "kick_poller_session: invoked tmux (got '${LAUNCHCTL_CALLS[*]:-}')"
+fi
+
+unset -f launchctl tmux
+
+# ─── no tmux anywhere in the script ─────────────────────────────────────────
+# P6c removed tmux from the runtime. Guard against it creeping back into the
+# watchdog (a single tmux call would reintroduce the FDA prompt + dependency).
+
+if grep -q '\btmux\b' "$SCRIPT_DIR/agent/watch_network.sh"; then
+  ng "watch_network.sh: still references tmux ($(grep -c '\btmux\b' "$SCRIPT_DIR/agent/watch_network.sh") lines)"
+else
+  ok "watch_network.sh: tmux-free"
+fi
 
 # ─── summary ─────────────────────────────────────────────────────────────────
 

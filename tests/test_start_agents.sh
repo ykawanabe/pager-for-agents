@@ -1,7 +1,12 @@
 #!/bin/bash
-# Tests for agent/start_agents.sh — focused on the file-permission
-# guarantees added after the 2026-05-13 security audit. The destructive tmux
-# dance (kill + new-session) is skipped via the BASH_SOURCE guard.
+# Tests for agent/start_agents.sh — the launchd entrypoint for the poller.
+#
+# P6c (2026-05-22): tmux removed. start_agents.sh no longer spawns detached
+# sessions + pipe-pane; it does preflight, rotates the log, then `exec`s the
+# poller in the foreground so launchd supervises the poller process directly.
+# agent.log is fed by the exec redirect (kept at 0600 via umask). The
+# destructive exec is skipped via the BASH_SOURCE guard, so we can source the
+# script and assert on its helpers.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,16 +18,14 @@ ng() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
 
 # ─── umask: agent.log + future inbox/* land at 0600 ──────────────────────────
 #
-# The agent.log file mirrors the full Telegram conversation via
-# `tmux pipe-pane`, so a 0644 mode would leak chat history to any other user
-# on the Mac (and to backup tools that walk $HOME with their own ACLs).
-# Catch regressions in start_agents.sh's umask declaration by sourcing the
-# script and asserting on the umask state.
+# agent.log mirrors the full Telegram conversation, so a 0644 mode would leak
+# chat history to any other user on the Mac (and to backup tools that walk
+# $HOME). Catch regressions in start_agents.sh's umask declaration by sourcing
+# the script and asserting on the umask state.
 
 ENV_FILE_FAKE=$(mktemp)
 cat > "$ENV_FILE_FAKE" <<'EOF'
-TMUX_SESSION_CLAUDE=test-claude
-TMUX_SESSION_WATCHDOG=test-watchdog
+MAIN_CHAT_ID=123
 EOF
 # Trick the script's "Missing .env" guard so we can source it cleanly.
 # Source in a subshell + capture umask.
@@ -39,34 +42,6 @@ if [[ "$RESOLVED_UMASK" == "0077" ]]; then
   ok "start_agents.sh sets umask 077 at entry"
 else
   ng "start_agents.sh expected umask 0077, got '$RESOLVED_UMASK'"
-fi
-
-# ─── pipe_to_log: pre-creates LOG_FILE at 0600 ───────────────────────────────
-#
-# Even if umask is somehow bypassed (caller pre-set, tmux's child shell drops
-# it, etc.), pipe_to_log MUST end up with a 0600 file. Stub tmux so the
-# actual pipe-pane call is a no-op; the touch + chmod path runs unchanged.
-
-WORK=$(mktemp -d)
-HOME_OVERRIDE="$WORK"
-mkdir -p "$HOME_OVERRIDE/.pager"
-cp "$ENV_FILE_FAKE" "$HOME_OVERRIDE/.pager/.env"
-
-PERM=$(
-  HOME="$HOME_OVERRIDE" \
-  bash -c "
-    # Stub tmux to a no-op so pipe-pane doesn't try to attach to a real session.
-    tmux() { return 0; }
-    export -f tmux
-    source '$SCRIPT_DIR/agent/start_agents.sh' 2>/dev/null
-    pipe_to_log dummy-session
-    stat -f %Sp \"\$HOME/.pager/agent.log\"
-  "
-)
-if [[ "$PERM" == "-rw-------" ]]; then
-  ok "pipe_to_log creates agent.log at 0600"
-else
-  ng "pipe_to_log: expected 0600 (-rw-------), got '$PERM'"
 fi
 
 # ─── rotate_logs: rotated archives also 0600 ─────────────────────────────────
@@ -96,6 +71,27 @@ if [[ "$ROTATED_PERM" == "-rw-------" ]]; then
   ok "rotate_logs chmods archive to 0600"
 else
   ng "rotate_logs: expected 0600 on archive, got '$ROTATED_PERM'"
+fi
+
+# ─── no tmux anywhere in the script ─────────────────────────────────────────
+# P6c removed tmux from the runtime entrypoint. A single tmux call would
+# reintroduce the FDA prompt + the multiplexer dependency.
+
+if grep -q '\btmux\b' "$SCRIPT_DIR/agent/start_agents.sh"; then
+  ng "start_agents.sh: still references tmux ($(grep -c '\btmux\b' "$SCRIPT_DIR/agent/start_agents.sh") lines)"
+else
+  ok "start_agents.sh: tmux-free"
+fi
+
+# ─── execs the poller in the foreground ──────────────────────────────────────
+# launchd supervision relies on start_agents.sh becoming the poller process
+# (via exec), so a poller crash propagates to launchd's KeepAlive. Assert the
+# script execs bun on the poller path rather than backgrounding it.
+
+if grep -Eq 'exec bun .*poller_path|exec bun .*poller/poller\.ts' "$SCRIPT_DIR/agent/start_agents.sh"; then
+  ok "start_agents.sh: execs bun on the poller (foreground, launchd-supervised)"
+else
+  ng "start_agents.sh: expected 'exec bun …poller.ts' in main()"
 fi
 
 # Cleanup tempfiles. mktemp -d dirs are small; let macOS reap them.

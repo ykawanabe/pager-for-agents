@@ -27,16 +27,21 @@ set -uo pipefail
 
 # When invoked from a launchd-spawned process (Claude Pager via CTAClient,
 # or the LaunchAgent's own restart cycle), $PATH is stripped to the macOS
-# default: /usr/bin:/bin:/usr/sbin:/sbin. tmux lives in /opt/homebrew/bin
-# (Apple Silicon) or /usr/local/bin (Intel) — neither is in the stripped
-# PATH. Without this prepend, `tmux has-session` silently fails with
-# "command not found" and cta reports tmux=false even when both sessions
-# are healthy. Prepend rather than overwrite so any caller-set PATH still
-# wins for entries we don't list.
+# default: /usr/bin:/bin:/usr/sbin:/sbin. bun lives in ~/.bun/bin and the
+# Homebrew tools (pgrep is /usr/bin, but launchctl probes + bun resolution
+# need the augmented set) live in /opt/homebrew/bin (Apple Silicon) or
+# /usr/local/bin (Intel) — none in the stripped PATH. Without this prepend,
+# child commands silently fail with "command not found" and cta misreports
+# liveness. Prepend rather than overwrite so any caller-set PATH still wins
+# for entries we don't list.
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}:$HOME/.local/bin"
 
 PLIST_LABEL="com.claude-agent"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+# P6c: the network/heartbeat watchdog is its own launchd job (was a tmux
+# session). Both jobs are loaded/booted together by cta start/stop.
+WATCHDOG_LABEL="com.claude-watchdog"
+WATCHDOG_PLIST_PATH="$HOME/Library/LaunchAgents/${WATCHDOG_LABEL}.plist"
 BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
 ACCESS_FILE="$HOME/.claude/channels/telegram/access.json"
 START_SCRIPT="$HOME/.local/bin/start_agents.sh"
@@ -145,8 +150,15 @@ _mcp_alive() {
   fi
 }
 
-_tmux_session_alive() {
-  tmux has-session -t "$1" 2>/dev/null
+# P6c: liveness is process-based now, not tmux-session-based. The poller and
+# the watchdog each run as a launchd-direct process; pgrep their argv.
+# `bun .../agent/poller/poller.ts$` is anchored so a dev's `bun test …poller.ts`
+# isn't mistaken for the live poller (same anchor as _claude_ps_line/cmd_stop).
+_poller_alive() {
+  pgrep -f 'bun .*/agent/poller/poller\.ts$' >/dev/null 2>&1
+}
+_watchdog_alive() {
+  pgrep -f 'watch_network\.sh' >/dev/null 2>&1
 }
 
 # Returns ISO8601 mtime of the most recent activity signal.
@@ -211,16 +223,18 @@ cmd_status() {
   local mcp_alive
   if _mcp_alive; then mcp_alive=true; else mcp_alive=false; fi
 
-  # In MULTI_TOPIC mode, `claude` (the v0 control session) doesn't exist —
-  # `poller` plays that role. Map the JSON's `tmux.claude.alive` field to the
-  # poller's status so existing consumers (Pager) keep working unchanged.
+  # P6c: tmux is gone, but the JSON `tmux` object is retained for back-compat
+  # (Pager + any scripts read tmux.claude.alive / tmux.watchdog.alive). The
+  # `.alive` fields now report launchd-process liveness (poller / watchdog),
+  # and the `.name` fields keep their display labels. In MULTI_TOPIC mode the
+  # control label is "poller" (the v0 `claude` session never existed there).
   local control_session
   if _multi_topic_enabled; then control_session="poller"
   else control_session="$TMUX_SESSION_CLAUDE"
   fi
   local tmux_claude tmux_watchdog
-  if _tmux_session_alive "$control_session"; then tmux_claude=true; else tmux_claude=false; fi
-  if _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then tmux_watchdog=true; else tmux_watchdog=false; fi
+  if _poller_alive;   then tmux_claude=true;   else tmux_claude=false;   fi
+  if _watchdog_alive; then tmux_watchdog=true; else tmux_watchdog=false; fi
 
   local activity
   activity=$(_last_activity)
@@ -257,10 +271,8 @@ EOF
       printf 'claude RSS:       %s MB\n' "$(( rss_kb / 1024 ))"
     fi
     printf 'Telegram MCP:     %s\n' "$mcp_alive"
-    printf 'tmux %s:%s   %s\n' "$TMUX_SESSION_CLAUDE" \
-      "$(printf '%*s' $((10 - ${#TMUX_SESSION_CLAUDE})) '')" "$tmux_claude"
-    printf 'tmux %s:%s %s\n' "$TMUX_SESSION_WATCHDOG" \
-      "$(printf '%*s' $((10 - ${#TMUX_SESSION_WATCHDOG})) '')" "$tmux_watchdog"
+    printf 'Poller:           %s\n' "$tmux_claude"
+    printf 'Watchdog:         %s\n' "$tmux_watchdog"
     if [[ "$caffeinate_alive" == "true" ]]; then
       printf 'Caffeinate:       %s (pid %s)\n' "$caffeinate_alive" "$caffeinate_pid"
     else
@@ -271,66 +283,65 @@ EOF
 }
 
 cmd_start() {
-  # Idempotent. If both sessions are already alive, do nothing — no destructive
-  # respawn, no claude PID churn, no conversation drop. start_agents.sh kills
-  # existing sessions before spawning new ones (intentional for a fresh boot
-  # or recovery), so it must NOT be the path for "make sure the bot is up."
-  # Pager calls this on every launch via ensureBotRunning(); without this
-  # guard, every Pager launch took the bot offline for ~3s.
-  #
-  # MULTI_TOPIC mode flips which control session matters. The v0 single-topic
-  # path uses TMUX_SESSION_CLAUDE ("claude" by default); MULTI_TOPIC uses
-  # `poller` instead — there's no `claude` session in that mode. Match
-  # cmd_status's mapping so the "Already running" guard isn't dead code.
-  local control_session
-  if _multi_topic_enabled; then control_session="poller"
-  else control_session="$TMUX_SESSION_CLAUDE"
-  fi
-  if _tmux_session_alive "$control_session" && _tmux_session_alive "$TMUX_SESSION_WATCHDOG"; then
-    echo "Already running (tmux $control_session + $TMUX_SESSION_WATCHDOG alive)."
-    # Still ensure the LaunchAgent is loaded so launchd will respawn at login.
-    # This is non-destructive — launchctl load is a no-op when already loaded.
-    if [[ -f "$PLIST_PATH" ]]; then
-      launchctl load "$PLIST_PATH" 2>/dev/null || true
+  # P6c: launchd-direct. Both jobs (poller + watchdog) are launchd-supervised;
+  # `cta start` just ensures they're loaded and running. This is idempotent and
+  # NON-DESTRUCTIVE: `launchctl load` of an already-loaded job is a no-op, and a
+  # healthy (alive) poller is never restarted. Pager's ensureBotRunning() calls
+  # this on every launch — the old tmux path took the bot offline for ~3s here.
+  local loaded_any=0
+  local plist
+  for plist in "$PLIST_PATH" "$WATCHDOG_PLIST_PATH"; do
+    if [[ -f "$plist" ]]; then
+      launchctl load "$plist" 2>/dev/null || true
+      loaded_any=1
     fi
-    return 0
-  fi
-  if [[ ! -x "$START_SCRIPT" ]]; then
-    echo "Missing $START_SCRIPT — run install.sh first." >&2
+  done
+  if [[ "$loaded_any" -eq 0 ]]; then
+    echo "Missing LaunchAgent plists — run install.sh first." >&2
     return 1
   fi
-  # Ensure LaunchAgent is loaded so launchd will respawn on next login.
-  if [[ -f "$PLIST_PATH" ]]; then
-    launchctl load "$PLIST_PATH" 2>/dev/null || true
+  # If a job is loaded but not actually running (e.g. it exited 0 and KeepAlive
+  # left it down, or `launchctl load` no-op'd because it was already loaded but
+  # stopped), kick it. `kickstart` (no -k) starts a stopped job; we gate on
+  # liveness so a healthy poller is never force-restarted.
+  local uid
+  uid=$(id -u)
+  if ! _poller_alive; then
+    launchctl kickstart "gui/$uid/$PLIST_LABEL" 2>/dev/null || true
   fi
-  "$START_SCRIPT"
+  if ! _watchdog_alive; then
+    launchctl kickstart "gui/$uid/$WATCHDOG_LABEL" 2>/dev/null || true
+  fi
+  echo "Started agent (launchd: $PLIST_LABEL + $WATCHDOG_LABEL)."
 }
 
 cmd_stop() {
-  # v0 sessions: harmless no-ops in Phase 4 (sessions don't exist).
-  tmux kill-session -t "$TMUX_SESSION_CLAUDE" 2>/dev/null || true
-  tmux kill-session -t "$TMUX_SESSION_WATCHDOG" 2>/dev/null || true
+  # P6c: launchd-direct. Boot out BOTH jobs. `launchctl unload` removes the job
+  # (disabling KeepAlive so the poller won't be respawned) AND sends SIGTERM to
+  # the running process — letting the poller's shutdown handler flush each
+  # daemon's JSONL + release its ~/.claude/tasks/<uuid>/.lock cleanly. Unload
+  # the poller FIRST: doing it before the belt-and-suspenders SIGTERM below
+  # means a still-running poller can't be respawned by KeepAlive mid-shutdown.
+  local plist
+  for plist in "$PLIST_PATH" "$WATCHDOG_PLIST_PATH"; do
+    if [[ -f "$plist" ]]; then
+      launchctl unload "$plist" 2>/dev/null || true
+    fi
+  done
 
-  # Phase 4 (2026-05-19): the poller owns one long-lived claude daemon per
-  # active topic via ClaudeDaemonRegistry. SIGTERM the poller process FIRST
-  # so its shutdown handler can send SIGTERM to each daemon — giving claude
-  # a chance to flush JSONL writes and release its per-session lock file at
-  # ~/.claude/tasks/<uuid>/.lock cleanly. Without this, the next `cta start`
-  # respawns daemons that crash with "Session ID X already in use" because
-  # the lock fd survived process kill via tmux teardown.
-  # Match only `bun … /agent/poller/poller.ts` as the LAST argv element so
-  # `bun test agent/poller/poller.ts` (a dev's running test) doesn't get
-  # SIGTERM'd. pgrep on macOS supports POSIX regex; anchor with `$`.
+  # Belt-and-suspenders: if a poller is still alive (started outside launchd, or
+  # unload's SIGTERM raced), SIGTERM it and wait for a graceful exit. Match only
+  # `bun … /agent/poller/poller.ts` as the LAST argv element so a dev's
+  # `bun test agent/poller/poller.ts` isn't signalled. pgrep on macOS supports
+  # POSIX regex; anchor with `$`.
   local poller_pids
   poller_pids=$(pgrep -f 'bun .*/agent/poller/poller\.ts$' 2>/dev/null || true)
   if [[ -n "$poller_pids" ]]; then
-    # SIGTERM signals our async handler. shutdown() awaits each daemon's
-    # close event with a 5s SIGKILL escalation, so 8s is the upper bound.
-    # Run kill in a subshell so a stray race doesn't fail the whole cmd.
+    # shutdown() awaits each daemon's close with a 5s SIGKILL escalation, so 8s
+    # is the upper bound. Run kill loosely so a race can't fail the whole cmd.
     while IFS= read -r pid; do
       kill -TERM "$pid" 2>/dev/null || true
     done <<< "$poller_pids"
-    # Brief poll: wait up to 8s for the poller(s) to exit gracefully.
     local waited=0
     while [[ "$waited" -lt 80 ]]; do
       if ! pgrep -f 'bun .*/agent/poller/poller\.ts' >/dev/null 2>&1; then break; fi
@@ -339,34 +350,13 @@ cmd_stop() {
     done
   fi
 
-  tmux kill-session -t "poller" 2>/dev/null || true
-  # Kill any leftover helper-<id> or pre-Phase-4 topic-<id> sessions.
-  # tmux list-sessions exits non-zero when the server isn't running, so
-  # guard with 2>/dev/null.
-  local leftover_sessions
-  leftover_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-    | awk '/^topic-|^helper-/' || true)
-  if [[ -n "$leftover_sessions" ]]; then
-    local sess
-    while IFS= read -r sess; do
-      [[ -z "$sess" ]] && continue
-      tmux kill-session -t "$sess" 2>/dev/null || true
-    done <<< "$leftover_sessions"
-  fi
-
-  # Clean up the bun MCP grandchildren the official telegram plugin spawned.
-  # Process tree:  claude → bun (wrapper, --cwd .../telegram ...) → bun server.ts
-  # Killing the tmux session only kills the claude. bun reparents to launchd
-  # and keeps long-polling Telegram's getUpdates. The next `cta start` spawns
-  # a fresh bun — now TWO consumers race for getUpdates, and ~half of inbound
-  # messages go to the orphan with no claude listening, getting silently
-  # dropped. Targeted by command-line match against the plugin path so we
-  # never kill unrelated `bun server.ts` processes the user might run.
+  # Clean up the bun MCP grandchildren a legacy (pre-P4) telegram plugin install
+  # may have spawned. They reparent to launchd and keep long-polling getUpdates;
+  # the next `cta start` would then race two getUpdates consumers and silently
+  # drop ~half of inbound messages. Targeted by command-line match against the
+  # plugin path so we never kill an unrelated `bun server.ts` the user runs.
   _kill_plugin_bun
-  if [[ -f "$PLIST_PATH" ]]; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-  fi
-  echo "Stopped agent (tmux + plugin MCP + LaunchAgent)."
+  echo "Stopped agent (launchd: $PLIST_LABEL + $WATCHDOG_LABEL + plugin MCP)."
 }
 
 # Kill the telegram plugin's bun wrapper + its server.ts child, but nothing
@@ -851,17 +841,10 @@ cmd_mount() {
   local rc=$?
   [[ "$rc" -ne 0 ]] && exit "$rc"
 
-  local tmux_session
-  tmux_session=$(echo "$mount_json" | jq -r '.tmux_session')
-
-  # Phase 4: no per-topic tmux session is spawned here. The poller hot-reloads
+  # P6c: no per-topic process is spawned here. The poller hot-reloads
   # mounts.json on mtime change and lazy-spawns the ClaudeDaemon on the topic's
-  # first inbound message. If the user replaced a provisional helper-* row,
-  # tear down the live helper tmux session so the daemon path takes over.
-  if [[ "$op" == "replace" ]] && [[ "$tmux_session" == helper-* || "$tmux_session" == topic-* ]]; then
-    tmux kill-session -t "$tmux_session" 2>/dev/null || true
-  fi
-  if tmux has-session -t poller 2>/dev/null; then
+  # first inbound message.
+  if _poller_alive; then
     echo "Mounted thread $thread_id at $abs_path (daemon spawns on next inbound)"
   else
     echo "Mounted thread $thread_id at $abs_path (will route on next 'cta start')"
@@ -892,11 +875,10 @@ cmd_umount() {
     return 0
   fi
 
-  local tmux_session
-  tmux_session=$(echo "$removed" | jq -r '.tmux_session')
-  tmux kill-session -t "$tmux_session" 2>/dev/null && \
-    echo "Unmounted thread $thread_id (killed tmux $tmux_session)" || \
-    echo "Unmounted thread $thread_id (tmux $tmux_session was not running)"
+  # P6c: nothing per-topic to tear down — removing the mounts.json row is
+  # enough. The poller hot-reloads on mtime change and stops routing the thread
+  # (its idle daemon, if any, is reaped by the registry / idle-evict).
+  echo "Unmounted thread $thread_id"
 }
 
 # Look up topic display name from topics.json (poller-maintained cache of
@@ -981,71 +963,16 @@ cmd_list() {
     return
   fi
 
-  printf "%-10s %-20s %-15s %-50s %-12s %s\n" "THREAD" "TOPIC" "LABEL" "PATH" "TMUX" "STATUS"
-  while IFS=$'\t' read -r thread_id label path tmux_session; do
-    local status="dead"
-    tmux has-session -t "$tmux_session" 2>/dev/null && status="alive"
+  # P6c: per-topic daemons live inside the poller — there's no per-topic
+  # process to probe, so the old TMUX + STATUS columns are gone. Overall
+  # liveness is `cta status` (the single poller).
+  printf "%-10s %-20s %-15s %s\n" "THREAD" "TOPIC" "LABEL" "PATH"
+  while IFS=$'\t' read -r thread_id label path; do
     local topic
     topic=$(_topic_name "$thread_id")
-    printf "%-10s %-20s %-15s %-50s %-12s %s\n" \
-      "$thread_id" "${topic:--}" "${label:--}" "$path" "$tmux_session" "$status"
-  done < <(echo "$raw" | jq -r '.mounts[] | [.thread_id, .label // "", .path, .tmux_session] | @tsv')
-}
-
-# `cta bind` — called from inside a running claude session (via the
-# bind-telegram-topic skill or directly in a tmux pane). Captures the
-# current tmux session name + pane cwd and writes a mounts.json entry so
-# the poller routes <thread_id>'s messages into this very claude.
-#
-# Hard requirement: $TMUX must be set. We can't pipe stdin into a claude
-# running in a bare terminal — same locking constraint that makes
-# --session-id collide with active sessions.
-cmd_bind() {
-  local thread_id="${1:-}"
-  local label="${2:-}"
-  if [[ -z "$thread_id" ]]; then
-    echo "Usage: cta bind <thread_id|dm> [label]" >&2
-    echo "Run this from inside the tmux session you want to bind." >&2
-    exit 1
-  fi
-  if [[ -z "${TMUX:-}" ]]; then
-    echo "cta bind: not in a tmux session (\$TMUX is unset)." >&2
-    echo "Open this claude inside tmux and re-run, or use 'cta mount <thread_id> <path>'." >&2
-    exit 1
-  fi
-
-  local current_session pane_cwd
-  current_session=$(tmux display-message -p '#S' 2>/dev/null || true)
-  pane_cwd=$(tmux display-message -p '#{pane_current_path}' 2>/dev/null || true)
-  if [[ -z "$current_session" || -z "$pane_cwd" ]]; then
-    echo "cta bind: tmux display-message returned nothing (broken tmux env?)" >&2
-    exit 1
-  fi
-  if [[ ! -d "$pane_cwd" ]]; then
-    echo "cta bind: pane cwd '$pane_cwd' is not a directory" >&2
-    exit 1
-  fi
-
-  local store
-  store=$(_mount_store_path)
-  if [[ ! -f "$store" ]]; then
-    echo "cta bind: mount-store not installed at $store — rerun install.sh" >&2
-    exit 1
-  fi
-
-  # bind PINs the *current* tmux session name (whatever the user named
-  # theirs) so the poller dispatches into the live claude instead of
-  # spawning a fresh topic-<id> wrapper. mount-store's `add` accepts an
-  # optional 4th arg that overrides the default tmux_session.
-  local mount_json
-  mount_json=$(bun run "$store" add "$thread_id" "$pane_cwd" "${label:-}" "$current_session")
-  local rc=$?
-  if [[ "$rc" -ne 0 ]]; then exit "$rc"; fi
-
-  echo "Bound thread $thread_id → tmux $current_session (cwd: $pane_cwd)"
-  echo "Future messages in thread $thread_id will be sent into this pane."
-  echo "Note: this pane already has a claude running. cta does NOT respawn it;"
-  echo "      messages will land via tmux send-keys into the existing prompt."
+    printf "%-10s %-20s %-15s %s\n" \
+      "$thread_id" "${topic:--}" "${label:--}" "$path"
+  done < <(echo "$raw" | jq -r '.mounts[] | [.thread_id, .label // "", .path] | @tsv')
 }
 
 # `cta watch <thread>` — print the current pane content of a topic's
@@ -1647,8 +1574,7 @@ cmd_init() {
   # ─── Step 3: first inbound ────────────────────────────────────────────────
   echo
   echo "Step 3/5  first inbound message"
-  if ! tmux has-session -t poller 2>/dev/null \
-     && ! pgrep -f 'bun .*/agent/poller/poller\.ts$' >/dev/null 2>&1; then
+  if ! _poller_alive; then
     echo "  starting the poller…"
     if ! cmd_start >/dev/null 2>&1; then
       echo "  ⚠ poller failed to start. Run 'cta start' manually and check logs:" >&2
@@ -1660,8 +1586,7 @@ cmd_init() {
     # Verify the poller actually came up — cmd_start can succeed superficially
     # (launchctl loaded) while bun never bound. Without this check the wizard
     # spins for 5 minutes on _init_wait_for_inbound watching nothing happen.
-    if ! tmux has-session -t poller 2>/dev/null \
-       && ! pgrep -f 'bun .*/agent/poller/poller\.ts$' >/dev/null 2>&1; then
+    if ! _poller_alive; then
       echo "  ⚠ poller didn't come up after cmd_start. Likely causes:" >&2
       echo "     - missing TELEGRAM_BOT_TOKEN in ~/.claude/channels/telegram/.env" >&2
       echo "     - bun not on PATH" >&2
@@ -1769,14 +1694,13 @@ cta — claude-telegram-agent CLI
 
 Usage:
   cta status [--json]             Show agent health (text by default, JSON for tooling)
-  cta start                       Load LaunchAgent + spawn tmux sessions
-  cta stop                        Kill tmux sessions + unload LaunchAgent
+  cta start                       Load the LaunchAgents (poller + watchdog)
+  cta stop                        Boot out the LaunchAgents (poller + watchdog)
   cta mount <thread> <path>       Mount a project dir at a Telegram thread (or "dm")
-  cta umount <thread>             Unmount; kill the topic's tmux session
+  cta umount <thread>             Unmount a thread (stops routing it)
   cta list [--json]               List current mounts
-  cta bind <thread>               Bind the CURRENT tmux session to a thread (run from inside claude)
-  cta watch <thread> [--lines N] [--ansi] [--follow|-f]
-                                  Print the current pane content of a topic; --follow tails the per-topic log
+  cta watch <thread> [--lines N] [--ansi]
+                                  Print the topic's recent session transcript
   cta send <thread> <text...>     Deliver text into a topic's claude daemon (Pager watch-live input)
   cta pair-code [--init|--reset]  Show / generate the one-time Telegram pairing code
   cta pair <chat_id> [user_id]    Host-driven pairing (skip the Telegram round-trip)
@@ -1789,11 +1713,11 @@ Usage:
   cta open <thread>               Open a TUI for a topic (β handoff — daemon yields, claude --resume)
   cta help                        This message
 
-Reads ~/.pager/.env (CTA_STATE_DIR-overridable) for configurable tmux session names.
+Reads ~/.pager/.env (CTA_STATE_DIR-overridable) for configurable settings.
 
 Pager and any other UI should call \`cta status --json\` rather than greping
-\`ps\` / \`tmux ls\` / \`launchctl list\` directly. Schema is versioned; see
-the header of this script for the contract.
+\`ps\` / \`launchctl list\` directly. Schema is versioned; see the header of
+this script for the contract.
 EOF
 }
 
@@ -1813,7 +1737,6 @@ main() {
     mount) cmd_mount "$@" ;;
     umount) cmd_umount "$@" ;;
     list)  cmd_list "$@" ;;
-    bind) cmd_bind "$@" ;;
     watch) cmd_watch "$@" ;;
     send) cmd_send "$@" ;;
     pair-code) cmd_pair_code "$@" ;;
