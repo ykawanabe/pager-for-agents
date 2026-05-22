@@ -83,9 +83,9 @@ struct SetupWizardView: View {
             Spacer()
             if granted != true {
                 Button("Grant…") {
-                    // Reveal bun (hidden ~/.bun path) THEN open the pane, so the
-                    // user has the binary ready to drag into the FDA list.
-                    FullDiskAccess.revealBunInFinder()
+                    // Reveal Claude Pager.app THEN open the pane, so the user has
+                    // the app ready to drag into the Full Disk Access list.
+                    FullDiskAccess.revealPagerAppInFinder()
                     FullDiskAccess.openSettings()
                 }
             }
@@ -97,7 +97,7 @@ struct SetupWizardView: View {
         case .some(true):
             return "Full Disk Access granted — the bot can work in protected folders."
         case .some(false):
-            return "To work in Documents / Desktop / Downloads / iCloud, grant `bun` Full Disk Access (not needed if your projects live in ~/ghq etc.)."
+            return "To work in Documents / Desktop / Downloads / iCloud, add Claude Pager to Full Disk Access (not needed if your projects live in ~/ghq etc.)."
         case .none:
             return "Unknown — will show once the agent has been updated."
         }

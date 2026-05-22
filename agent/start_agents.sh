@@ -103,7 +103,21 @@ main() {
   # this very process: when the poller exits non-zero, KeepAlive respawns it.
   touch "$LOG_FILE"
   chmod 600 "$LOG_FILE" 2>/dev/null || true
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] start_agents: exec poller ($poller_path)" >> "$LOG_FILE"
+
+  # Run the poller through Claude Pager.app's launcher when present, so macOS
+  # attributes the poller's file access to com.claude-pager — the Full Disk
+  # Access list shows "Claude Pager" (a recognizable, already-known app) instead
+  # of the bare "bun", and the grant persists across updates (stable bundle id).
+  # The launcher (`ClaudePager --agent-launcher`) spawns `bun poller.ts` as a
+  # CHILD that inherits the bundle's TCC identity (verified). bun stays on $PATH
+  # — nothing third-party is bundled. Falls back to plain bun if Pager.app isn't
+  # installed (agent-only install / before a Pager build).
+  local pager_launcher="$HOME/Applications/Claude Pager.app/Contents/MacOS/ClaudePager"
+  if [[ -x "$pager_launcher" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] start_agents: exec poller via Claude Pager.app launcher ($poller_path)" >> "$LOG_FILE"
+    exec "$pager_launcher" --agent-launcher "$poller_path" >> "$LOG_FILE" 2>&1
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] start_agents: exec poller via bun ($poller_path)" >> "$LOG_FILE"
   exec bun "$poller_path" >> "$LOG_FILE" 2>&1
 }
 
