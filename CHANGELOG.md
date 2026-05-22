@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Changed
+- **No more `tmux`.** The agent runs as two `launchd` jobs — the poller and a watchdog — launched directly. No `tmux` sessions to crash, detach, or trip Full Disk Access prompts; `cta status` / `cta start` / `cta stop` manage them.
+- **Full Disk Access now shows up as "Claude Pager."** The poller is launched through the menu bar app, so the recurring "bun wants to access your files" prompts stop — grant Claude Pager once and you're done.
+- **Pager's "Mounts" tab is now "Projects"** — plainer language (each Telegram topic maps to a folder), a stable picker, and a friendlier empty state.
+- Outbound messaging flows through a platform-agnostic `ChatTransport` layer — groundwork for adding Slack/Discord later without touching the core.
+- Retired the outbound MCP server (`mcp-telegram`). Inline buttons now ride a marker Claude emits in its own reply, parsed by the poller, so Claude needs no chat-specific tools.
+- Removed `cta bind` — unneeded now that each topic gets its own long-lived daemon.
 - **Merged the Pager (`claude-telegram-agent-bar`) repo into this one** as the
   `pager/` subdirectory. Pager and the agent ship together, share `cta` as the
   contract, and follow the same release cadence — splitting them was useful
@@ -17,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   via `pager/install.sh` directly.
 
 ### Added
+- Full Disk Access onboarding in Pager (a setup step + a "Grant…" button); `cta status` now reports file-access state.
+- Opt-in idle-session eviction to reclaim RAM — `cta config idle-evict <min>` (or the Pager "Memory" toggle). Quiet topics close and resume on your next message.
 - `docs/index.html` + `docs/site.css` — minimal static landing page for
   GitHub Pages. Inspired by codexbar.app's layout (aurora gradient, hero with
   copy-button install, feature grid, detail blocks). No framework — pure HTML
