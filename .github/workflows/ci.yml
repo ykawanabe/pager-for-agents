@@ -19,9 +19,7 @@ jobs:
             install.sh \
             uninstall.sh \
             cli/cta \
-            agent/restart_claude.sh \
             agent/start_agents.sh \
-            agent/topic-wrapper.sh \
             agent/watch_network.sh \
             scripts/check-no-secrets.sh
 

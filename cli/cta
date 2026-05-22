@@ -45,7 +45,6 @@ WATCHDOG_LABEL="com.claude-watchdog"
 WATCHDOG_PLIST_PATH="$HOME/Library/LaunchAgents/${WATCHDOG_LABEL}.plist"
 BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
 ACCESS_FILE="$HOME/.claude/channels/telegram/access.json"
-START_SCRIPT="$HOME/.local/bin/start_agents.sh"
 
 # State + install dirs. Defaults match agent/lib/paths.ts. Env overrides
 # (CTA_STATE_DIR / CTA_INSTALL_DIR) flow through here so a single shell can
@@ -65,6 +64,7 @@ CAFFEINATE_PID_FILE="$STATE_DIR/caffeinate.pid"
 SETTINGS_FILE="$STATE_DIR/settings.json"
 PAIRING_CODE_FILE="$STATE_DIR/pairing-code"
 PAIRED_STATE_FILE="$STATE_DIR/paired.json"
+# shellcheck disable=SC2034  # not read by cta directly; kept as a state-path the tests/test_cta.sh guard verifies resolves from $STATE_DIR
 MOUNTS_FILE="$STATE_DIR/mounts.json"
 TOPICS_FILE="$STATE_DIR/topics.json"
 MOUNT_STORE_TS="$INSTALL_DIR/agent/mount-store/mount-store.ts"

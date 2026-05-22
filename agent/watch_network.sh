@@ -35,7 +35,6 @@ AGENT_LABEL="${AGENT_LABEL:-com.claude-agent}"
 WATCHDOG_STARTUP_GRACE_SECS=60
 
 STATE_DIR="${CTA_STATE_DIR:-$HOME/.pager}"
-INSTALL_DIR="${CTA_INSTALL_DIR:-$HOME/.local/share/pager}"
 
 # Heartbeat staleness threshold in seconds. Poller touches heartbeat every
 # getUpdates cycle (~25-30s under normal long-poll). 120s = ~4 missed cycles,
