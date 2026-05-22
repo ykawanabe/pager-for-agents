@@ -52,31 +52,23 @@ h_setup_sandbox() {
   SCENARIO_DIR=$(mktemp -d "/tmp/e2e-${name}.XXXXXX")
   export CTA_STATE_DIR="$SCENARIO_DIR/state"
   export CTA_INSTALL_DIR="$SCENARIO_DIR/install"
-  mkdir -p "$CTA_STATE_DIR" "$CTA_INSTALL_DIR/agent/poller" "$CTA_INSTALL_DIR/agent/mount-store" "$CTA_INSTALL_DIR/agent/lib" "$CTA_INSTALL_DIR/agent/channels/telegram"
+  mkdir -p "$CTA_STATE_DIR" "$CTA_INSTALL_DIR/agent"
 
   # Mirror agent sources into the install dir so the poller and friends
   # resolve their helpers under the standard $CTA_INSTALL_DIR layout.
-  cp "$REPO_DIR/agent/poller/poller.ts" "$CTA_INSTALL_DIR/agent/poller/"
-  # Phase 4 modules poller.ts imports — without these the poller crashes on
-  # startup ("Cannot find module './slash-commands'") and never polls.
-  cp "$REPO_DIR/agent/poller/slash-commands.ts" "$CTA_INSTALL_DIR/agent/poller/"
-  cp "$REPO_DIR/agent/poller/claude-daemon.ts" "$CTA_INSTALL_DIR/agent/poller/"
-  cp "$REPO_DIR/agent/poller/claude-daemon-registry.ts" "$CTA_INSTALL_DIR/agent/poller/"
-  cp "$REPO_DIR/agent/poller/buttons-marker.ts" "$CTA_INSTALL_DIR/agent/poller/"
-  cp "$REPO_DIR/agent/poller/watch-render.ts" "$CTA_INSTALL_DIR/agent/poller/"
-  # Chat-channel modules (ChatTransport migration). poller.ts imports the wire
-  # adapter (P1) + the TelegramTransport (P3) which pulls in the core types —
-  # without these copies the sandboxed poller crashes on startup ("Cannot find
-  # module") and never polls.
-  cp "$REPO_DIR/agent/channels/types.ts" "$CTA_INSTALL_DIR/agent/channels/"
-  cp "$REPO_DIR/agent/channels/telegram/adapter.ts" \
-     "$REPO_DIR/agent/channels/telegram/transport.ts" \
-     "$REPO_DIR/agent/channels/telegram/typing-keepalive.ts" \
-     "$CTA_INSTALL_DIR/agent/channels/telegram/"
-  cp "$REPO_DIR/agent/poller/package.json" "$CTA_INSTALL_DIR/agent/poller/"
-  cp "$REPO_DIR/agent/mount-store/mount-store.ts" "$CTA_INSTALL_DIR/agent/mount-store/"
-  cp "$REPO_DIR/agent/mount-store/package.json" "$CTA_INSTALL_DIR/agent/mount-store/"
-  cp "$REPO_DIR/agent/lib/paths.ts" "$CTA_INSTALL_DIR/agent/lib/"
+  #
+  # Copy whole source dirs, NOT a hand-picked file list. poller.ts's import
+  # graph stays entirely within these four dirs (verified: only ./,
+  # ../channels, ../mount-store, ../lib imports). A cherry-picked cp list
+  # silently broke ALL e2e twice — when P4 added buttons-marker.ts, then
+  # again when the FDA work added file-access-probe.ts — because CI never
+  # runs e2e to catch the drift. Directory copies are self-maintaining: a
+  # new sibling import can't desync the sandbox. Dirs hold no node_modules
+  # and total <400K, so the copy stays cheap.
+  cp -R "$REPO_DIR/agent/poller" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/mount-store" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/lib" "$CTA_INSTALL_DIR/agent/"
+  cp -R "$REPO_DIR/agent/channels" "$CTA_INSTALL_DIR/agent/"
 
   # Plugin .env (the canonical TELEGRAM_BOT_TOKEN source).
   mkdir -p "$SCENARIO_DIR/plugin"
