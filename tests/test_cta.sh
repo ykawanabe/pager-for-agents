@@ -437,6 +437,62 @@ _caffeinate_alive && ok "_caffeinate_alive: live PID (self) → alive" \
 
 rm -f "$CAFFEINATE_PID_FILE"
 
+# ─── _caffeinate_start: lock serializes concurrent starts (no orphan leak) ───
+#
+# Regression guard for the caffeinate-orphan leak. Pager's CaffeinateController
+# fires `cta config caffeinate on` from unserialized tasks on every power-state
+# change; without a lock two concurrent _caffeinate_start calls both pass
+# _caffeinate_alive before either writes the pid file, both spawn, and the loser
+# orphans (ppid 1). _caffeinate_start now takes an atomic mkdir lock around the
+# check-and-spawn. CAFFEINATE_BIN injects a stub so we never touch the real one.
+
+CAFF_TMP=$(mktemp -d)
+CAFFEINATE_PID_FILE="$CAFF_TMP/caffeinate.pid"
+SPAWN_LOG="$CAFF_TMP/spawns"
+cat > "$CAFF_TMP/fake-caffeinate" <<EOF
+#!/bin/bash
+echo spawn >> "$SPAWN_LOG"
+exec sleep 300
+EOF
+chmod +x "$CAFF_TMP/fake-caffeinate"
+export CAFFEINATE_BIN="$CAFF_TMP/fake-caffeinate"
+
+# (a) lock free → spawns exactly once + releases the lock.
+: > "$SPAWN_LOG"
+_caffeinate_start >/dev/null 2>&1
+# Wait (bounded) for the backgrounded stub to record its spawn — a fixed sleep
+# flakes under load (the stub is `nohup … &`, so the write is async).
+for ((w = 0; w < 50; w++)); do [[ -s "$SPAWN_LOG" ]] && break; sleep 0.1; done
+CAFF_SPAWNS=$(wc -l < "$SPAWN_LOG" | tr -d ' ')
+[[ "$CAFF_SPAWNS" == "1" ]] && ok "_caffeinate_start: spawns once when lock free" \
+                            || ng "_caffeinate_start: expected 1 spawn, got $CAFF_SPAWNS"
+[[ ! -d "$CAFFEINATE_PID_FILE.lock" ]] && ok "_caffeinate_start: releases lock on success" \
+                                       || ng "_caffeinate_start: lock dir leaked"
+CAFF_PID=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null)
+
+# (b) already alive → idempotent, no respawn.
+: > "$SPAWN_LOG"
+_caffeinate_start >/dev/null 2>&1
+CAFF_SPAWNS=$(wc -l < "$SPAWN_LOG" | tr -d ' ')
+[[ "$CAFF_SPAWNS" == "0" ]] && ok "_caffeinate_start: idempotent when already alive" \
+                            || ng "_caffeinate_start: respawned despite alive ($CAFF_SPAWNS)"
+
+# (c) lock already held (simulated concurrent caller) → must NOT double-spawn.
+kill "$CAFF_PID" 2>/dev/null; rm -f "$CAFFEINATE_PID_FILE"
+mkdir -p "$CAFFEINATE_PID_FILE.lock"
+: > "$SPAWN_LOG"
+CAFFEINATE_LOCK_TRIES=2 _caffeinate_start >/dev/null 2>&1
+CAFF_SPAWNS=$(wc -l < "$SPAWN_LOG" | tr -d ' ')
+[[ "$CAFF_SPAWNS" == "0" ]] && ok "_caffeinate_start: lock held → no double-spawn" \
+                            || ng "_caffeinate_start: spawned while lock held ($CAFF_SPAWNS)"
+rmdir "$CAFFEINATE_PID_FILE.lock" 2>/dev/null
+
+# Cleanup: kill any stub still alive, drop the seam + temp.
+[[ -n "$CAFF_PID" ]] && kill "$CAFF_PID" 2>/dev/null
+[[ -f "$CAFFEINATE_PID_FILE" ]] && kill "$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null)" 2>/dev/null
+unset CAFFEINATE_BIN CAFFEINATE_LOCK_TRIES
+rm -rf "$CAFF_TMP"
+
 # ─── _config_caffeinate: arg validation ──────────────────────────────────────
 #
 # Don't actually spawn caffeinate in the test — that would race with the

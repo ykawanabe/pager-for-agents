@@ -529,17 +529,36 @@ _caffeinate_alive() {
 # mode: that needs a power-state watcher running continuously and cta is
 # one-shot. Users who want AC-conditional behavior should use Pager.
 _caffeinate_start() {
+  local bin="${CAFFEINATE_BIN:-/usr/bin/caffeinate}"
+  mkdir -p "$(dirname "$CAFFEINATE_PID_FILE")"
+  # Serialize the check-and-spawn across concurrent `cta config caffeinate on`
+  # callers. Pager's CaffeinateController fires this from unserialized tasks on
+  # every power-state change; without a lock two procs both pass
+  # _caffeinate_alive before either writes the pid file, both spawn, and the
+  # loser orphans (ppid 1) and leaks. Atomic `mkdir` is the lock; the bounded
+  # wait keeps a crashed holder from wedging the caller forever (worst case:
+  # caffeinate doesn't turn on this once — the next toggle retries).
+  local lockdir="$CAFFEINATE_PID_FILE.lock" tries="${CAFFEINATE_LOCK_TRIES:-20}" i=0
+  until mkdir "$lockdir" 2>/dev/null; do
+    i=$((i + 1))
+    if (( i >= tries )); then
+      echo "Another caffeinate start is in progress; skipping."
+      return 0
+    fi
+    sleep 0.1
+  done
   if _caffeinate_alive; then
+    rmdir "$lockdir" 2>/dev/null || true
     echo "Already running (pid $(cat "$CAFFEINATE_PID_FILE"))."
     return 0
   fi
-  mkdir -p "$(dirname "$CAFFEINATE_PID_FILE")"
   # nohup + & + disown: caffeinate keeps running after cta exits. setsid would
   # be cleaner but macOS doesn't ship it.
-  nohup /usr/bin/caffeinate -i >/dev/null 2>&1 &
+  nohup "$bin" -i >/dev/null 2>&1 &
   local pid=$!
   disown "$pid" 2>/dev/null || true
   echo "$pid" > "$CAFFEINATE_PID_FILE"
+  rmdir "$lockdir" 2>/dev/null || true
   echo "Started caffeinate -i (pid $pid)."
 }
 
