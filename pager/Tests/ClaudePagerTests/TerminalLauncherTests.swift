@@ -1,25 +1,47 @@
 import XCTest
 @testable import ClaudePager
 
-/// P6c/P6d: the "Poller log" row opens a `tail -f agent.log` Terminal window
-/// (the poller is launchd-direct now, not a tmux session). logTailScript is
-/// the pure command builder; we assert it produces a tail of the path and
-/// shell-quotes it so a path with shell metacharacters can't break out.
+/// P6c/P6d + TCC fix: the "Open in Terminal" rows now write a temp `.command`
+/// file and `open` it (so macOS routes it to the user's default terminal),
+/// instead of driving Terminal.app over AppleScript. Apple Events automation
+/// permission (Claude Pager → Terminal.app) is lost on every rebuild of the
+/// unsigned binary, so the osascript path failed with -1743 after each
+/// reinstall. The pure builders below produce the shell command and the
+/// `.command` body; we assert the command tails/opens correctly and that the
+/// path / thread id are quoted/sanitized so they can't break out of the shell.
 final class TerminalLauncherTests: XCTestCase {
 
-    func test_logTailScript_tailsThePath() {
-        let script = TerminalLauncher.logTailScript(path: "/Users/x/.pager/agent.log")
-        XCTAssertTrue(script.contains("tail -n 200 -f '/Users/x/.pager/agent.log'"),
-                      "expected a single-quoted tail -f of the path; got: \(script)")
-        XCTAssertTrue(script.contains("do script"),
-                      "expected an AppleScript do-script wrapper")
+    func test_logTailCommand_tailsThePath() {
+        let cmd = TerminalLauncher.logTailCommand(path: "/Users/x/.pager/agent.log")
+        XCTAssertEqual(cmd, "tail -n 200 -f '/Users/x/.pager/agent.log'")
     }
 
-    func test_logTailScript_shellQuotesEmbeddedSingleQuote() {
+    func test_logTailCommand_shellQuotesEmbeddedSingleQuote() {
         // A path containing a single quote must be escaped as '\'' so the
         // shell sees the literal quote rather than ending the quoted string.
-        let script = TerminalLauncher.logTailScript(path: "/tmp/we'rd/agent.log")
-        XCTAssertTrue(script.contains("'/tmp/we'\\''rd/agent.log'"),
-                      "single quote in path must be escaped as '\\''; got: \(script)")
+        let cmd = TerminalLauncher.logTailCommand(path: "/tmp/we'rd/agent.log")
+        XCTAssertEqual(cmd, "tail -n 200 -f '/tmp/we'\\''rd/agent.log'")
+    }
+
+    func test_commandFileBody_isBashScriptWithTrailingNewline() {
+        // Mirrors MenuView.openTerminal: a #!/bin/bash script (no `exec`
+        // prefix), the command on its own line, trailing newline so the
+        // .command tab closes cleanly when the command exits.
+        let body = TerminalLauncher.commandFileBody("tail -f '/x'")
+        XCTAssertEqual(body, "#!/bin/bash\ntail -f '/x'\n")
+    }
+
+    func test_openTopicCommand_buildsCtaOpen() {
+        let cmd = TerminalLauncher.openTopicCommand(threadId: "dm",
+                                                    ctaPath: "/Users/x/.local/bin/cta")
+        XCTAssertEqual(cmd, "/Users/x/.local/bin/cta open dm")
+    }
+
+    func test_openTopicCommand_sanitizesThreadId() {
+        // No legitimate thread id contains quotes/backslashes, but strip them
+        // defensively so a crafted mounts.json entry can't inject shell.
+        let cmd = TerminalLauncher.openTopicCommand(threadId: "d\"m\\",
+                                                    ctaPath: "/bin/cta")
+        XCTAssertEqual(cmd, "/bin/cta open dm")
     }
 }
