@@ -98,6 +98,7 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `cta list` | Same as `/list` but in your terminal |
 | `cta mount <thread> <path>` | Same as `/mount` but in your terminal |
 | `cta config idle-evict <min>` | Evict idle Claude sessions after N minutes to free RAM (`0` = off; default off). Quiet topics are closed and resume on your next message; same knob as the Pager "Memory" toggle. Applies within ~25s, no restart |
+| `cta config interrupt-steer <on\|off>` | Mid-turn steering (`on` by default). When on, a message sent while Claude is working interrupts and redirects it after a ~1.5s debounce. Set `off` to make new messages queue until the current task finishes. Same knob as the Pager "Mid-turn steering" toggle. Applies within ~25s, no restart |
 
 ### Troubleshooting
 

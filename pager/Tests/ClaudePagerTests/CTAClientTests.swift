@@ -209,4 +209,56 @@ final class CTAClientTests: XCTestCase {
         try #"{"version":1}"#.write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
         XCTAssertEqual(CTAClient.idleEvictMinutes(), 0)
     }
+
+    // MARK: - settings.json (interrupt-steer / mid-turn auto-steer)
+
+    func test_interruptOnMessage_readsFromStateDir() throws {
+        let tmp = NSTemporaryDirectory() + "cta-pager-steer-test-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        // Explicit false written by `cta config interrupt-steer off`.
+        try #"{"version":1,"interrupt_on_message":false}"#
+            .write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        XCTAssertFalse(CTAClient.interruptOnMessage(), "explicit false should be read back as false")
+    }
+
+    func test_interruptOnMessage_explicitTrue() throws {
+        let tmp = NSTemporaryDirectory() + "cta-pager-steer-true-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        try #"{"version":1,"interrupt_on_message":true}"#
+            .write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        XCTAssertTrue(CTAClient.interruptOnMessage())
+    }
+
+    func test_interruptOnMessage_missingFileOrKey_defaultsToTrue() throws {
+        let tmp = NSTemporaryDirectory() + "cta-pager-steer-default-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        // No settings.json → default on (matches poller's out-of-box behavior).
+        XCTAssertTrue(CTAClient.interruptOnMessage(), "absent file should default to true")
+        // File present but key absent → still defaults to true.
+        try #"{"version":1,"idle_evict_minutes":30}"#
+            .write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
+        XCTAssertTrue(CTAClient.interruptOnMessage(), "absent key should default to true")
+    }
+
+    func test_interruptOnMessage_coexistsWithIdleEvict() throws {
+        let tmp = NSTemporaryDirectory() + "cta-pager-steer-coexist-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        try #"{"version":1,"idle_evict_minutes":60,"interrupt_on_message":false}"#
+            .write(toFile: "\(tmp)/settings.json", atomically: true, encoding: .utf8)
+        setenv("CTA_STATE_DIR", tmp, 1)
+        defer { unsetenv("CTA_STATE_DIR") }
+        // Both fields decode correctly from the same file.
+        XCTAssertEqual(CTAClient.idleEvictMinutes(), 60)
+        XCTAssertFalse(CTAClient.interruptOnMessage())
+    }
 }

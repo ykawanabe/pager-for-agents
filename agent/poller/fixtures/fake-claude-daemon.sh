@@ -76,6 +76,15 @@ TURN=0
 MODE="${FAKE_CLAUDE_MODE:-echo}"
 
 while IFS= read -r line; do
+  # Graceful in-band interrupt: real claude aborts the running turn and emits a
+  # result(subtype:error_during_execution) WITHOUT dying. Mirror that so tests
+  # can drive a hung turn to turn-end via interrupt() instead of SIGTERM.
+  if [[ "$line" == *'"type":"control_request"'* && "$line" == *'"subtype":"interrupt"'* ]]; then
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"fake"}}\n'
+    printf '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Interrupted by user","total_cost_usd":0.0,"session_id":"fake-session-uuid","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    continue
+  fi
+
   TURN=$((TURN + 1))
 
   text=$(extract_content "$line")

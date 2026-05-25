@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { ClaudeDaemon } from "./claude-daemon";
+import type { TurnEndInfo } from "./claude-daemon";
 
 const FIXTURE = join(import.meta.dir, "fixtures/fake-claude-daemon.sh");
 
@@ -169,6 +170,41 @@ describe("ClaudeDaemon argv composition", () => {
     });
     expect(argv).toContain("--append-system-prompt");
     expect(argv).toContain("be terse");
+  });
+});
+
+describe("ClaudeDaemon interrupt", () => {
+  test("interrupt() ends the in-flight turn without killing the process", async () => {
+    const turnEnds: TurnEndInfo[] = [];
+    const daemon = new ClaudeDaemon({
+      claudeBin: FIXTURE,
+      cwd: "/tmp",
+      env: { FAKE_CLAUDE_MODE: "hang-no-result" },
+    });
+    daemon.on("turn-end", (i) => turnEnds.push(i));
+    await daemon.start();
+    await daemon.send("long task");
+    // hang-no-result posts text but never a result → no turn-end yet.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(turnEnds.length).toBe(0);
+
+    await daemon.interrupt();
+    // The fixture replies with a result → turn-end fires, process stays alive.
+    await waitFor(() => turnEnds.length === 1, 5000);
+    expect(daemon.isAlive).toBe(true);   // isAlive is a GETTER, not a method
+
+    // Same warm process answers the next message.
+    const texts: string[] = [];
+    daemon.on("text", (t) => texts.push(t));
+    await daemon.send("after interrupt");
+    await waitFor(() => texts.some((t) => t.includes("after interrupt")), 5000);
+
+    await daemon.stop("SIGKILL");
+  });
+
+  test("interrupt() throws when the daemon is not running", async () => {
+    const daemon = new ClaudeDaemon({ claudeBin: FIXTURE, cwd: "/tmp" });
+    await expect(daemon.interrupt()).rejects.toThrow();
   });
 });
 

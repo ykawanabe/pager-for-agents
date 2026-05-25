@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **"Mid-turn steering" toggle in Settings.** Mirrors `cta config interrupt-steer on|off`. When on (default), a message sent while Claude is working interrupts and redirects it after a ~1.5s debounce. Turn it off to make new messages wait until the current task finishes. Changes apply within ~25 seconds without restarting the agent.
+
 ## [0.1.0] - 2026-05-12
 
 First tagged release. Pairs with [claude-telegram-agent v0.1.0](https://github.com/ykawanabe/pager-for-agents/releases/tag/v0.1.0).

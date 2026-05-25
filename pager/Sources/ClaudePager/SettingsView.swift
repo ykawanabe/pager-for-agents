@@ -184,6 +184,10 @@ private struct PagerTab: View {
     private let idleEvictPresets = [15, 30, 60, 120]
     private let defaultIdleEvictMinutes = 30
 
+    // Mid-turn auto-steer is also agent state (settings.json via cta). Default
+    // true — mirrors the poller's out-of-box default.
+    @State private var interruptSteer: Bool = true
+
     var body: some View {
         Form {
             Section {
@@ -255,9 +259,25 @@ private struct PagerTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                Toggle("Steer running tasks", isOn: Binding(
+                    get: { interruptSteer },
+                    set: { on in setInterruptSteerSetting(on) }
+                ))
+            } header: {
+                Text("Mid-turn steering")
+            } footer: {
+                Text("A message sent while Claude is working interrupts and redirects it. Turn this off to make new messages wait until the current task finishes (legacy behavior). Changes apply within ~25 seconds without restarting the agent.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-        .onAppear { reloadIdleEvict() }
+        .onAppear {
+            reloadIdleEvict()
+            reloadInterruptSteer()
+        }
     }
 
     /// Load the current idle-eviction threshold from settings.json (off main).
@@ -289,6 +309,30 @@ private struct PagerTab: View {
             return h == 1 ? "1 hour" : "\(h) hours"
         }
         return "\(minutes) min"
+    }
+
+    /// Load the current interrupt-steer setting from settings.json (off main).
+    private func reloadInterruptSteer() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let on = CTAClient.interruptOnMessage()
+            DispatchQueue.main.async { interruptSteer = on }
+        }
+    }
+
+    /// Persist the interrupt-steer setting via `cta config interrupt-steer`
+    /// (off main). Updates local state immediately for a responsive toggle; the
+    /// poller catches up within a poll loop. On failure, re-read so the UI
+    /// reflects reality.
+    private func setInterruptSteerSetting(_ on: Bool) {
+        interruptSteer = on
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                _ = try CTAClient.setInterruptSteer(on)
+            } catch {
+                let actual = CTAClient.interruptOnMessage()
+                DispatchQueue.main.async { interruptSteer = actual }
+            }
+        }
     }
 
     /// Same three-state model as the menu label, written for the longer

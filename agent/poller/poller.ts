@@ -195,6 +195,12 @@ let pairedMtimeMs = 0;
 // settings.json each poll loop. 0 unless the operator opts in via
 // `cta config idle-evict <min>` (the Pager "Memory" toggle).
 let idleEvictMinutes = 0;
+// Mid-turn auto-steer: when a message arrives during an in-flight turn, the
+// registry debounces then gracefully interrupts so the batched messages flow
+// into the next turn. Default ON; operator opt-out via
+// `cta config interrupt-steer off` (the Pager steering toggle). Live-reloaded
+// from settings.json each poll loop, same path as idle_evict_minutes.
+let interruptOnMessage = true;
 let settingsMtimeMs = 0;
 // Idle-clear tuning. When an idle topic's transcript exceeds this many bytes,
 // the idle sweep flushes durable memory then rotates the session UUID (a real
@@ -249,10 +255,15 @@ function refreshSettingsIfChanged(): void {
     let next = 0;
     if (mtimeMs !== 0) {
       const raw = readFileSync(SETTINGS_FILE, "utf8");
-      const parsed = JSON.parse(raw) as { version?: number; idle_evict_minutes?: number };
+      const parsed = JSON.parse(raw) as { version?: number; idle_evict_minutes?: number; interrupt_on_message?: boolean };
       if (parsed.version !== 1) throw new Error("settings.json: unknown version");
       const n = Number(parsed.idle_evict_minutes ?? 0);
       next = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+      const steer = parsed.interrupt_on_message;
+      if (typeof steer === "boolean" && steer !== interruptOnMessage) {
+        interruptOnMessage = steer;
+        process.stdout.write(`[${new Date().toISOString()}] settings reloaded: interrupt_on_message=${interruptOnMessage}\n`);
+      }
     }
     settingsMtimeMs = mtimeMs;
     if (next !== idleEvictMinutes) {
@@ -642,6 +653,11 @@ function initDaemonRegistry(): void {
     // registry defaults to "claude".
     claudeBin: process.env.PAGER_CLAUDE_BIN || undefined,
     daemonOptsFor: buildDaemonOpts,
+    // Mid-turn auto-steer: read interruptOnMessage live so the settings reload
+    // takes effect without reconstructing the registry. Default debounce 1500ms;
+    // overridable via PAGER_INTERRUPT_DEBOUNCE_MS for e2e tests (fast scenarios).
+    autoSteerEnabled: () => interruptOnMessage,
+    interruptDebounceMs: Number(process.env.PAGER_INTERRUPT_DEBOUNCE_MS ?? "1500"),
     onText: postTelegramTextFromDaemon,
     onFlush: onDaemonFlush,
     onTurnEnd: onDaemonTurnEnd,
@@ -1328,9 +1344,12 @@ async function handleRestartCmd(msg: TgMessage): Promise<void> {
  * running turn is dropped. Idempotent: replies "Nothing running to stop." when
  * no turn is in-flight.
  *
- * v1 is kill-and-respawn (registry.stopTurn → SIGTERM→SIGKILL the subprocess,
- * lazy respawn on the next message). The raw stream-json CLI has no in-band
- * interrupt, so there is no "graceful leave-it-alive" path yet (CLI v2.1.148).
+ * registry.stopTurn is graceful by default: it sends an in-band interrupt over
+ * the daemon's stdin (stream-json control_request, verified claude v2.1.150) so
+ * the subprocess STAYS ALIVE and the session continues — claude ends the current
+ * turn and the next message reuses the warm daemon. It falls back to
+ * SIGTERM→SIGKILL kill + lazy respawn only when the daemon/stdin is unavailable
+ * or the interrupt write fails. The queue is preserved across the stop.
  */
 async function handleStop(msg: TgMessage): Promise<void> {
   const chat_id = msg.chat.id;

@@ -404,13 +404,14 @@ cmd_config() {
     ack)        _config_ack "${1:-}" ;;
     caffeinate) _config_caffeinate "${1:-}" ;;
     idle-evict) _config_idle_evict "${1:-}" ;;
+    interrupt-steer) _config_interrupt_steer "${1:-}" ;;
     "")
-      echo "Usage: cta config <ack|caffeinate|idle-evict> <value>" >&2
+      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer> <value>" >&2
       return 1
       ;;
     *)
       echo "Unknown config subcommand: $sub" >&2
-      echo "Usage: cta config <ack|caffeinate|idle-evict> <value>" >&2
+      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer> <value>" >&2
       return 1
       ;;
   esac
@@ -509,6 +510,67 @@ PY
     echo "idle eviction: off"
   else
     echo "idle eviction: ${val} min (live — applies within ~25s, no restart)"
+  fi
+}
+
+# Mid-turn auto-steer toggle. When ON (the default), a message sent during an
+# in-flight turn debounces then gracefully interrupts the running turn so the
+# batched messages flow into the next turn. OFF holds mid-turn messages until
+# the turn ends (legacy behavior). Lives in $STATE_DIR/settings.json, which the
+# poller live-reloads each poll loop — change applies within ~25s, no restart.
+# With no value, prints the current setting (defaults to "on" when unset).
+# Mirrors _config_idle_evict's JSON-merge so other settings keys survive.
+_config_interrupt_steer() {
+  local val="${1:-}"
+  # No value → print the current setting ("on" unless explicitly disabled).
+  if [[ -z "$val" ]]; then
+    if [[ -f "$SETTINGS_FILE" ]]; then
+      python3 - "$SETTINGS_FILE" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    print("on" if data.get("interrupt_on_message", True) else "off")
+except Exception:
+    print("on")
+PY
+    else
+      echo on
+    fi
+    return 0
+  fi
+  case "$val" in
+    on|off) ;;
+    *)
+      echo "Invalid value: $val (expected 'on' or 'off')" >&2
+      return 1
+      ;;
+  esac
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  python3 - "$SETTINGS_FILE" "$val" <<'PY'
+import json, os, sys
+path, val = sys.argv[1], sys.argv[2]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+data["version"] = 1
+data["interrupt_on_message"] = (val == "on")
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+  chmod 600 "$SETTINGS_FILE"
+  if [[ "$val" == "on" ]]; then
+    echo "mid-turn steering: on (live — applies within ~25s, no restart)"
+  else
+    echo "mid-turn steering: off (live — applies within ~25s, no restart)"
   fi
 }
 
@@ -1736,6 +1798,7 @@ Usage:
   cta unpair [--keep-mounts]      Release the paired chat so you can pair a different one
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
+  cta config interrupt-steer <on|off>  Toggle mid-turn steering (interrupt a running turn)
   cta migrate-state               Move v0.1 ~/.claude-telegram-agent/ → ~/.pager/
   cta init                        First-run setup wizard (token → pair → default mount)
   cta open <thread>               Open a TUI for a topic (β handoff — daemon yields, claude --resume)

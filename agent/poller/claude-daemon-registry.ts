@@ -21,6 +21,15 @@ import { ClaudeDaemon, type ClaudeDaemonOptions, type TurnEndInfo, type CrashInf
 export interface RegistryOptions {
   /** Default 2000ms — collapse messages arriving within this window. */
   debounceMs?: number;
+  /** Default 1500ms — when a message arrives mid-turn and auto-steer is on,
+   *  wait this long (resetting on each further message) before interrupting,
+   *  so a burst of follow-ups collapses into one interrupt. */
+  interruptDebounceMs?: number;
+  /** Returns true if mid-turn messages should auto-interrupt the running turn
+   *  (debounced) rather than holding until turn-end. Read live at arm time so
+   *  the poller's settings reload takes effect without reconstructing the
+   *  registry. Default: always on. */
+  autoSteerEnabled?: () => boolean;
   /** Override the claude binary path (tests inject the fake). */
   claudeBin?: string;
   /** Per-topic daemon options — called lazily to build cwd/uuid/etc. */
@@ -68,6 +77,9 @@ interface DaemonHandle {
   /** Inactivity watchdog for the current inFlight turn (B2). Cleared on
    *  turn-end / crash / release / reset; reset on each text block. */
   inFlightTimer: ReturnType<typeof setTimeout> | null;
+  /** Interrupt-debounce timer for mid-turn auto-steer. Cleared on
+   *  turn-end / crash / release / reset / stop; reset on each mid-turn message. */
+  interruptTimer: ReturnType<typeof setTimeout> | null;
   /** Wall-clock ms of the last activity on this topic (enqueue or turn-end).
    *  Drives the idle sweep (idleCandidates): a topic quiet longer than the
    *  configured threshold becomes eligible for evict (small session) or
@@ -143,6 +155,7 @@ export class ClaudeDaemonRegistry {
         spawnedCount: 0,
         releasedAt: null,
         inFlightTimer: null,
+        interruptTimer: null,
         lastActivityAt: Date.now(),
         stopping: false,
         turnEndResolver: null,
@@ -168,9 +181,15 @@ export class ClaudeDaemonRegistry {
       return;
     }
 
-    // If a turn is in progress, leave the queue alone — turn-end will
-    // re-arm the debounce timer.
-    if (handle.state === "inFlight") return;
+    // If a turn is in progress: with auto-steer on, arm (or reset) an
+    // interrupt-debounce so a single steer fires after the window and a burst
+    // of follow-ups collapses into one interrupt. With it off, hold the queue
+    // until turn-end (legacy behavior).
+    if (handle.state === "inFlight") {
+      const autoSteer = this.opts.autoSteerEnabled ? this.opts.autoSteerEnabled() : true;
+      if (autoSteer) this.armInterruptDebounce(threadId, handle);
+      return;
+    }
 
     this.armDebounce(threadId, handle);
   }
@@ -194,6 +213,10 @@ export class ClaudeDaemonRegistry {
     if (handle.inFlightTimer) {
       clearTimeout(handle.inFlightTimer);
       handle.inFlightTimer = null;
+    }
+    if (handle.interruptTimer) {
+      clearTimeout(handle.interruptTimer);
+      handle.interruptTimer = null;
     }
     if (handle.daemon) {
       // SIGTERM gives claude a chance to close the session lock file
@@ -242,6 +265,10 @@ export class ClaudeDaemonRegistry {
       clearTimeout(handle.inFlightTimer);
       handle.inFlightTimer = null;
     }
+    if (handle.interruptTimer) {
+      clearTimeout(handle.interruptTimer);
+      handle.interruptTimer = null;
+    }
     if (handle.daemon) {
       await handle.daemon.stop("SIGTERM");
     }
@@ -258,28 +285,44 @@ export class ClaudeDaemonRegistry {
    *  (idle/pending/released/crashed/absent) — lets the caller pick the reply
    *  copy ("Stopped." vs "Nothing running to stop.").
    *
-   *  v1 is the reliable fallback (SIGTERM→SIGKILL the subprocess, lazy respawn
-   *  on next message). The raw `claude -p --input-format stream-json` CLI has
-   *  no in-band interrupt control message and SIGINT kills the whole headless
-   *  process (verified 2026-05-22, CLI v2.1.148), so a "leave the subprocess
-   *  alive" graceful path is not available yet. */
+   *  Graceful by default: send an in-band interrupt control message (verified
+   *  claude v2.1.150) so the subprocess STAYS ALIVE and the session continues —
+   *  claude ends the turn (turn-end → idle) and the next message reuses the warm
+   *  daemon. Falls back to SIGTERM→SIGKILL kill + lazy respawn if the daemon /
+   *  stdin is unavailable or the interrupt write fails. The queue is PRESERVED
+   *  across the stop in both paths. */
   async stopTurn(threadId: string): Promise<boolean> {
     const handle = this.handles.get(threadId);
     if (!handle) return false;
     if (handle.state !== "inFlight") return false;
-    this.clearInFlightTimer(handle);
-    if (handle.debounceTimer) {
-      clearTimeout(handle.debounceTimer);
-      handle.debounceTimer = null;
+    if (handle.debounceTimer) { clearTimeout(handle.debounceTimer); handle.debounceTimer = null; }
+    if (handle.interruptTimer) { clearTimeout(handle.interruptTimer); handle.interruptTimer = null; }
+
+    // Graceful path: interrupt over stdin, leave the subprocess alive. The
+    // daemon's turn-end handler transitions inFlight → idle and re-arms the
+    // debounce if the queue is non-empty.
+    //
+    // CRITICAL: do NOT clear the inFlight watchdog (clearInFlightTimer) here.
+    // The graceful interrupt relies on the CLI emitting a result → turn-end.
+    // If the interrupt is acked but no result ever arrives (a hung/old CLI),
+    // the still-armed watchdog (inFlightTimer) is the ONLY thing that recovers
+    // the topic — it kills the wedged daemon → crash → respawn. Clearing it
+    // before interrupting reintroduces the 2026-05-21 stuck-inFlight incident.
+    // turn-end clears the watchdog normally on the happy path.
+    if (handle.daemon) {
+      try {
+        await handle.daemon.interrupt();
+        return true;
+      } catch {
+        // fall through to the kill fallback below
+      }
     }
-    // Mark intentional stop BEFORE awaiting stop() so the on('crash') handler
-    // that fires during teardown takes the clean-stop branch (mirrors how
-    // releaseForTerminal sets "released" before the await).
+
+    // Fallback: SIGTERM + lazy respawn (the pre-graceful behavior). Only here
+    // do we clear the watchdog — the SIGTERM-driven close guarantees recovery.
+    this.clearInFlightTimer(handle);
     handle.stopping = true;
     if (handle.daemon) {
-      // SIGTERM (not SIGKILL): gives claude a chance to release its session
-      // .lock cleanly so the next --resume doesn't refuse with "Session ID
-      // already in use". stop() escalates to SIGKILL after 5s if needed.
       await handle.daemon.stop("SIGTERM");
       handle.daemon = null;
     }
@@ -287,8 +330,6 @@ export class ClaudeDaemonRegistry {
     handle.state = "idle";
     handle.backoffMs = 0;
     handle.lastActivityAt = Date.now();
-    // Preserve the queue: any messages that arrived during the aborted turn
-    // resume processing on the lazy respawn.
     if (handle.queue.length > 0) this.armDebounce(threadId, handle);
     return true;
   }
@@ -304,6 +345,10 @@ export class ClaudeDaemonRegistry {
       if (handle.inFlightTimer) {
         clearTimeout(handle.inFlightTimer);
         handle.inFlightTimer = null;
+      }
+      if (handle.interruptTimer) {
+        clearTimeout(handle.interruptTimer);
+        handle.interruptTimer = null;
       }
       if (handle.daemon) {
         promises.push(handle.daemon.stop("SIGTERM"));
@@ -406,6 +451,21 @@ export class ClaudeDaemonRegistry {
     handle.debounceTimer = setTimeout(() => {
       void this.flush(threadId);
     }, this.opts.debounceMs ?? 2000);
+  }
+
+  /** Mid-turn auto-steer: after interruptDebounceMs of quiet, interrupt the
+   *  running turn so the queued messages flush into the next turn (turn-end
+   *  re-arms the debounce). Resetting on each call collapses bursts. */
+  private armInterruptDebounce(threadId: string, handle: DaemonHandle): void {
+    if (handle.interruptTimer) clearTimeout(handle.interruptTimer);
+    handle.interruptTimer = setTimeout(() => {
+      handle.interruptTimer = null;
+      const h = this.handles.get(threadId);
+      if (!h || h.state !== "inFlight" || !h.daemon) return;   // race: turn already ended
+      void h.daemon.interrupt().catch(() => {
+        // stdin closed mid-flight → the crash/respawn path will flush the queue.
+      });
+    }, this.opts.interruptDebounceMs ?? 1500);
   }
 
   private clearInFlightTimer(handle: DaemonHandle): void {
@@ -528,6 +588,10 @@ export class ClaudeDaemonRegistry {
       // Wake any runTurnAndWait() awaiting THIS turn's end (e.g. the idle
       // memory-flush) before arming the next debounce.
       if (h.turnEndResolver) { const r = h.turnEndResolver; h.turnEndResolver = null; r(); }
+      // Clear any pending interrupt-debounce BEFORE re-arming the next turn's
+      // debounce: a surviving interruptTimer that fires after the queue re-arms
+      // would interrupt the NEXT (unrelated) turn. Order matters here.
+      if (h.interruptTimer) { clearTimeout(h.interruptTimer); h.interruptTimer = null; }
       // If more messages arrived while we were in-flight, arm next debounce.
       if (h.queue.length > 0) this.armDebounce(threadId, h);
     });
@@ -536,6 +600,7 @@ export class ClaudeDaemonRegistry {
       const h = this.handles.get(threadId);
       if (!h) return;
       this.clearInFlightTimer(h);
+      if (h.interruptTimer) { clearTimeout(h.interruptTimer); h.interruptTimer = null; }
       // Drop any runTurnAndWait resolver: the turn it awaited died with the
       // daemon. Leaving it set lets a LATER real turn's turn-end fire this
       // stale resolver → a spurious idle-clear right after the user's reply.

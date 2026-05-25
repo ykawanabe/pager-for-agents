@@ -493,33 +493,29 @@ describe("ClaudeDaemonRegistry stopTurn", () => {
   let reg: ClaudeDaemonRegistry | null = null;
   afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
 
-  test("stopTurn aborts an in-flight turn and returns true; topic stays usable", async () => {
+  test("stopTurn gracefully interrupts: daemon stays warm, topic idle, queue preserved", async () => {
     const texts: string[] = [];
     reg = new ClaudeDaemonRegistry({
       claudeBin: FIXTURE,
       debounceMs: 50,
-      // hang-no-result keeps the fake daemon in-flight: it posts text then
-      // never emits a result event, so the registry stays in "inFlight".
       daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
-      // High watchdog so the inactivity timer never fires during the test.
       inFlightTimeoutMs: 60_000,
       onText: (_t, s) => texts.push(s),
     });
 
     reg.enqueue("topic-42", "long running");
-    await waitFor(() => texts.length >= 1, 5000);          // turn is now in-flight
+    await waitFor(() => texts.length >= 1, 5000);
     expect(reg.getStatus("topic-42")).toBe("inFlight");
 
+    const spawnsBefore = reg.spawnedCount;
     const stopped = await reg.stopTurn("topic-42");
     expect(stopped).toBe(true);
-    expect(reg.getStatus("topic-42")).toBe("idle");        // back to idle, NOT crashed
-    expect(reg.daemonCount).toBe(0);                        // subprocess gone
+    await waitFor(() => reg!.getStatus("topic-42") === "idle", 5000);
+    expect(reg.daemonCount).toBe(1);                 // subprocess SURVIVES (graceful)
 
-    // Session/topic preserved: a new message lazy-respawns and processes.
-    const spawnsBefore = reg.spawnedCount;
     reg.enqueue("topic-42", "after stop");
     await waitFor(() => texts.some((t) => t.includes("after stop")), 5000);
-    expect(reg.spawnedCount).toBe(spawnsBefore + 1);        // respawned, not reused
+    expect(reg.spawnedCount).toBe(spawnsBefore);     // reused warm daemon, NOT respawned
   });
 
   test("stopTurn returns false when nothing is running (idle topic)", async () => {
@@ -561,6 +557,97 @@ describe("ClaudeDaemonRegistry stopTurn", () => {
     expect(await reg.stopTurn("topic-42")).toBe(true);
     // The preserved queue flushes on respawn → the queued message is processed.
     await waitFor(() => texts.some((t) => t.includes("queued during turn")), 5000);
+  });
+
+  test("stopTurn falls back to kill-respawn when the daemon stdin is gone", async () => {
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
+      inFlightTimeoutMs: 60_000,
+      onText: (_t, s) => texts.push(s),
+    });
+    reg.enqueue("topic-42", "long running");
+    await waitFor(() => texts.length >= 1, 5000);
+
+    // Simulate a dead-stdin daemon: force interrupt() to reject.
+    const handle = (reg as any).handles.get("topic-42");
+    handle.daemon.interrupt = async () => { throw new Error("stdin closed"); };
+
+    expect(await reg.stopTurn("topic-42")).toBe(true);
+    await waitFor(() => reg!.getStatus("topic-42") === "idle", 5000);
+    expect(reg.daemonCount).toBe(0);                 // killed (fallback path)
+  });
+});
+
+describe("ClaudeDaemonRegistry auto-steer (mid-turn interrupt)", () => {
+  let reg: ClaudeDaemonRegistry | null = null;
+  afterEach(async () => { if (reg) { await reg.shutdown(); reg = null; } });
+
+  test("a mid-turn message interrupts and is processed in the next turn", async () => {
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      interruptDebounceMs: 100,
+      autoSteerEnabled: () => true,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
+      inFlightTimeoutMs: 60_000,
+      onText: (_t, s) => texts.push(s),
+    });
+    reg.enqueue("topic-42", "browse the site");
+    await waitFor(() => texts.length >= 1, 5000);      // inFlight (hung turn)
+    expect(reg.getStatus("topic-42")).toBe("inFlight");
+
+    reg.enqueue("topic-42", "no, click the other link");  // mid-turn steer
+    // After interruptDebounceMs the registry interrupts → fixture emits result
+    // → turn-end → batched message flushes as the next turn.
+    await waitFor(() => texts.some((t) => t.includes("no, click the other link")), 5000);
+  });
+
+  test("rapid mid-turn messages collapse into ONE interrupt (batched)", async () => {
+    let interruptCount = 0;
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      interruptDebounceMs: 150,
+      autoSteerEnabled: () => true,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
+      inFlightTimeoutMs: 60_000,
+      onText: (_t, s) => texts.push(s),
+    });
+    reg.enqueue("topic-42", "start");
+    await waitFor(() => texts.length >= 1, 5000);
+    const handle = (reg as any).handles.get("topic-42");
+    const realInterrupt = handle.daemon.interrupt.bind(handle.daemon);
+    handle.daemon.interrupt = async () => { interruptCount++; return realInterrupt(); };
+
+    reg.enqueue("topic-42", "msg A");
+    reg.enqueue("topic-42", "msg B");   // resets the interrupt-debounce
+    reg.enqueue("topic-42", "msg C");
+    await waitFor(() => texts.some((t) => t.includes("msg")), 5000);
+    expect(interruptCount).toBe(1);     // one interrupt for the whole burst
+  });
+
+  test("autoSteerEnabled=false keeps the legacy hold-until-turn-end behavior", async () => {
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      interruptDebounceMs: 100,
+      autoSteerEnabled: () => false,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result" } }),
+      inFlightTimeoutMs: 60_000,
+      onText: (_t, s) => texts.push(s),
+    });
+    reg.enqueue("topic-42", "start");
+    await waitFor(() => texts.length >= 1, 5000);
+    reg.enqueue("topic-42", "should NOT interrupt");
+    await new Promise((r) => setTimeout(r, 400));        // > interruptDebounceMs
+    expect(reg.getStatus("topic-42")).toBe("inFlight");  // still hung, no interrupt
+    expect(texts.some((t) => t.includes("should NOT interrupt"))).toBe(false);
   });
 });
 

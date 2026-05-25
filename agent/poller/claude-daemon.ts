@@ -18,6 +18,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 
 export interface TurnEndInfo {
   costUsd: number | null;
@@ -155,6 +156,25 @@ export class ClaudeDaemon extends EventEmitter {
     };
     // Each JSON event is one line — newline terminator separates events.
     const wire = JSON.stringify(event) + "\n";
+    await new Promise<void>((resolve, reject) => {
+      this.proc!.stdin!.write(wire, (err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  /** Gracefully interrupt the in-flight turn via the stream-json control
+   *  protocol. Unlike stop()/SIGTERM, the subprocess stays alive and the
+   *  session continues — claude aborts the current turn and emits a
+   *  result(subtype:error_during_execution). Verified against claude v2.1.150.
+   *  No-op safety: throws if the daemon isn't running (caller decides fallback). */
+  async interrupt(): Promise<void> {
+    if (!this.proc || !this.alive || !this.proc.stdin || this.proc.stdin.destroyed) {
+      throw new Error("ClaudeDaemon is not running — cannot interrupt");
+    }
+    const wire = JSON.stringify({
+      type: "control_request",
+      request_id: randomUUID().slice(0, 8),
+      request: { subtype: "interrupt" },
+    }) + "\n";
     await new Promise<void>((resolve, reject) => {
       this.proc!.stdin!.write(wire, (err) => (err ? reject(err) : resolve()));
     });

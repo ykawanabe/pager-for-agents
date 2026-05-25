@@ -221,6 +221,19 @@ enum CTAClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    /// Enable or disable mid-turn auto-steer — `cta config interrupt-steer
+    /// on|off`. cta writes `interrupt_on_message` into $STATE_DIR/settings.json,
+    /// which the poller live-reloads each poll loop (no restart needed). When on,
+    /// a message sent while Claude is busy interrupts and redirects the running
+    /// turn (debounced); when off, new messages queue until the turn ends (legacy
+    /// behavior). Mirrors setIdleEvict in structure — same error handling and
+    /// threading contract.
+    @discardableResult
+    static func setInterruptSteer(_ on: Bool) throws -> String {
+        let data = try run(args: ["config", "interrupt-steer", on ? "on" : "off"])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     // MARK: - Mounts (Phase 2: per-topic project bindings)
 
     /// Mirrors a single entry in `cta list --json` → `.mounts[]`. thread_id
@@ -397,12 +410,16 @@ enum CTAClient {
 
     /// Mirrors $STATE_DIR/settings.json. Read directly from disk (like
     /// pairedState) because it's a tiny file the UI needs at render time and a
-    /// cta roundtrip isn't worth it. Writes go through `setIdleEvict` — cta
-    /// owns STATE_DIR. `idle_evict_minutes` of 0 / absent = eviction disabled.
+    /// cta roundtrip isn't worth it. Writes go through `setIdleEvict` /
+    /// `setInterruptSteer` — cta owns STATE_DIR. `idle_evict_minutes` of 0 /
+    /// absent = eviction disabled. `interrupt_on_message` absent = on (matches
+    /// the poller's default).
     struct SettingsJSON: Decodable, Equatable {
         let idleEvictMinutes: Int?
+        let interruptOnMessage: Bool?
         enum CodingKeys: String, CodingKey {
             case idleEvictMinutes = "idle_evict_minutes"
+            case interruptOnMessage = "interrupt_on_message"
         }
     }
 
@@ -414,6 +431,17 @@ enum CTAClient {
               let decoded = try? JSONDecoder().decode(SettingsJSON.self, from: data)
         else { return 0 }
         return max(0, decoded.idleEvictMinutes ?? 0)
+    }
+
+    /// Whether mid-turn auto-steer is enabled (default true when the key is
+    /// absent, matching the poller's default). Reads $STATE_DIR/settings.json
+    /// directly — same idiom as idleEvictMinutes().
+    static func interruptOnMessage() -> Bool {
+        let path = "\(stateDir)/settings.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let decoded = try? JSONDecoder().decode(SettingsJSON.self, from: data)
+        else { return true }
+        return decoded.interruptOnMessage ?? true
     }
 
     /// True if the topic's claude daemon appears to be mid-turn, derived from

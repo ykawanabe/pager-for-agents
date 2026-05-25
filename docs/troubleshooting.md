@@ -57,3 +57,11 @@ cta stop      # unloads both LaunchAgents; SIGTERMs the poller + its claude daem
 ```
 
 Bring it all back with `cta start`.
+
+## Mid-turn messages and `/stop`
+
+By default, a message you send while Claude is working will **steer** the running task: the agent waits ~1.5 seconds (in case more messages follow), then interrupts Claude gracefully and processes your new message next. The session and conversation history are preserved — only the in-flight turn is aborted.
+
+- **`/stop`** — explicit halt. Sends the same graceful interrupt and acks "⏹ Stopped."; your next message resumes the same session.
+- **Mid-turn messages are debounced.** If you send several messages in quick succession, only one interrupt fires (after the last message settles). All messages accumulate in the queue and flow into the next turn together.
+- **To disable steering** — so new messages always wait until the current task finishes — run `cta config interrupt-steer off` on the host, or toggle "Mid-turn steering" off in Pager Settings. Re-enable with `cta config interrupt-steer on`. Changes apply within ~25 seconds without restarting the agent.
