@@ -65,7 +65,7 @@ import type {
   TgCallbackQuery,
 } from "../channels/telegram/adapter";
 import { makeTransport } from "../channels/transport-factory";
-import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel } from "../channels/types";
+import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
 
 // ─── ChatTransport (P3 — DI'd) ───────────────────────────────────────────────
 // The poller drives ALL inbound + outbound through the ChatTransport interface,
@@ -1975,24 +1975,31 @@ async function promptMountChoice(thread_id: number | "dm", chat_id: number, thre
   await sendInlineKeyboard(chat_id, "This topic isn't linked to a project yet. Pick one, or send `/mount <path>`:", buttons);
 }
 
-async function dispatchUpdate(u: TgUpdate): Promise<void> {
-  // Auto-pair flow events first — neither requires a paired chat to exist.
-  if (u.my_chat_member) { await handleMyChatMember(u.my_chat_member); return; }
-  if (u.callback_query) { await handleCallbackQuery(u.callback_query); return; }
+/** Topic-name harvest from a normalized topic-created/topic-renamed event. The
+ *  Bot API has no getForumTopic, so we record names opportunistically as the
+ *  forum service messages fly past (Pager shows "topic 42 (Plans)"). The
+ *  normalized event carries the name; chat_id + numeric thread_id come from the
+ *  underlying service message. Runs regardless of pairing/routing (same as the
+ *  pre-normalization harvest that lived inside dispatchUpdate). */
+function recordTopicNameFromEvent(
+  ev: Extract<InboundEvent, { kind: "topic-created" | "topic-renamed" }>,
+): void {
+  const u = ev.raw as TgUpdate;
+  const msg = u.message ?? u.edited_message;
+  if (!msg || msg.message_thread_id == null) return;
+  recordTopicName(msg.chat.id, msg.message_thread_id, ev.name);
+}
 
+// Message dispatch. The onEvent entry (main()) now routes by ev.kind, so
+// membership (joined/removed), button-press (callback_query), and the topic-name
+// harvest (topic-created/topic-renamed) are handled BEFORE this point — this
+// path sees only message-kind updates. Still takes a raw TgUpdate: the synthetic
+// re-inject from the `ans:` button path (handleCallbackQuery) calls it directly,
+// and the command pipeline below is migrated onto the normalized event in a
+// later chunk. `u` is always a plain message update here (u.message set).
+async function dispatchUpdate(u: TgUpdate): Promise<void> {
   const msg = u.message ?? u.edited_message;
   if (!msg) return;
-
-  // Topic-name harvest: forum service messages can pop up at any time and
-  // we want them recorded regardless of whether the chat is paired or the
-  // message is dropped downstream. The Pager UI relies on this opportunistic
-  // capture for the "topic 42 (Plans)" display.
-  if (msg.message_thread_id != null) {
-    const created = msg.forum_topic_created?.name;
-    const edited = msg.forum_topic_edited?.name;
-    const name = created ?? edited;
-    if (name) recordTopicName(msg.chat.id, msg.message_thread_id, name);
-  }
 
   // Commands run first. Pre-pair /pair messages bypass MAIN_CHAT_ID gating
   // (that's the whole point — we don't know the chat yet). Post-pair commands
@@ -2216,17 +2223,36 @@ export async function main(): Promise<void> {
   const housekeepTimer = setInterval(housekeep, 5_000);
 
   // ── Inbound: drive dispatch through the ChatTransport ──────────────────────
-  // P3a: the poller no longer owns the getUpdates loop — TelegramTransport.start()
-  // does, using the SAME offset file + offset-before-dispatch durability
-  // contract. Every telegram-derived event carries the raw TgUpdate, so the
-  // existing dispatchUpdate runs unchanged; only loop ownership moved. (Migrating
-  // dispatchUpdate onto normalized ChatAddress/MessageRef is a later step.)
+  // The poller routes on the normalized event KIND, not by probing raw Telegram
+  // fields — so a second platform rides the same switch. Membership, buttons,
+  // and topic-name harvest are now kind-routed; only the message path still
+  // narrows ev.raw (handleMyChatMember/handleCallbackQuery/dispatchUpdate consume
+  // raw until the next chunks migrate them onto the normalized fields). The
+  // transport owns the getUpdates loop + offset-before-dispatch durability.
   transport.onEvent(async (ev) => {
-    if (ev.kind === "transport-degraded") {
-      process.stderr.write(`poller: transport degraded: ${ev.reason}\n`);
-      return;
+    switch (ev.kind) {
+      case "transport-degraded":
+        process.stderr.write(`poller: transport degraded: ${ev.reason}\n`);
+        return;
+      case "topic-created":
+      case "topic-renamed":
+        recordTopicNameFromEvent(ev);
+        return;
+      case "joined":
+      case "removed": {
+        const mcm = (ev.raw as TgUpdate).my_chat_member;
+        if (mcm) await handleMyChatMember(mcm);
+        return;
+      }
+      case "button-press": {
+        const cb = (ev.raw as TgUpdate).callback_query;
+        if (cb) await handleCallbackQuery(cb);
+        return;
+      }
+      case "message":
+        await dispatchUpdate(ev.raw as TgUpdate);
+        return;
     }
-    await dispatchUpdate(ev.raw as TgUpdate);
   });
   await transport.start({});
   clearInterval(housekeepTimer); // unreachable in steady state (start() blocks)
