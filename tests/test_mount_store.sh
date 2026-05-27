@@ -311,6 +311,40 @@ bun run "$STORE" clear >/dev/null
   && ok "clear: creates mounts.json if absent" \
   || ng "clear: did not create mounts.json"
 
+# ─── opaque-slug ThreadId (Phase 2: Slack et al.) ─────────────────────────────
+# parseThreadId is channel-aware: Telegram stays strict (numeric/dm/*), a
+# non-telegram channel accepts an opaque filename-safe slug. mountKey namespaces
+# by channel so the same raw id never collides across platforms. Driven as a bun
+# unit snippet (the CLI is Telegram-only until Phase 4 wires --channel).
+rm -rf "$STATE" && mkdir -p "$STATE"
+cat > "$STATE/slug_test.ts" <<TS
+import { parseThreadId, mountKey } from "$STORE";
+let bad = 0;
+const eq = (a, b, m) => { if (String(a) !== String(b)) { console.error("MISMATCH " + m + ": " + a + " !== " + b); bad++; } };
+const throwsOn = (fn, m) => { try { fn(); console.error("NO-THROW " + m); bad++; } catch { /* expected */ } };
+// Telegram strict (default + explicit) — unchanged behavior.
+eq(parseThreadId("42"), 42, "tg numeric");
+eq(parseThreadId("dm"), "dm", "tg dm");
+eq(parseThreadId("*"), "*", "tg wildcard");
+throwsOn(() => parseThreadId("abc"), "tg rejects non-numeric");
+throwsOn(() => parseThreadId("T1-C1", "telegram"), "tg rejects slug");
+// Non-telegram opaque slug.
+eq(parseThreadId("T1-C1-1699999999_000100", "slack"), "T1-C1-1699999999_000100", "slack slug round-trip");
+eq(parseThreadId("dm", "slack"), "dm", "slack dm");
+eq(parseThreadId("*", "slack"), "*", "slack wildcard");
+throwsOn(() => parseThreadId("a/b", "slack"), "slack rejects slash");
+throwsOn(() => parseThreadId("a b", "slack"), "slack rejects space");
+// Collision-freedom: same raw "42" under two channels yields distinct keys.
+if (mountKey("slack", "42") === mountKey("telegram", 42)) { console.error("COLLISION slack:42 == telegram:42"); bad++; }
+if (mountKey("slack", "T1-C1-ts") !== "slack:T1-C1-ts") { console.error("BAD slack key shape"); bad++; }
+process.exit(bad === 0 ? 0 : 2);
+TS
+if bun run "$STATE/slug_test.ts" >/dev/null 2>&1; then
+  ok "parseThreadId channel-aware slug + mountKey collision-freedom"
+else
+  ng "parseThreadId channel-aware slug + mountKey collision-freedom"
+fi
+
 # ─── result ─────────────────────────────────────────────────────────────────
 
 echo

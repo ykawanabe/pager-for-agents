@@ -95,7 +95,12 @@ const LOCK_RETRY_MAX = 200; // ~10s total
  *     time so users get reply-everywhere behavior without /mount-ing each
  *     topic. Specific /mount entries override the wildcard.
  */
-export type ThreadId = number | "dm" | "*";
+// The string arm is an opaque per-platform routing slug (Slack/Discord/LINE),
+// emitted by the adapter's routingKey() and NEVER field-parsed here — mount-store
+// treats it as an atomic key. Telegram keeps the numeric topic_id. "dm"/"*" are
+// the cross-platform sentinels. (TS collapses the union to `string | number`; the
+// literals are retained for documentation + Telegram-path readability.)
+export type ThreadId = number | "dm" | "*" | string;
 
 /**
  * Messaging platform identifier. The canonical definition lives in the
@@ -142,19 +147,33 @@ export function mountKey(channel: Channel, thread_id: ThreadId): string {
   return `${channel}:${thread_id}`;
 }
 
+/** Opaque-slug acceptance pattern for non-Telegram channels. Filename-safe by
+ *  construction: no `/` (used in sessions/<key> + release-flag paths). The `__`
+ *  reservation (inject filenames) is the ADAPTER's concern when it composes the
+ *  slug in routingKey() — mount-store only guards the storage boundary. */
+const THREAD_SLUG_RE = /^[A-Za-z0-9._:-]+$/;
+
 /**
- * Parse a CLI-supplied thread_id into our internal ThreadId type. Accepts
- * the literal string "dm" or any positive integer string. Anything else
- * throws — callers should let the error propagate to stderr.
+ * Parse a CLI-supplied thread_id into our internal ThreadId type. Channel-aware:
+ *   - telegram (default): "dm", "*", or a positive integer (strict — catches typos).
+ *   - non-telegram: "dm", "*", or an opaque filename-safe slug (the adapter owns
+ *     its composition; mount-store stores it atomically, never field-parses it).
+ * Anything else throws — callers should let the error propagate to stderr.
  */
-export function parseThreadId(raw: string): ThreadId {
+export function parseThreadId(raw: string, channel: Channel = DEFAULT_CHANNEL): ThreadId {
   if (raw === "dm") return "dm";
   if (raw === "*") return "*";
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
-    throw new Error(`invalid thread_id: ${JSON.stringify(raw)} — expected "dm", "*", or a positive integer`);
+  if (channel === "telegram") {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
+      throw new Error(`invalid thread_id: ${JSON.stringify(raw)} — expected "dm", "*", or a positive integer`);
+    }
+    return n;
   }
-  return n;
+  if (!THREAD_SLUG_RE.test(raw)) {
+    throw new Error(`invalid thread_id: ${JSON.stringify(raw)} — expected "dm", "*", or a slug matching ${THREAD_SLUG_RE} (no "/")`);
+  }
+  return raw;
 }
 
 function threadIdsEqual(a: ThreadId, b: ThreadId): boolean {
