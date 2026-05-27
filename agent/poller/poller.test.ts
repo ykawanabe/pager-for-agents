@@ -357,12 +357,17 @@ describe("bot-added intro (/pair <code> flow)", () => {
     // poller no longer stages pendingPair, so the callback returns the
     // "expired" alert and refuses to pair.
     await poller.handleMyChatMember(botAddedEvent());
-    await poller.handleCallbackQuery({
-      id: "cb1",
-      from: { id: INVITER_ID },
-      message: { chat: { id: CHAT_ID }, message_id: 1 },
-      data: "pair-confirm",
+    const cbEv = normalizeUpdate({
+      update_id: 1,
+      callback_query: {
+        id: "cb1",
+        from: { id: INVITER_ID },
+        message: { chat: { id: CHAT_ID }, message_id: 1 },
+        data: "pair-confirm",
+      },
     });
+    if (cbEv?.kind !== "button-press") throw new Error("test: callback did not normalize to button-press");
+    await poller.onButtonPress(cbEv);
     expect(existsSync(PAIRED_STATE_FILE)).toBe(false);
     expect(callbackAcks.some((a) => a.show_alert === true && a.text?.includes("expired"))).toBe(true);
   });

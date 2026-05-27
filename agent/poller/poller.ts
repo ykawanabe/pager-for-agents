@@ -56,16 +56,16 @@ import {
   getMe,
   setMyCommands,
 } from "../channels/telegram/adapter";
-// Raw Telegram inbound wire types. The poller still consumes TgUpdate directly
-// in P1; P3's cutover replaces these with the normalized InboundEvent.
+// Raw Telegram inbound wire types. After the normalized-event migration the
+// poller consumes these only at the genuinely-Telegram-only edges reached via
+// `ev.raw`: membership status transitions (handleMyChatMember) and the
+// callback_query id/prompt (onButtonPress). TgMessage is re-exported for tests.
 import type {
   TgMessage,
   TgUpdate,
   TgChatMemberUpdated,
-  TgCallbackQuery,
 } from "../channels/telegram/adapter";
 import { makeTransport } from "../channels/transport-factory";
-import { normalizeUpdate } from "../channels/telegram/transport";
 import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
 
 /** The normalized message-kind event the command pipeline consumes (replaces the
@@ -73,6 +73,11 @@ import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, typ
  *  — address (reply target), routingKey (mount/registry key), from.id (auth),
  *  text, messageRef (ack target) — with the original update still on `.raw`. */
 type InboundMessageEvent = Extract<InboundEvent, { kind: "message" }>;
+/** The normalized button-press event (an inline-keyboard tap). Carries the tapped
+ *  callback payload as `label`, plus the same address/routingKey/from/messageRef a
+ *  message event does. Telegram-only callback mechanics (answerCallback's query id,
+ *  the prompt message's text for the inline "↳ choice" echo) are reached via `raw`. */
+type ButtonPressEvent = Extract<InboundEvent, { kind: "button-press" }>;
 
 /** Routing key → mount-store ThreadId. Telegram emits "dm" or a numeric string;
  *  a future platform's opaque slug stays a string (Phase 2 relaxes the consumers
@@ -975,62 +980,67 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
   process.stdout.write(`[${new Date().toISOString()}] pair intro sent: chat=${mcm.chat.id} inviter=${mcm.from.id}${isGroup ? " (group)" : ""}\n`);
 }
 
-export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
-  if (!cb.data) { await answerCallback(cb.id); return; }
+export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
+  // answerCallback (dismiss the tap's spinner) is genuinely Telegram-only — the
+  // normalized event doesn't model it, so reach the query id via raw. cb.message
+  // (the prompt) likewise survives only on raw: we echo its text + drop its
+  // keyboard via editMessageText.
+  const cb = (ev.raw as TgUpdate).callback_query;
+  if (!cb) return; // a button-press event always wraps a Telegram callback_query
+  const data = ev.label;
+  const dest = ev.address;
+  if (!data) { await answerCallback(cb.id); return; }
+  const isPairedUser = !!pairedCache && ev.from.id === String(pairedCache.user_id);
 
-  // Inline-keyboard answer to a send_telegram(buttons=...) prompt. callback_data
-  // shape: `ans:<thread_id>:<label>` (thread_id is "dm" or a numeric forum
-  // topic). We synthesize a TgMessage carrying the label and route it through
-  // the normal dispatch path — claude sees it exactly as if the user had typed
-  // the option text. The paired-user check matches the same enforcement
-  // routeMessage applies to typed messages.
-  if (cb.data.startsWith("ans:")) {
-    if (!pairedCache || cb.from.id !== pairedCache.user_id) {
+  // Inline-keyboard answer to a buttons-marker prompt. callback_data shape:
+  // `ans:<thread_id>:<label>`. We synthesize a normalized message event carrying
+  // the label as text and route it through the SAME onInboundMessage path —
+  // claude sees it exactly as if the user had typed the option. The paired-user
+  // check mirrors routeMessage's enforcement for typed messages.
+  if (data.startsWith("ans:")) {
+    if (!isPairedUser) {
       await answerCallback(cb.id, "Only the paired user can answer.", true);
       return;
     }
     if (!cb.message) { await answerCallback(cb.id); return; }
-    const rest = cb.data.slice(4);
+    const rest = data.slice(4);
     const colonIdx = rest.indexOf(":");
     if (colonIdx < 0) { await answerCallback(cb.id); return; }
-    const tidStr = rest.slice(0, colonIdx);
     const label = rest.slice(colonIdx + 1);
-    const thread_id = tidStr === "dm" ? undefined : Number(tidStr);
     await answerCallback(cb.id);
-    // Immediate visual ack: append the chosen label to the original prompt
-    // and drop the inline keyboard (one editMessageText call does both per
-    // Bot API semantics). User sees "↳ <choice>" the instant they tap, even
-    // while claude is still composing a reply.
+    // Immediate visual ack: append the chosen label to the original prompt and
+    // drop the inline keyboard (one editMessageText does both per Bot API
+    // semantics). User sees "↳ <choice>" the instant they tap.
     const originalText = cb.message.text ?? "";
     void editMessageText(cb.message.chat.id, cb.message.message_id, `${originalText}\n\n↳ ${label}`);
-    await dispatchUpdate({
-      update_id: 0,
-      message: {
-        message_id: cb.message.message_id,
-        from: { id: cb.from.id },
-        chat: { id: cb.message.chat.id },
-        message_thread_id: thread_id,
-        text: label,
-      },
+    // Re-inject the chosen label as the user's next message through the shared
+    // normalized pipeline (replaces the old synthetic-TgUpdate → dispatchUpdate).
+    await onInboundMessage({
+      kind: "message",
+      routingKey: ev.routingKey,
+      address: ev.address,
+      from: ev.from,
+      text: label,
+      messageRef: ev.messageRef,
+      raw: ev.raw,
     });
     return;
   }
 
   // P6a: mount-choice button (`mnt:<thread>:<idx>`) — link the topic to the
-  // chosen project dir, then prompt the user to resend. Replaces the tmux
-  // mount-helper. Index references the deterministic mountCandidates() list.
-  if (cb.data.startsWith("mnt:")) {
-    if (!pairedCache || cb.from.id !== pairedCache.user_id) {
+  // chosen project dir, then prompt the user to resend. Index references the
+  // deterministic mountCandidates() list (re-derived identically here).
+  if (data.startsWith("mnt:")) {
+    if (!isPairedUser) {
       await answerCallback(cb.id, "Only the paired user can answer.", true);
       return;
     }
     if (!cb.message) { await answerCallback(cb.id); return; }
-    const rest = cb.data.slice(4);
+    const rest = data.slice(4);
     const ci = rest.indexOf(":");
     if (ci < 0) { await answerCallback(cb.id); return; }
     const tidStr = rest.slice(0, ci);
     const idx = Number(rest.slice(ci + 1));
-    const thread_id_raw = tidStr === "dm" ? undefined : Number(tidStr);
     const dir = mountCandidates()[idx];
     if (!dir) {
       await answerCallback(cb.id, "That option expired — send /mount <path>.", true);
@@ -1041,12 +1051,12 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
       await addMount({ thread_id: tidStr === "dm" ? "dm" : Number(tidStr), path: dir, label: mountBasename(dir) });
       refreshMountsIfChanged();
     } catch (e) {
-      await reply(tgAddr(cb.message.chat.id, thread_id_raw), `Couldn't link: ${e instanceof Error ? e.message : String(e)}`);
+      await reply(dest, `Couldn't link: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
     const original = cb.message.text ?? "";
     void editMessageText(cb.message.chat.id, cb.message.message_id, `${original}\n\n↳ linked to ${dir}`);
-    await reply(tgAddr(cb.message.chat.id, thread_id_raw), `Linked this topic to ${dir}. Send your message again and I'll start the session.`);
+    await reply(dest, `Linked this topic to ${dir}. Send your message again and I'll start the session.`);
     return;
   }
 
@@ -1057,12 +1067,12 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
     return;
   }
   // Only the original inviter can answer.
-  if (cb.from.id !== pendingPair.inviter_user_id) {
+  if (ev.from.id !== String(pendingPair.inviter_user_id)) {
     await answerCallback(cb.id, "Only the user who invited me can confirm.", true);
     return;
   }
 
-  if (cb.data === "pair-confirm") {
+  if (data === "pair-confirm") {
     const state: PairedState = {
       version: 1,
       chat_id: pendingPair.chat_id,
@@ -1077,7 +1087,7 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
     await answerCallback(cb.id, "Paired!");
     if (cb.message) {
       await reply(
-        tgAddr(cb.message.chat.id),
+        dest,
         [
           "✓ Paired with this chat. Only you can issue commands from now on.",
           "",
@@ -1086,12 +1096,12 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
       );
     }
     process.stdout.write(`[${new Date().toISOString()}] auto-pair confirmed: chat=${state.chat_id} user=${state.user_id}\n`);
-  } else if (cb.data === "pair-cancel") {
+  } else if (data === "pair-cancel") {
     pendingPair = null;
     await answerCallback(cb.id, "Pairing cancelled.");
     if (cb.message) {
       await reply(
-        tgAddr(cb.message.chat.id),
+        dest,
         "Pairing cancelled. Remove me and re-add when you're ready, or use `/pair <code>` (run `cta pair-code` on the host to see it).",
       );
     }
@@ -2086,15 +2096,6 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
   process.stdout.write(`[${new Date().toISOString()}] msg → daemon[${ev.routingKey}] (${text0.length} chars)\n`);
 }
 
-// Raw-update entry, retained ONLY for the synthetic `ans:` re-inject from
-// handleCallbackQuery (a button tap fabricates a TgUpdate carrying the chosen
-// label as the user's next message). Normalizes then routes through the shared
-// onInboundMessage. Chunk 4 migrates the button path onto the normalized event
-// and removes this shim.
-async function dispatchUpdate(u: TgUpdate): Promise<void> {
-  const ev = normalizeUpdate(u);
-  if (ev?.kind === "message") await onInboundMessage(ev);
-}
 
 // ─── main loop ───────────────────────────────────────────────────────────────
 
@@ -2262,10 +2263,10 @@ export async function main(): Promise<void> {
 
   // ── Inbound: drive dispatch through the ChatTransport ──────────────────────
   // The poller routes on the normalized event KIND, not by probing raw Telegram
-  // fields — so a second platform rides the same switch. Membership, buttons,
-  // and topic-name harvest are now kind-routed; only the message path still
-  // narrows ev.raw (handleMyChatMember/handleCallbackQuery/dispatchUpdate consume
-  // raw until the next chunks migrate them onto the normalized fields). The
+  // fields — so a second platform rides the same switch. Every kind dispatches to
+  // a handler that consumes normalized fields; the only residual ev.raw reads are
+  // the genuinely-Telegram-only edges: my_chat_member status transitions
+  // (handleMyChatMember) and onButtonPress's callback_query id/prompt. The
   // transport owns the getUpdates loop + offset-before-dispatch durability.
   transport.onEvent(async (ev) => {
     switch (ev.kind) {
@@ -2282,11 +2283,9 @@ export async function main(): Promise<void> {
         if (mcm) await handleMyChatMember(mcm);
         return;
       }
-      case "button-press": {
-        const cb = (ev.raw as TgUpdate).callback_query;
-        if (cb) await handleCallbackQuery(cb);
+      case "button-press":
+        await onButtonPress(ev);
         return;
-      }
       case "message":
         await onInboundMessage(ev);
         return;
