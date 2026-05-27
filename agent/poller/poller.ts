@@ -65,7 +65,28 @@ import type {
   TgCallbackQuery,
 } from "../channels/telegram/adapter";
 import { makeTransport } from "../channels/transport-factory";
+import { normalizeUpdate } from "../channels/telegram/transport";
 import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
+
+/** The normalized message-kind event the command pipeline consumes (replaces the
+ *  raw TgMessage every handler used to take). Carries everything a handler needs
+ *  — address (reply target), routingKey (mount/registry key), from.id (auth),
+ *  text, messageRef (ack target) — with the original update still on `.raw`. */
+type InboundMessageEvent = Extract<InboundEvent, { kind: "message" }>;
+
+/** Routing key → mount-store ThreadId. Telegram emits "dm" or a numeric string;
+ *  a future platform's opaque slug stays a string (Phase 2 relaxes the consumers
+ *  to accept it). */
+function threadIdOf(ev: InboundMessageEvent): number | "dm" {
+  return ev.routingKey === "dm" ? "dm" : Number(ev.routingKey);
+}
+
+/** Numeric Telegram chat id from the normalized address. The poller is the
+ *  Telegram adapter's consumer; a non-Telegram address here is a bug. */
+function chatIdOf(ev: InboundMessageEvent): number {
+  if (ev.address.channel !== "telegram") throw new Error(`poller: non-telegram address (${ev.address.channel})`);
+  return ev.address.chatId;
+}
 
 // ─── ChatTransport (P3 — DI'd) ───────────────────────────────────────────────
 // The poller drives ALL inbound + outbound through the ChatTransport interface,
@@ -515,9 +536,9 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
 // /effort <level> over Telegram: set the per-topic --effort level and respawn
 // the topic's daemon so it takes effect immediately. No arg → show current +
 // valid levels.
-async function handleEffort(msg: TgMessage, args: string): Promise<void> {
-  const dest = tgAddr(msg.chat.id, msg.message_thread_id);
-  const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+async function handleEffort(ev: InboundMessageEvent, args: string): Promise<void> {
+  const dest = ev.address;
+  const key = threadIdOf(ev);
   const level = args.trim().toLowerCase().split(/\s+/)[0];
 
   if (!level) {
@@ -546,9 +567,9 @@ async function handleEffort(msg: TgMessage, args: string): Promise<void> {
 
 // /model <alias|id> over Telegram: set the per-topic model and respawn the
 // topic's daemon. No arg → show current.
-async function handleModel(msg: TgMessage, args: string): Promise<void> {
-  const dest = tgAddr(msg.chat.id, msg.message_thread_id);
-  const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+async function handleModel(ev: InboundMessageEvent, args: string): Promise<void> {
+  const dest = ev.address;
+  const key = threadIdOf(ev);
   const name = args.trim().split(/\s+/)[0];
 
   if (!name) {
@@ -576,10 +597,9 @@ async function handleModel(msg: TgMessage, args: string): Promise<void> {
 
 // /context over Telegram: approximate current context-window usage from the
 // transcript's last turn.
-async function handleContext(msg: TgMessage): Promise<void> {
-  const thread_id = msg.message_thread_id;
-  const key: number | "dm" = thread_id != null ? thread_id : "dm";
-  const dest = tgAddr(msg.chat.id, thread_id);
+async function handleContext(ev: InboundMessageEvent): Promise<void> {
+  const key = threadIdOf(ev);
+  const dest = ev.address;
   const mount = mountsCache.get(tgKey(key));
   if (!mount) { await reply(dest, "No mount in this topic — `/mount <path>` first."); return; }
   const jsonl = jsonlPathForMount(mount);
@@ -680,22 +700,22 @@ function initDaemonRegistry(): void {
  * recovery. Fire-and-forget — replies flow back via the onText callback,
  * not via this function's return value.
  */
-async function daemonDispatch(threadIdStr: string, msg: TgMessage): Promise<void> {
-  const text = msg.text ?? msg.caption ?? "";
+async function daemonDispatch(threadIdStr: string, ev: InboundMessageEvent): Promise<void> {
+  const text = ev.text;
   if (!text) return;
   if (!daemonRegistry) {
     process.stderr.write("poller: daemonDispatch called before initDaemonRegistry — initializing on demand\n");
     initDaemonRegistry();
   }
-  // Typing keepalive (via the transport) — fast Bot API call + disk marker,
+  // Typing keepalive (via the transport) — fast platform call + disk marker,
   // cleared at turn-end via clearTypingExternal. Fire-and-forget.
-  if (isTyping(transport)) void transport.startTyping({ channel: "telegram", chatId: msg.chat.id, threadId: msg.message_thread_id });
+  if (isTyping(transport)) void transport.startTyping(ev.address);
   // Delivered ack (👀): the transport reads the operator glyph (access.json) and
   // returns a handle to flip to 👌 on flush — or null if the operator disabled it
   // (skip the ack pipeline). Await so the handle is queued BEFORE enqueue; the
   // flush fires ≥ debounce later, so it always finds it (no race).
   const ack = isReactable(transport)
-    ? await transport.setDeliveredAck({ channel: "telegram", chatId: msg.chat.id, messageId: msg.message_id })
+    ? await transport.setDeliveredAck(ev.messageRef)
     : null;
   if (ack) trackPendingRead(threadIdStr, ack);
 
@@ -1169,15 +1189,14 @@ async function idleFlushAndClear(threadIdStr: string): Promise<void> {
 // would clear claude's context but produce no send_telegram call — typing-
 // keepalive would run to its 10-min cap with no user-visible feedback.
 // We own the semantic so the user gets an explicit ack.
-async function handleClear(msg: TgMessage): Promise<void> {
-  const chat_id = msg.chat.id;
-  const thread_id_raw = msg.message_thread_id;
-  const key: number | "dm" = thread_id_raw != null ? thread_id_raw : "dm";
+async function handleClear(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
+  const key = threadIdOf(ev);
   const mount = mountsCache.get(tgKey(key));
 
   if (!mount) {
     await reply(
-      tgAddr(chat_id, thread_id_raw),
+      dest,
       "Nothing to clear — no project linked to this topic yet. Send a message and pick a directory from the buttons, or `cta mount <path>` from your Mac.",
     );
     return;
@@ -1185,7 +1204,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
 
   if (mount.provisional) {
     await reply(
-      tgAddr(chat_id, thread_id_raw),
+      dest,
       "This topic has a pending mount, not a running session — nothing to clear. Send `/cancel` to drop it, or `cta mount <path>` from your Mac.",
     );
     return;
@@ -1196,7 +1215,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
   // a fresh UUID → no --resume → cold conversation.
   if (!rotateSessionUuid(key)) {
     await reply(
-      tgAddr(chat_id, thread_id_raw),
+      dest,
       "Couldn't rotate the session UUID. Run `cta start` from your Mac to recover.",
     );
     return;
@@ -1215,19 +1234,18 @@ async function handleClear(msg: TgMessage): Promise<void> {
   }
 
   await reply(
-    tgAddr(chat_id, thread_id_raw),
+    dest,
     "Cleared. New session starts on the next message (cold-start adds ~5–15s).",
   );
 }
 
-async function handleCancel(msg: TgMessage): Promise<void> {
-  const chat_id = msg.chat.id;
-  const thread_id_raw = msg.message_thread_id;
-  const key: number | "dm" = thread_id_raw != null ? thread_id_raw : "dm";
+async function handleCancel(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
+  const key = threadIdOf(ev);
   const mount = mountsCache.get(tgKey(key));
   if (!mount?.provisional) {
     await reply(
-      tgAddr(chat_id, thread_id_raw),
+      dest,
       "Nothing to cancel — this topic has no pending mount.",
     );
     return;
@@ -1239,7 +1257,7 @@ async function handleCancel(msg: TgMessage): Promise<void> {
   }
   refreshMountsIfChanged();
   await reply(
-    tgAddr(chat_id, thread_id_raw),
+    dest,
     "Cancelled. Send any message here to start over, or use `cta mount` from your Mac to point this topic at a project directly.",
   );
 }
@@ -1271,13 +1289,13 @@ function jsonlPathForMount(mount: Mount): string | null {
   return jsonlPathForSession(mount.path, uuid);
 }
 
-async function handleCost(msg: TgMessage): Promise<void> {
-  const thread_id = msg.message_thread_id;
-  const key: number | "dm" = thread_id != null ? thread_id : "dm";
+async function handleCost(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
+  const key = threadIdOf(ev);
   const mount = mountsCache.get(tgKey(key));
   if (!mount) {
     await reply(
-      tgAddr(msg.chat.id, thread_id),
+      dest,
       "No mount in this topic — nothing to bill. `/mount <path>` first.",
     );
     return;
@@ -1285,13 +1303,13 @@ async function handleCost(msg: TgMessage): Promise<void> {
   const jsonl = jsonlPathForMount(mount);
   if (!jsonl) {
     await reply(
-      tgAddr(msg.chat.id, thread_id),
+      dest,
       "Session hasn't started yet — send any message in this topic first, then try `/cost` again.",
     );
     return;
   }
   const summary = aggregateCostFromJsonl(jsonl);
-  await reply(tgAddr(msg.chat.id, thread_id), formatCostMessage(summary));
+  await reply(dest, formatCostMessage(summary));
 }
 
 // 60s cache for /usage — Anthropic's Usage API is rate-limited and the
@@ -1299,7 +1317,8 @@ async function handleCost(msg: TgMessage): Promise<void> {
 let usageCache: { stats: import("./slash-commands").UsageStats; expires: number } | null = null;
 const USAGE_CACHE_MS = 60_000;
 
-async function handleUsage(msg: TgMessage): Promise<void> {
+async function handleUsage(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
   let stats: import("./slash-commands").UsageStats;
   if (usageCache && usageCache.expires > Date.now()) {
     stats = usageCache.stats;
@@ -1307,7 +1326,7 @@ async function handleUsage(msg: TgMessage): Promise<void> {
     const token = await resolveCredentialToken();
     if (!token) {
       await reply(
-        tgAddr(msg.chat.id, msg.message_thread_id),
+        dest,
         "Couldn't find claude code credentials on the host. Make sure you're signed in (`claude /login` on the Mac).",
       );
       return;
@@ -1315,7 +1334,7 @@ async function handleUsage(msg: TgMessage): Promise<void> {
     stats = await fetchUsageStats(token);
     usageCache = { stats, expires: Date.now() + USAGE_CACHE_MS };
   }
-  await reply(tgAddr(msg.chat.id, msg.message_thread_id), formatUsageMessage(stats));
+  await reply(dest, formatUsageMessage(stats));
 }
 
 /**
@@ -1324,13 +1343,13 @@ async function handleUsage(msg: TgMessage): Promise<void> {
  * from the same session UUID. Different from `/clear`, which also rotates
  * the UUID for a brand-new conversation.
  */
-async function handleRestartCmd(msg: TgMessage): Promise<void> {
-  const thread_id = msg.message_thread_id;
-  const key: number | "dm" = thread_id != null ? thread_id : "dm";
+async function handleRestartCmd(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
+  const key = threadIdOf(ev);
   const mount = mountsCache.get(tgKey(key));
   if (!mount) {
     await reply(
-      tgAddr(msg.chat.id, thread_id),
+      dest,
       "Nothing to restart — no mount in this topic.",
     );
     return;
@@ -1343,7 +1362,7 @@ async function handleRestartCmd(msg: TgMessage): Promise<void> {
     }
   }
   await reply(
-    tgAddr(msg.chat.id, thread_id),
+    dest,
     "Restarting claude in this topic. First reply may take 5–15s while it cold-starts.",
   );
 }
@@ -1361,10 +1380,9 @@ async function handleRestartCmd(msg: TgMessage): Promise<void> {
  * SIGTERM→SIGKILL kill + lazy respawn only when the daemon/stdin is unavailable
  * or the interrupt write fails. The queue is preserved across the stop.
  */
-async function handleStop(msg: TgMessage): Promise<void> {
-  const chat_id = msg.chat.id;
-  const thread_id = msg.message_thread_id;
-  const key: number | "dm" = thread_id != null ? thread_id : "dm";
+async function handleStop(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
+  const key = threadIdOf(ev);
   const threadIdStr = String(key);
 
   let stopped = false;
@@ -1382,11 +1400,11 @@ async function handleStop(msg: TgMessage): Promise<void> {
   // in-flight turn's messages to 👌 at flush time; messages queued during the
   // turn keep their 👀 and flip naturally when the resumed turn flushes.)
   if (isTyping(transport)) {
-    void transport.clearTypingExternal({ channel: "telegram", chatId: chat_id, threadId: thread_id });
+    void transport.clearTypingExternal(dest);
   }
 
   await reply(
-    tgAddr(chat_id, thread_id),
+    dest,
     stopped ? "⏹ Stopped." : "Nothing running to stop.",
   );
 }
@@ -1396,7 +1414,8 @@ async function handleStop(msg: TgMessage): Promise<void> {
  * component (LaunchAgent, poller heartbeat, MCP, watchdog) — this is the
  * source of truth for "is the bot alive."
  */
-async function handleStatusCmd(msg: TgMessage): Promise<void> {
+async function handleStatusCmd(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
   // cta lives at $HOME/.local/bin/cta in install.sh's layout; allow override
   // for tests. Plain status (no flags) prints the same checklist Pager menu
   // bar shows.
@@ -1404,7 +1423,7 @@ async function handleStatusCmd(msg: TgMessage): Promise<void> {
   const r = spawnSync(ctaPath, ["status"], { encoding: "utf8", timeout: 5000 });
   if (r.status !== 0 && !r.stdout) {
     await reply(
-      tgAddr(msg.chat.id, msg.message_thread_id),
+      dest,
       `Couldn't run cta status: ${(r.stderr ?? "").trim() || `exit ${r.status}`}`,
     );
     return;
@@ -1414,7 +1433,7 @@ async function handleStatusCmd(msg: TgMessage): Promise<void> {
   let body = (r.stdout ?? "").replace(/\x1b\[[0-9;]*m/g, "");
   if (body.length > 3500) body = body.slice(0, 3500) + "\n…(truncated)";
   await reply(
-    tgAddr(msg.chat.id, msg.message_thread_id),
+    dest,
     `cta status\n${body}`,
   );
 }
@@ -1426,20 +1445,22 @@ async function handleStatusCmd(msg: TgMessage): Promise<void> {
 // allowlisted operator. Post-pair: only commands from the paired user are
 // honored; everything else falls through to normal claude dispatch.
 
-async function handlePair(msg: TgMessage, args: string): Promise<void> {
-  if (!msg.from) return; // channel post; can't pair
+async function handlePair(ev: InboundMessageEvent, args: string): Promise<void> {
+  const dest = ev.address;
+  if (!ev.from.id) return; // no sender (channel post); can't pair
 
   // Already-paired path: same operator (user_id) can re-pair anywhere with
   // no code — they've already proven ownership. /pair in a new chat just
   // switches the bot to that chat. /pair in the same chat is a no-op.
+  // ev.from.id is the stringified sender; paired user_id is stored numeric.
   if (pairedCache) {
-    if (msg.from.id !== pairedCache.user_id) {
+    if (ev.from.id !== String(pairedCache.user_id)) {
       // Different user trying to claim while paired. Stay silent.
       return;
     }
-    if (msg.chat.id === pairedCache.chat_id) {
+    if (chatIdOf(ev) === pairedCache.chat_id) {
       await reply(
-        tgAddr(msg.chat.id, msg.message_thread_id),
+        dest,
         "✓ Already paired here. Send any message to talk to claude.",
       );
       return;
@@ -1449,14 +1470,14 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
     // respawn on next dispatch via auto-respawn, picking up the new
     // paired.json's chat_id.
     const previousChatId = pairedCache.chat_id;
-    const newState: PairedState = { ...pairedCache, chat_id: msg.chat.id, paired_at: new Date().toISOString() };
+    const newState: PairedState = { ...pairedCache, chat_id: chatIdOf(ev), paired_at: new Date().toISOString() };
     writePairedAtomic(newState);
     pairedCache = newState;
     pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs;
     await resetPerTopicStateOnPairSwitch();
     await ensureWildcardMount();
     await reply(
-      tgAddr(msg.chat.id, msg.message_thread_id),
+      dest,
       `✓ Switched to this chat (was chat ${previousChatId}). Send any message to talk to claude.`,
     );
     return;
@@ -1473,7 +1494,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   const supplied = args.trim().toUpperCase();
   if (supplied !== storedCode.toUpperCase()) {
     await reply(
-      tgAddr(msg.chat.id, msg.message_thread_id),
+      dest,
       "Pairing code did not match. Lost it? Run `cta pair-code --reset` on the host.",
     );
     return;
@@ -1481,8 +1502,8 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   // Match. Claim this chat + user, persist, delete the consumed code.
   const newState: PairedState = {
     version: 1,
-    chat_id: msg.chat.id,
-    user_id: msg.from.id,
+    chat_id: chatIdOf(ev),
+    user_id: Number(ev.from.id),
     paired_at: new Date().toISOString(),
   };
   writePairedAtomic(newState);
@@ -1491,7 +1512,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs;
   await ensureWildcardMount();
   await reply(
-    tgAddr(msg.chat.id, msg.message_thread_id),
+    dest,
     "✓ Paired. Send any message to talk to claude. To switch chats later, just send /pair in the new chat.",
   );
 }
@@ -1529,23 +1550,24 @@ async function resetPerTopicStateOnPairSwitch(): Promise<void> {
   }
 }
 
-async function handleMount(msg: TgMessage, args: string): Promise<void> {
+async function handleMount(ev: InboundMessageEvent, args: string): Promise<void> {
+  const dest = ev.address;
   const path = args.trim().replace(/^~/, homedir());
   if (!path) {
-    await reply(tgAddr(msg.chat.id, msg.message_thread_id), "Usage: `/mount <path>` — e.g. `/mount ~/projects/iron-flow`");
+    await reply(dest, "Usage: `/mount <path>` — e.g. `/mount ~/projects/iron-flow`");
     return;
   }
   if (!existsSync(path) || !statSync(path).isDirectory()) {
     await reply(
-      tgAddr(msg.chat.id, msg.message_thread_id),
+      dest,
       `Path \`${path}\` is not a directory on the Mac. Check spelling and that it exists locally.`,
     );
     return;
   }
-  const thread_id = msg.message_thread_id ?? null;
-  if (thread_id == null) {
+  const thread_id = threadIdOf(ev);
+  if (thread_id === "dm") {
     await reply(
-      tgAddr(msg.chat.id),
+      dest,
       "Send `/mount` inside a forum topic, or use `/dm <path>` here in DM.",
     );
     return;
@@ -1555,13 +1577,13 @@ async function handleMount(msg: TgMessage, args: string): Promise<void> {
   const r = spawnSync("bun", ["run", storePath, "add", String(thread_id), path], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply(
-      tgAddr(msg.chat.id, thread_id),
+      dest,
       `Mount failed: ${(r.stderr ?? "").trim() || "(no error)"}`,
     );
     return;
   }
   await reply(
-    tgAddr(msg.chat.id, thread_id),
+    dest,
     [
       `✓ Mounted thread ${thread_id} → ${path}`,
       ``,
@@ -1573,48 +1595,50 @@ async function handleMount(msg: TgMessage, args: string): Promise<void> {
   refreshMountsIfChanged();
 }
 
-async function handleDm(msg: TgMessage, args: string): Promise<void> {
+async function handleDm(ev: InboundMessageEvent, args: string): Promise<void> {
   // Equivalent to /mount but pins thread_id="dm" sentinel.
+  const dest = ev.address;
   const path = args.trim().replace(/^~/, homedir());
   if (!path) {
-    await reply(tgAddr(msg.chat.id), "Usage: `/dm <path>` — sets the DM mount to the given Mac path.");
+    await reply(dest, "Usage: `/dm <path>` — sets the DM mount to the given Mac path.");
     return;
   }
   if (!existsSync(path) || !statSync(path).isDirectory()) {
-    await reply(tgAddr(msg.chat.id), `Path \`${path}\` is not a directory on the Mac.`);
+    await reply(dest, `Path \`${path}\` is not a directory on the Mac.`);
     return;
   }
   const storePath = process.env.MOUNT_STORE_PATH ?? installMountStoreTs();
   const r = spawnSync("bun", ["run", storePath, "add", "dm", path], { encoding: "utf8" });
   if (r.status !== 0) {
-    await reply(tgAddr(msg.chat.id), `DM mount failed: ${(r.stderr ?? "").trim()}`);
+    await reply(dest, `DM mount failed: ${(r.stderr ?? "").trim()}`);
     return;
   }
-  await reply(tgAddr(msg.chat.id), `✓ DM mount → ${path}. Send any message here to start the claude session.`);
+  await reply(dest, `✓ DM mount → ${path}. Send any message here to start the claude session.`);
   refreshMountsIfChanged();
 }
 
-async function handleUnmount(msg: TgMessage): Promise<void> {
-  const thread_id = msg.message_thread_id;
-  const key = thread_id != null ? String(thread_id) : "dm";
+async function handleUnmount(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
+  const key = String(threadIdOf(ev));
   const storePath = process.env.MOUNT_STORE_PATH ?? installMountStoreTs();
   const r = spawnSync("bun", ["run", storePath, "remove", key], { encoding: "utf8" });
   if (r.status !== 0) {
-    await reply(tgAddr(msg.chat.id, thread_id), `Unmount failed: ${(r.stderr ?? "").trim()}`);
+    await reply(dest, `Unmount failed: ${(r.stderr ?? "").trim()}`);
     return;
   }
   if ((r.stdout ?? "").trim() === "null") {
-    await reply(tgAddr(msg.chat.id, thread_id), `Thread ${key} was not mounted.`);
+    await reply(dest, `Thread ${key} was not mounted.`);
     return;
   }
-  await reply(tgAddr(msg.chat.id, thread_id), `✓ Unmounted thread ${key}.`);
+  await reply(dest, `✓ Unmounted thread ${key}.`);
   refreshMountsIfChanged();
 }
 
-async function handleList(msg: TgMessage): Promise<void> {
+async function handleList(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
   const data = readMounts();
   if (data.mounts.length === 0) {
-    await reply(tgAddr(msg.chat.id, msg.message_thread_id), "No mounts yet. Send `/mount <path>` in a topic to add one.");
+    await reply(dest, "No mounts yet. Send `/mount <path>` in a topic to add one.");
     return;
   }
   // Join with topics.json so users see "thread 42 (Plans)" instead of bare
@@ -1636,17 +1660,18 @@ async function handleList(msg: TgMessage): Promise<void> {
     }
     return `• thread ${m.thread_id}${nameSuffix} → ${m.path}${m.label ? ` (${m.label})` : ""}`;
   });
-  await reply(tgAddr(msg.chat.id, msg.message_thread_id), `Current mounts:\n${lines.join("\n")}`);
+  await reply(dest, `Current mounts:\n${lines.join("\n")}`);
 }
 
 // Telegram-convention: every bot's first-touch UX is /start. Telegram clients
 // auto-send /start when a user opens a new bot chat. Without a handler the
 // bot looks dead to a first-time user.
-async function handleStart(msg: TgMessage): Promise<void> {
+async function handleStart(ev: InboundMessageEvent): Promise<void> {
+  const dest = ev.address;
   if (pairedCache) {
-    if (msg.from?.id === pairedCache.user_id) {
+    if (ev.from.id === String(pairedCache.user_id)) {
       // Paired owner came back. Just remind them of available commands.
-      return handleHelp(msg);
+      return handleHelp(ev);
     }
     // Random user opened the paired bot. Stay silent — don't leak that
     // anything exists.
@@ -1654,7 +1679,7 @@ async function handleStart(msg: TgMessage): Promise<void> {
   }
   // Unpaired. Tell them how to claim it.
   await reply(
-    tgAddr(msg.chat.id, msg.message_thread_id),
+    dest,
     [
       "👋 Hi. I'm a claude-code Telegram proxy waiting to be paired.",
       "",
@@ -1666,13 +1691,14 @@ async function handleStart(msg: TgMessage): Promise<void> {
   );
 }
 
-async function handleUnpair(msg: TgMessage, args: string): Promise<void> {
+async function handleUnpair(ev: InboundMessageEvent, args: string): Promise<void> {
+  const dest = ev.address;
   // Two-step confirmation. `/unpair confirm` actually releases; bare /unpair
   // just explains. Prevents accidental release if someone fat-fingers the
   // command in a busy chat.
   if (args.trim().toLowerCase() !== "confirm") {
     await reply(
-      tgAddr(msg.chat.id, msg.message_thread_id),
+      dest,
       [
         "Unpair releases this chat so a different chat can claim the bot.",
         "Mounts are wiped. To proceed, send: `/unpair confirm`",
@@ -1696,14 +1722,14 @@ async function handleUnpair(msg: TgMessage, args: string): Promise<void> {
   pairedMtimeMs = 0;
   refreshMountsIfChanged();
   await reply(
-    tgAddr(msg.chat.id, msg.message_thread_id),
+    dest,
     "✓ Unpaired. Re-add me to a chat for the auto-pair prompt, or send `/pair <code>` (run `cta pair-code` on the host).",
   );
 }
 
-async function handleHelp(msg: TgMessage): Promise<void> {
+async function handleHelp(ev: InboundMessageEvent): Promise<void> {
   await reply(
-    tgAddr(msg.chat.id, msg.message_thread_id),
+    ev.address,
     [
       "Mount commands:",
       "  /mount <path>   — bind THIS forum topic to a project dir on the Mac",
@@ -1746,7 +1772,7 @@ async function handleHelp(msg: TgMessage): Promise<void> {
 // commands need a one-line registry update — vs. the old hand-grown
 // CLAUDE_BUILTIN_BLOCKLIST that silently fell out of sync.
 type CommandSpec =
-  | { disposition: "translated"; handler: (msg: TgMessage) => Promise<void> }
+  | { disposition: "translated"; handler: (ev: InboundMessageEvent) => Promise<void> }
   | { disposition: "hidden"; reason: string };
 
 const TUI_COMMANDS: Record<string, CommandSpec> = {
@@ -1774,9 +1800,9 @@ const TUI_COMMANDS: Record<string, CommandSpec> = {
   "/login":       { disposition: "hidden", reason: "The Telegram bot has no login. Run `cta pair-code` on your Mac, then send `/pair <code>` here." },
 };
 
-async function handleHiddenTuiCommand(msg: TgMessage, command: string, reason: string): Promise<void> {
+async function handleHiddenTuiCommand(ev: InboundMessageEvent, command: string, reason: string): Promise<void> {
   await reply(
-    tgAddr(msg.chat.id, msg.message_thread_id),
+    ev.address,
     `\`${command}\` is a Claude Code TUI command — ${reason}`,
   );
 }
@@ -1792,8 +1818,8 @@ async function handleHiddenTuiCommand(msg: TgMessage, command: string, reason: s
  * through. Unknown /commands also fall through (claude can handle them)
  * except for the blocklist of UI-only built-ins.
  */
-async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
-  const text = msg.text ?? "";
+async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
+  const text = ev.text;
   if (!text.startsWith("/")) return false;
   // `/pair@MyBot AB7K-...` → strip @-suffix from command word
   const firstSpace = text.indexOf(" ");
@@ -1804,40 +1830,41 @@ async function tryHandleCommand(msg: TgMessage): Promise<boolean> {
   // Pre-pair: only /start and /pair are meaningful. Everything else falls
   // through (which then drops because there's no MAIN_CHAT_ID yet).
   if (!pairedCache && !ENV_MAIN_CHAT_ID) {
-    if (command === "/pair") { await handlePair(msg, args); return true; }
-    if (command === "/start") { await handleStart(msg); return true; }
+    if (command === "/pair") { await handlePair(ev, args); return true; }
+    if (command === "/start") { await handleStart(ev); return true; }
     return false;
   }
 
-  // Post-pair authorization: paired user_id only.
-  if (pairedCache && msg.from?.id !== pairedCache.user_id) {
+  // Post-pair authorization: paired user_id only. ev.from.id is the stringified
+  // sender id; the stored user_id is numeric, so compare as strings.
+  if (pairedCache && ev.from.id !== String(pairedCache.user_id)) {
     // Silently drop — don't reveal command surface to unauthorized users.
     return command.startsWith("/"); // claim handled to suppress claude dispatch
   }
 
   switch (command) {
-    case "/start": await handleStart(msg); return true;
-    case "/pair":  await handlePair(msg, args); return true;
-    case "/unpair": await handleUnpair(msg, args); return true;
-    case "/mount": await handleMount(msg, args); return true;
-    case "/dm":    await handleDm(msg, args); return true;
-    case "/unmount": await handleUnmount(msg); return true;
-    case "/cancel": await handleCancel(msg); return true;
-    case "/stop":   await handleStop(msg); return true;
-    case "/list":  await handleList(msg); return true;
-    case "/effort": await handleEffort(msg, args); return true;
-    case "/model": await handleModel(msg, args); return true;
-    case "/help":  await handleHelp(msg); return true;
+    case "/start": await handleStart(ev); return true;
+    case "/pair":  await handlePair(ev, args); return true;
+    case "/unpair": await handleUnpair(ev, args); return true;
+    case "/mount": await handleMount(ev, args); return true;
+    case "/dm":    await handleDm(ev, args); return true;
+    case "/unmount": await handleUnmount(ev); return true;
+    case "/cancel": await handleCancel(ev); return true;
+    case "/stop":   await handleStop(ev); return true;
+    case "/list":  await handleList(ev); return true;
+    case "/effort": await handleEffort(ev, args); return true;
+    case "/model": await handleModel(ev, args); return true;
+    case "/help":  await handleHelp(ev); return true;
     default: {
       // TUI command framework: translated → run handler, hidden → reply,
       // forwarded (no entry) → fall through to claude.
       const spec = TUI_COMMANDS[command];
       if (spec?.disposition === "translated") {
-        await spec.handler(msg);
+        await spec.handler(ev);
         return true;
       }
       if (spec?.disposition === "hidden") {
-        await handleHiddenTuiCommand(msg, command, spec.reason);
+        await handleHiddenTuiCommand(ev, command, spec.reason);
         return true;
       }
       return false; // unknown /x → let claude see it (user skills etc.)
@@ -1918,23 +1945,30 @@ function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): 
   return mount.tmux_session;
 }
 
-function routeMessage(msg: TgMessage): string | null {
+function routeMessage(ev: InboundMessageEvent): string | null {
+  const chatId = chatIdOf(ev);
+  const fromId = ev.from.id;
+  const threadLabel = ev.routingKey === "dm" ? "-" : ev.routingKey;
+  const dropLog = (reason: string) =>
+    process.stderr.write(`poller: drop msg from chat=${chatId} user=${fromId} thread=${threadLabel} text=${JSON.stringify(ev.text.slice(0, 40))} reason=${reason}\n`);
   const expectedChat = effectiveChatId();
   if (expectedChat == null) {
-    process.stderr.write(`poller: drop msg from chat=${msg.chat.id} user=${msg.from?.id} thread=${msg.message_thread_id ?? "-"} text=${JSON.stringify((msg.text ?? msg.caption ?? "").slice(0,40))} reason=unpaired-no-env\n`);
+    dropLog("unpaired-no-env");
     return null;
   }
-  if (String(msg.chat.id) !== expectedChat) {
-    process.stderr.write(`poller: drop msg from chat=${msg.chat.id} user=${msg.from?.id} thread=${msg.message_thread_id ?? "-"} text=${JSON.stringify((msg.text ?? msg.caption ?? "").slice(0,40))} reason=wrong-chat (expected ${expectedChat})\n`);
+  if (String(chatId) !== expectedChat) {
+    dropLog(`wrong-chat (expected ${expectedChat})`);
     return null;
   }
-  // Per-user enforcement: when paired, only the paired user's messages reach claude.
+  // Per-user enforcement: when paired, only the paired user's messages reach
+  // claude. effectiveUserId is numeric; ev.from.id is stringified — compare as
+  // strings.
   const expectedUser = effectiveUserId();
-  if (expectedUser != null && msg.from?.id !== expectedUser) {
-    process.stderr.write(`poller: drop msg from chat=${msg.chat.id} user=${msg.from?.id} thread=${msg.message_thread_id ?? "-"} text=${JSON.stringify((msg.text ?? msg.caption ?? "").slice(0,40))} reason=wrong-user (expected ${expectedUser})\n`);
+  if (expectedUser != null && fromId !== String(expectedUser)) {
+    dropLog(`wrong-user (expected ${expectedUser})`);
     return null;
   }
-  const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+  const key = threadIdOf(ev);
   const specific = mountsCache.get(tgKey(key));
   if (specific) return specific.tmux_session;
 
@@ -1990,45 +2024,38 @@ function recordTopicNameFromEvent(
   recordTopicName(msg.chat.id, msg.message_thread_id, ev.name);
 }
 
-// Message dispatch. The onEvent entry (main()) now routes by ev.kind, so
-// membership (joined/removed), button-press (callback_query), and the topic-name
-// harvest (topic-created/topic-renamed) are handled BEFORE this point — this
-// path sees only message-kind updates. Still takes a raw TgUpdate: the synthetic
-// re-inject from the `ans:` button path (handleCallbackQuery) calls it directly,
-// and the command pipeline below is migrated onto the normalized event in a
-// later chunk. `u` is always a plain message update here (u.message set).
-async function dispatchUpdate(u: TgUpdate): Promise<void> {
-  const msg = u.message ?? u.edited_message;
-  if (!msg) return;
-
+// Message dispatch on the NORMALIZED event. The onEvent entry (main()) routes by
+// ev.kind, so membership (joined/removed), button-press (callback_query), and the
+// topic-name harvest (topic-created/topic-renamed) are handled before this point;
+// onInboundMessage sees only message-kind events. No raw Telegram fields — every
+// field comes from the normalized event (text/address/routingKey/from/messageRef),
+// so a second platform routes through the identical code.
+async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
   // Commands run first. Pre-pair /pair messages bypass MAIN_CHAT_ID gating
   // (that's the whole point — we don't know the chat yet). Post-pair commands
   // are gated by paired user_id inside tryHandleCommand.
-  if (await tryHandleCommand(msg)) return;
+  if (await tryHandleCommand(ev)) return;
 
-  const text0 = msg.text ?? msg.caption ?? "";
+  const text0 = ev.text;
   if (text0.length === 0) {
-    process.stderr.write(`poller: update ${u.update_id}: empty text/caption, dropping\n`);
+    process.stderr.write(`poller: ${ev.routingKey}: empty text, dropping\n`);
     return;
   }
 
   // Resolve which mount this message belongs to. routeMessage handles the
-  // chat/user gating and returns a session name; we also need the Mount
-  // itself for stream-json dispatch. Mount cache and routeMessage share
-  // a lookup by tgKey, so do it once here.
+  // chat/user gating + drop logging; we re-check the gate here (cheaply) so a
+  // dropped message logs once and returns without touching the registry.
   const expectedChat = effectiveChatId();
-  if (expectedChat == null || String(msg.chat.id) !== expectedChat) {
-    // routeMessage logs the drop reason. Just call it for the side-effect
-    // of logging, then return.
-    void routeMessage(msg);
+  if (expectedChat == null || String(chatIdOf(ev)) !== expectedChat) {
+    void routeMessage(ev); // logs the drop reason
     return;
   }
   const expectedUser = effectiveUserId();
-  if (expectedUser != null && msg.from?.id !== expectedUser) {
-    void routeMessage(msg);
+  if (expectedUser != null && ev.from.id !== String(expectedUser)) {
+    void routeMessage(ev);
     return;
   }
-  const routeKey: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
+  const routeKey = threadIdOf(ev);
   let mount = mountsCache.get(tgKey(routeKey));
   if (!mount) {
     // No specific mount — try wildcard auto-spawn (existing behavior).
@@ -2044,7 +2071,8 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
     // P6a: no mount and no wildcard — offer a buttons prompt of known project
     // dirs (poller-only) instead of spawning the interactive tmux mount-helper.
     // The user taps a dir (or sends /mount), then resends their message.
-    await promptMountChoice(routeKey, msg.chat.id, msg.message_thread_id);
+    const threadIdRaw = routeKey === "dm" ? undefined : routeKey;
+    await promptMountChoice(routeKey, chatIdOf(ev), threadIdRaw);
     return;
   }
 
@@ -2054,8 +2082,18 @@ async function dispatchUpdate(u: TgUpdate): Promise<void> {
   // postTelegramTextFromDaemon callback wired in initDaemonRegistry().
   // Fire-and-forget: daemonDispatch awaits the delivered-ack internally before
   // enqueue, but the caller need not block on it.
-  void daemonDispatch(String(routeKey), msg);
-  process.stdout.write(`[${new Date().toISOString()}] update ${u.update_id} → daemon[${routeKey}] (${text0.length} chars)\n`);
+  void daemonDispatch(ev.routingKey, ev);
+  process.stdout.write(`[${new Date().toISOString()}] msg → daemon[${ev.routingKey}] (${text0.length} chars)\n`);
+}
+
+// Raw-update entry, retained ONLY for the synthetic `ans:` re-inject from
+// handleCallbackQuery (a button tap fabricates a TgUpdate carrying the chosen
+// label as the user's next message). Normalizes then routes through the shared
+// onInboundMessage. Chunk 4 migrates the button path onto the normalized event
+// and removes this shim.
+async function dispatchUpdate(u: TgUpdate): Promise<void> {
+  const ev = normalizeUpdate(u);
+  if (ev?.kind === "message") await onInboundMessage(ev);
 }
 
 // ─── main loop ───────────────────────────────────────────────────────────────
@@ -2250,7 +2288,7 @@ export async function main(): Promise<void> {
         return;
       }
       case "message":
-        await dispatchUpdate(ev.raw as TgUpdate);
+        await onInboundMessage(ev);
         return;
     }
   });
@@ -2283,5 +2321,6 @@ export {
   effectiveChatId,
   effectiveUserId,
   type TgMessage,
+  type InboundMessageEvent,
   type PairedState,
 };

@@ -87,6 +87,10 @@ delete process.env.MAIN_CHAT_ID; // make sure pre-pair tests start unpaired
 
 // Import after env is set so the module-level constants pick up our overrides.
 const poller = await import("./poller");
+// The command pipeline now consumes the NORMALIZED InboundEvent. Build test
+// events through the real production normalizer so the test exercises
+// normalizeUpdate too (and never drifts from the live field mapping).
+const { normalizeUpdate } = await import("../channels/telegram/transport");
 
 function resetState(): void {
   sent.length = 0;
@@ -102,19 +106,26 @@ function resetState(): void {
 
 beforeEach(() => resetState());
 
+// Build the normalized message event the command pipeline now consumes, by
+// running the same raw TgMessage we used to pass through the production
+// normalizer. Keeps the test's call sites (`tryHandleCommand(msg({...}))`)
+// unchanged while validating normalizeUpdate end to end.
 function msg(args: {
   text: string;
   chat_id?: number;
   thread_id?: number;
   from_id?: number;
-}): poller.TgMessage {
-  return {
+}): poller.InboundMessageEvent {
+  const raw: poller.TgMessage = {
     message_id: 1,
     chat: { id: args.chat_id ?? -1001234 },
     from: args.from_id != null ? { id: args.from_id } : undefined,
     message_thread_id: args.thread_id,
     text: args.text,
   };
+  const ev = normalizeUpdate({ update_id: 1, message: raw });
+  if (ev?.kind !== "message") throw new Error("test msg() did not normalize to a message event");
+  return ev;
 }
 
 describe("pre-pair state", () => {
