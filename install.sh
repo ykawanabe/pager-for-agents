@@ -179,7 +179,9 @@ if [[ -d "$REPO_DIR/agent" ]]; then
   # contract (types.ts) + Telegram wire adapter. poller.ts imports the adapter
   # via ../channels/telegram/adapter; without these copies the installed poller
   # crashes on startup ("Cannot find module").
-  cp "$REPO_DIR/agent/channels/types.ts" "$AGENT_DIR/channels/"
+  cp "$REPO_DIR/agent/channels/types.ts" \
+     "$REPO_DIR/agent/channels/transport-factory.ts" \
+     "$AGENT_DIR/channels/"
   cp "$REPO_DIR/agent/channels/telegram/adapter.ts" \
      "$REPO_DIR/agent/channels/telegram/transport.ts" \
      "$REPO_DIR/agent/channels/telegram/typing-keepalive.ts" \

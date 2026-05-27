@@ -35,6 +35,7 @@ poller/file-access-probe.ts	agent	644
 # Chat-channel adapters (ChatTransport migration). Platform-agnostic core
 # contract + per-platform wire adapters.
 channels/types.ts	agent	644
+channels/transport-factory.ts	agent	644
 channels/telegram/adapter.ts	agent	644
 channels/telegram/transport.ts	agent	644
 channels/telegram/typing-keepalive.ts	agent	644

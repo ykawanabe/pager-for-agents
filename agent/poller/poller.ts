@@ -64,8 +64,8 @@ import type {
   TgChatMemberUpdated,
   TgCallbackQuery,
 } from "../channels/telegram/adapter";
-import { TelegramTransport } from "../channels/telegram/transport";
-import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatTransport } from "../channels/types";
+import { makeTransport } from "../channels/transport-factory";
+import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatTransport, type Channel } from "../channels/types";
 
 // ─── ChatTransport (P3 — DI'd) ───────────────────────────────────────────────
 // The poller drives ALL inbound + outbound through the ChatTransport interface,
@@ -75,7 +75,12 @@ import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, typ
 // buttons) are reached only behind capability guards (isEditable/isReactable/
 // isTyping/isButtonCapable), so a future platform that lacks one degrades
 // gracefully rather than failing to compile or crashing at runtime.
-const transport: ChatTransport = new TelegramTransport();
+//
+// Selected by CTA_CHANNEL via the transport-factory DI seam (default "telegram").
+// Phase 0: only Telegram is registered in the factory; CTA_CHANNEL unset →
+// "telegram", so production is unchanged.
+const activeChannel: Channel = (process.env.CTA_CHANNEL as Channel) ?? "telegram";
+const transport: ChatTransport = makeTransport(activeChannel);
 
 /** Outbound plain text. Now flows through transport.sendText (which chunks
  *  >4096 and returns a ref); kept as `reply(target, text)` so the ~58 existing
@@ -2110,7 +2115,11 @@ export async function main(): Promise<void> {
     });
   }
 
-  if (!process.env.TELEGRAM_BOT_TOKEN) {
+  // Channel-conditional credential require: a Slack run must not be blocked by a
+  // missing Telegram token (and vice versa). Phase 0 only knows Telegram; the
+  // factory throws for any other configured channel before we reach the loop.
+  // Phase 4 adds: if (activeChannel === "slack" && (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN)) {…}
+  if (activeChannel === "telegram" && !process.env.TELEGRAM_BOT_TOKEN) {
     process.stderr.write("poller: TELEGRAM_BOT_TOKEN must be set\n");
     process.exit(1);
   }
@@ -2118,8 +2127,15 @@ export async function main(): Promise<void> {
   ensureReleaseFlagDir();
   cleanupStaleReleaseFlags();
   ensureInjectDir();
-  await preflightBotToken();
-  await registerBotCommands();
+  // Both are Telegram-wire-specific (getMe / setMyCommands via the adapter, not
+  // the transport contract). Guard on the active channel so a non-Telegram run
+  // doesn't issue Telegram API calls. Phase 4 generalizes preflight onto
+  // transport.whoami(); registerBotCommands moves behind isSlashCommandable once
+  // TelegramTransport actually implements SlashCommandable.
+  if (activeChannel === "telegram") {
+    await preflightBotToken();
+    await registerBotCommands();
+  }
   let offset = readOffset();
   refreshMountsIfChanged();
   refreshPairedIfChanged();
