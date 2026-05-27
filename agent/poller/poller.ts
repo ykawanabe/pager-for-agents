@@ -65,7 +65,7 @@ import type {
   TgCallbackQuery,
 } from "../channels/telegram/adapter";
 import { makeTransport } from "../channels/transport-factory";
-import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatTransport, type Channel } from "../channels/types";
+import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel } from "../channels/types";
 
 // ─── ChatTransport (P3 — DI'd) ───────────────────────────────────────────────
 // The poller drives ALL inbound + outbound through the ChatTransport interface,
@@ -82,17 +82,22 @@ import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, typ
 const activeChannel: Channel = (process.env.CTA_CHANNEL as Channel) ?? "telegram";
 const transport: ChatTransport = makeTransport(activeChannel);
 
-/** Outbound plain text. Now flows through transport.sendText (which chunks
- *  >4096 and returns a ref); kept as `reply(target, text)` so the ~58 existing
- *  call sites are unchanged. */
-async function reply(
-  target: { chat_id: number | string; thread_id?: number },
-  text: string,
-): Promise<void> {
-  await transport.sendText({
-    to: { channel: "telegram", chatId: Number(target.chat_id), threadId: target.thread_id },
-    text,
-  });
+/** Outbound plain text. Flows through transport.sendText (which chunks >4096 and
+ *  returns a ref). Takes a platform-agnostic ChatAddress — the poller no longer
+ *  builds a Telegram-shaped target, so a non-Telegram transport replies through
+ *  the identical path. Handlers pass the inbound event's `ev.address`; the few
+ *  non-inbound senders (daemon stream, mount prompt) build one via `tgAddr`. */
+async function reply(to: ChatAddress, text: string): Promise<void> {
+  await transport.sendText({ to, text });
+}
+
+/** Build a Telegram ChatAddress from raw ids. Transitional helper for the
+ *  outbound seam (Phase 1 chunk 1): handlers still hold a raw TgMessage, and the
+ *  daemon/stream callbacks resolve a numeric chat id. Once the command pipeline
+ *  consumes the normalized event (chunk 3) most call sites collapse to
+ *  `ev.address` and this remains only for the daemon-stream senders. */
+function tgAddr(chatId: number, threadId?: number): ChatAddress {
+  return { channel: "telegram", chatId, threadId };
 }
 
 /** Edit a sent message's text in place — now via transport.editText (Editable). */
@@ -511,7 +516,7 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
 // the topic's daemon so it takes effect immediately. No arg → show current +
 // valid levels.
 async function handleEffort(msg: TgMessage, args: string): Promise<void> {
-  const dest = { chat_id: msg.chat.id, thread_id: msg.message_thread_id };
+  const dest = tgAddr(msg.chat.id, msg.message_thread_id);
   const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
   const level = args.trim().toLowerCase().split(/\s+/)[0];
 
@@ -542,7 +547,7 @@ async function handleEffort(msg: TgMessage, args: string): Promise<void> {
 // /model <alias|id> over Telegram: set the per-topic model and respawn the
 // topic's daemon. No arg → show current.
 async function handleModel(msg: TgMessage, args: string): Promise<void> {
-  const dest = { chat_id: msg.chat.id, thread_id: msg.message_thread_id };
+  const dest = tgAddr(msg.chat.id, msg.message_thread_id);
   const key: number | "dm" = msg.message_thread_id != null ? msg.message_thread_id : "dm";
   const name = args.trim().split(/\s+/)[0];
 
@@ -574,7 +579,7 @@ async function handleModel(msg: TgMessage, args: string): Promise<void> {
 async function handleContext(msg: TgMessage): Promise<void> {
   const thread_id = msg.message_thread_id;
   const key: number | "dm" = thread_id != null ? thread_id : "dm";
-  const dest = { chat_id: msg.chat.id, thread_id };
+  const dest = tgAddr(msg.chat.id, thread_id);
   const mount = mountsCache.get(tgKey(key));
   if (!mount) { await reply(dest, "No mount in this topic — `/mount <path>` first."); return; }
   const jsonl = jsonlPathForMount(mount);
@@ -622,7 +627,7 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
     return;
   }
   // No buttons, or the platform can't render them → plain text (graceful degrade).
-  void reply({ chat_id, thread_id: threadId }, body);
+  void reply(tgAddr(chat_id, threadId), body);
 }
 
 /** Turn-end hook: clear typing keepalive (mcp-telegram normally does this
@@ -906,7 +911,7 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
   }
   if (pairedCache) {
     await reply(
-      { chat_id: mcm.chat.id },
+      tgAddr(mcm.chat.id),
       [
         "I'm already paired with another chat — I can't claim two at once.",
         "",
@@ -946,7 +951,7 @@ export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void
     "",
     "Already paired with another chat? Just send `/pair` here (no code needed) and I'll switch.",
   );
-  await reply({ chat_id: mcm.chat.id }, introLines.join("\n"));
+  await reply(tgAddr(mcm.chat.id), introLines.join("\n"));
   process.stdout.write(`[${new Date().toISOString()}] pair intro sent: chat=${mcm.chat.id} inviter=${mcm.from.id}${isGroup ? " (group)" : ""}\n`);
 }
 
@@ -1016,12 +1021,12 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
       await addMount({ thread_id: tidStr === "dm" ? "dm" : Number(tidStr), path: dir, label: mountBasename(dir) });
       refreshMountsIfChanged();
     } catch (e) {
-      await reply({ chat_id: cb.message.chat.id, thread_id: thread_id_raw }, `Couldn't link: ${e instanceof Error ? e.message : String(e)}`);
+      await reply(tgAddr(cb.message.chat.id, thread_id_raw), `Couldn't link: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
     const original = cb.message.text ?? "";
     void editMessageText(cb.message.chat.id, cb.message.message_id, `${original}\n\n↳ linked to ${dir}`);
-    await reply({ chat_id: cb.message.chat.id, thread_id: thread_id_raw }, `Linked this topic to ${dir}. Send your message again and I'll start the session.`);
+    await reply(tgAddr(cb.message.chat.id, thread_id_raw), `Linked this topic to ${dir}. Send your message again and I'll start the session.`);
     return;
   }
 
@@ -1052,7 +1057,7 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
     await answerCallback(cb.id, "Paired!");
     if (cb.message) {
       await reply(
-        { chat_id: cb.message.chat.id },
+        tgAddr(cb.message.chat.id),
         [
           "✓ Paired with this chat. Only you can issue commands from now on.",
           "",
@@ -1066,7 +1071,7 @@ export async function handleCallbackQuery(cb: TgCallbackQuery): Promise<void> {
     await answerCallback(cb.id, "Pairing cancelled.");
     if (cb.message) {
       await reply(
-        { chat_id: cb.message.chat.id },
+        tgAddr(cb.message.chat.id),
         "Pairing cancelled. Remove me and re-add when you're ready, or use `/pair <code>` (run `cta pair-code` on the host to see it).",
       );
     }
@@ -1172,7 +1177,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
 
   if (!mount) {
     await reply(
-      { chat_id, thread_id: thread_id_raw },
+      tgAddr(chat_id, thread_id_raw),
       "Nothing to clear — no project linked to this topic yet. Send a message and pick a directory from the buttons, or `cta mount <path>` from your Mac.",
     );
     return;
@@ -1180,7 +1185,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
 
   if (mount.provisional) {
     await reply(
-      { chat_id, thread_id: thread_id_raw },
+      tgAddr(chat_id, thread_id_raw),
       "This topic has a pending mount, not a running session — nothing to clear. Send `/cancel` to drop it, or `cta mount <path>` from your Mac.",
     );
     return;
@@ -1191,7 +1196,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
   // a fresh UUID → no --resume → cold conversation.
   if (!rotateSessionUuid(key)) {
     await reply(
-      { chat_id, thread_id: thread_id_raw },
+      tgAddr(chat_id, thread_id_raw),
       "Couldn't rotate the session UUID. Run `cta start` from your Mac to recover.",
     );
     return;
@@ -1210,7 +1215,7 @@ async function handleClear(msg: TgMessage): Promise<void> {
   }
 
   await reply(
-    { chat_id, thread_id: thread_id_raw },
+    tgAddr(chat_id, thread_id_raw),
     "Cleared. New session starts on the next message (cold-start adds ~5–15s).",
   );
 }
@@ -1222,7 +1227,7 @@ async function handleCancel(msg: TgMessage): Promise<void> {
   const mount = mountsCache.get(tgKey(key));
   if (!mount?.provisional) {
     await reply(
-      { chat_id, thread_id: thread_id_raw },
+      tgAddr(chat_id, thread_id_raw),
       "Nothing to cancel — this topic has no pending mount.",
     );
     return;
@@ -1234,7 +1239,7 @@ async function handleCancel(msg: TgMessage): Promise<void> {
   }
   refreshMountsIfChanged();
   await reply(
-    { chat_id, thread_id: thread_id_raw },
+    tgAddr(chat_id, thread_id_raw),
     "Cancelled. Send any message here to start over, or use `cta mount` from your Mac to point this topic at a project directly.",
   );
 }
@@ -1272,7 +1277,7 @@ async function handleCost(msg: TgMessage): Promise<void> {
   const mount = mountsCache.get(tgKey(key));
   if (!mount) {
     await reply(
-      { chat_id: msg.chat.id, thread_id },
+      tgAddr(msg.chat.id, thread_id),
       "No mount in this topic — nothing to bill. `/mount <path>` first.",
     );
     return;
@@ -1280,13 +1285,13 @@ async function handleCost(msg: TgMessage): Promise<void> {
   const jsonl = jsonlPathForMount(mount);
   if (!jsonl) {
     await reply(
-      { chat_id: msg.chat.id, thread_id },
+      tgAddr(msg.chat.id, thread_id),
       "Session hasn't started yet — send any message in this topic first, then try `/cost` again.",
     );
     return;
   }
   const summary = aggregateCostFromJsonl(jsonl);
-  await reply({ chat_id: msg.chat.id, thread_id }, formatCostMessage(summary));
+  await reply(tgAddr(msg.chat.id, thread_id), formatCostMessage(summary));
 }
 
 // 60s cache for /usage — Anthropic's Usage API is rate-limited and the
@@ -1302,7 +1307,7 @@ async function handleUsage(msg: TgMessage): Promise<void> {
     const token = await resolveCredentialToken();
     if (!token) {
       await reply(
-        { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+        tgAddr(msg.chat.id, msg.message_thread_id),
         "Couldn't find claude code credentials on the host. Make sure you're signed in (`claude /login` on the Mac).",
       );
       return;
@@ -1310,7 +1315,7 @@ async function handleUsage(msg: TgMessage): Promise<void> {
     stats = await fetchUsageStats(token);
     usageCache = { stats, expires: Date.now() + USAGE_CACHE_MS };
   }
-  await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, formatUsageMessage(stats));
+  await reply(tgAddr(msg.chat.id, msg.message_thread_id), formatUsageMessage(stats));
 }
 
 /**
@@ -1325,7 +1330,7 @@ async function handleRestartCmd(msg: TgMessage): Promise<void> {
   const mount = mountsCache.get(tgKey(key));
   if (!mount) {
     await reply(
-      { chat_id: msg.chat.id, thread_id },
+      tgAddr(msg.chat.id, thread_id),
       "Nothing to restart — no mount in this topic.",
     );
     return;
@@ -1338,7 +1343,7 @@ async function handleRestartCmd(msg: TgMessage): Promise<void> {
     }
   }
   await reply(
-    { chat_id: msg.chat.id, thread_id },
+    tgAddr(msg.chat.id, thread_id),
     "Restarting claude in this topic. First reply may take 5–15s while it cold-starts.",
   );
 }
@@ -1381,7 +1386,7 @@ async function handleStop(msg: TgMessage): Promise<void> {
   }
 
   await reply(
-    { chat_id, thread_id },
+    tgAddr(chat_id, thread_id),
     stopped ? "⏹ Stopped." : "Nothing running to stop.",
   );
 }
@@ -1399,7 +1404,7 @@ async function handleStatusCmd(msg: TgMessage): Promise<void> {
   const r = spawnSync(ctaPath, ["status"], { encoding: "utf8", timeout: 5000 });
   if (r.status !== 0 && !r.stdout) {
     await reply(
-      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      tgAddr(msg.chat.id, msg.message_thread_id),
       `Couldn't run cta status: ${(r.stderr ?? "").trim() || `exit ${r.status}`}`,
     );
     return;
@@ -1409,7 +1414,7 @@ async function handleStatusCmd(msg: TgMessage): Promise<void> {
   let body = (r.stdout ?? "").replace(/\x1b\[[0-9;]*m/g, "");
   if (body.length > 3500) body = body.slice(0, 3500) + "\n…(truncated)";
   await reply(
-    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    tgAddr(msg.chat.id, msg.message_thread_id),
     `cta status\n${body}`,
   );
 }
@@ -1434,7 +1439,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
     }
     if (msg.chat.id === pairedCache.chat_id) {
       await reply(
-        { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+        tgAddr(msg.chat.id, msg.message_thread_id),
         "✓ Already paired here. Send any message to talk to claude.",
       );
       return;
@@ -1451,7 +1456,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
     await resetPerTopicStateOnPairSwitch();
     await ensureWildcardMount();
     await reply(
-      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      tgAddr(msg.chat.id, msg.message_thread_id),
       `✓ Switched to this chat (was chat ${previousChatId}). Send any message to talk to claude.`,
     );
     return;
@@ -1468,7 +1473,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   const supplied = args.trim().toUpperCase();
   if (supplied !== storedCode.toUpperCase()) {
     await reply(
-      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      tgAddr(msg.chat.id, msg.message_thread_id),
       "Pairing code did not match. Lost it? Run `cta pair-code --reset` on the host.",
     );
     return;
@@ -1486,7 +1491,7 @@ async function handlePair(msg: TgMessage, args: string): Promise<void> {
   pairedMtimeMs = statSync(PAIRED_STATE_FILE).mtimeMs;
   await ensureWildcardMount();
   await reply(
-    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    tgAddr(msg.chat.id, msg.message_thread_id),
     "✓ Paired. Send any message to talk to claude. To switch chats later, just send /pair in the new chat.",
   );
 }
@@ -1527,12 +1532,12 @@ async function resetPerTopicStateOnPairSwitch(): Promise<void> {
 async function handleMount(msg: TgMessage, args: string): Promise<void> {
   const path = args.trim().replace(/^~/, homedir());
   if (!path) {
-    await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, "Usage: `/mount <path>` — e.g. `/mount ~/projects/iron-flow`");
+    await reply(tgAddr(msg.chat.id, msg.message_thread_id), "Usage: `/mount <path>` — e.g. `/mount ~/projects/iron-flow`");
     return;
   }
   if (!existsSync(path) || !statSync(path).isDirectory()) {
     await reply(
-      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      tgAddr(msg.chat.id, msg.message_thread_id),
       `Path \`${path}\` is not a directory on the Mac. Check spelling and that it exists locally.`,
     );
     return;
@@ -1540,7 +1545,7 @@ async function handleMount(msg: TgMessage, args: string): Promise<void> {
   const thread_id = msg.message_thread_id ?? null;
   if (thread_id == null) {
     await reply(
-      { chat_id: msg.chat.id },
+      tgAddr(msg.chat.id),
       "Send `/mount` inside a forum topic, or use `/dm <path>` here in DM.",
     );
     return;
@@ -1550,13 +1555,13 @@ async function handleMount(msg: TgMessage, args: string): Promise<void> {
   const r = spawnSync("bun", ["run", storePath, "add", String(thread_id), path], { encoding: "utf8" });
   if (r.status !== 0) {
     await reply(
-      { chat_id: msg.chat.id, thread_id },
+      tgAddr(msg.chat.id, thread_id),
       `Mount failed: ${(r.stderr ?? "").trim() || "(no error)"}`,
     );
     return;
   }
   await reply(
-    { chat_id: msg.chat.id, thread_id },
+    tgAddr(msg.chat.id, thread_id),
     [
       `✓ Mounted thread ${thread_id} → ${path}`,
       ``,
@@ -1572,20 +1577,20 @@ async function handleDm(msg: TgMessage, args: string): Promise<void> {
   // Equivalent to /mount but pins thread_id="dm" sentinel.
   const path = args.trim().replace(/^~/, homedir());
   if (!path) {
-    await reply({ chat_id: msg.chat.id }, "Usage: `/dm <path>` — sets the DM mount to the given Mac path.");
+    await reply(tgAddr(msg.chat.id), "Usage: `/dm <path>` — sets the DM mount to the given Mac path.");
     return;
   }
   if (!existsSync(path) || !statSync(path).isDirectory()) {
-    await reply({ chat_id: msg.chat.id }, `Path \`${path}\` is not a directory on the Mac.`);
+    await reply(tgAddr(msg.chat.id), `Path \`${path}\` is not a directory on the Mac.`);
     return;
   }
   const storePath = process.env.MOUNT_STORE_PATH ?? installMountStoreTs();
   const r = spawnSync("bun", ["run", storePath, "add", "dm", path], { encoding: "utf8" });
   if (r.status !== 0) {
-    await reply({ chat_id: msg.chat.id }, `DM mount failed: ${(r.stderr ?? "").trim()}`);
+    await reply(tgAddr(msg.chat.id), `DM mount failed: ${(r.stderr ?? "").trim()}`);
     return;
   }
-  await reply({ chat_id: msg.chat.id }, `✓ DM mount → ${path}. Send any message here to start the claude session.`);
+  await reply(tgAddr(msg.chat.id), `✓ DM mount → ${path}. Send any message here to start the claude session.`);
   refreshMountsIfChanged();
 }
 
@@ -1595,21 +1600,21 @@ async function handleUnmount(msg: TgMessage): Promise<void> {
   const storePath = process.env.MOUNT_STORE_PATH ?? installMountStoreTs();
   const r = spawnSync("bun", ["run", storePath, "remove", key], { encoding: "utf8" });
   if (r.status !== 0) {
-    await reply({ chat_id: msg.chat.id, thread_id }, `Unmount failed: ${(r.stderr ?? "").trim()}`);
+    await reply(tgAddr(msg.chat.id, thread_id), `Unmount failed: ${(r.stderr ?? "").trim()}`);
     return;
   }
   if ((r.stdout ?? "").trim() === "null") {
-    await reply({ chat_id: msg.chat.id, thread_id }, `Thread ${key} was not mounted.`);
+    await reply(tgAddr(msg.chat.id, thread_id), `Thread ${key} was not mounted.`);
     return;
   }
-  await reply({ chat_id: msg.chat.id, thread_id }, `✓ Unmounted thread ${key}.`);
+  await reply(tgAddr(msg.chat.id, thread_id), `✓ Unmounted thread ${key}.`);
   refreshMountsIfChanged();
 }
 
 async function handleList(msg: TgMessage): Promise<void> {
   const data = readMounts();
   if (data.mounts.length === 0) {
-    await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, "No mounts yet. Send `/mount <path>` in a topic to add one.");
+    await reply(tgAddr(msg.chat.id, msg.message_thread_id), "No mounts yet. Send `/mount <path>` in a topic to add one.");
     return;
   }
   // Join with topics.json so users see "thread 42 (Plans)" instead of bare
@@ -1631,7 +1636,7 @@ async function handleList(msg: TgMessage): Promise<void> {
     }
     return `• thread ${m.thread_id}${nameSuffix} → ${m.path}${m.label ? ` (${m.label})` : ""}`;
   });
-  await reply({ chat_id: msg.chat.id, thread_id: msg.message_thread_id }, `Current mounts:\n${lines.join("\n")}`);
+  await reply(tgAddr(msg.chat.id, msg.message_thread_id), `Current mounts:\n${lines.join("\n")}`);
 }
 
 // Telegram-convention: every bot's first-touch UX is /start. Telegram clients
@@ -1649,7 +1654,7 @@ async function handleStart(msg: TgMessage): Promise<void> {
   }
   // Unpaired. Tell them how to claim it.
   await reply(
-    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    tgAddr(msg.chat.id, msg.message_thread_id),
     [
       "👋 Hi. I'm a claude-code Telegram proxy waiting to be paired.",
       "",
@@ -1667,7 +1672,7 @@ async function handleUnpair(msg: TgMessage, args: string): Promise<void> {
   // command in a busy chat.
   if (args.trim().toLowerCase() !== "confirm") {
     await reply(
-      { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+      tgAddr(msg.chat.id, msg.message_thread_id),
       [
         "Unpair releases this chat so a different chat can claim the bot.",
         "Mounts are wiped. To proceed, send: `/unpair confirm`",
@@ -1691,14 +1696,14 @@ async function handleUnpair(msg: TgMessage, args: string): Promise<void> {
   pairedMtimeMs = 0;
   refreshMountsIfChanged();
   await reply(
-    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    tgAddr(msg.chat.id, msg.message_thread_id),
     "✓ Unpaired. Re-add me to a chat for the auto-pair prompt, or send `/pair <code>` (run `cta pair-code` on the host).",
   );
 }
 
 async function handleHelp(msg: TgMessage): Promise<void> {
   await reply(
-    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    tgAddr(msg.chat.id, msg.message_thread_id),
     [
       "Mount commands:",
       "  /mount <path>   — bind THIS forum topic to a project dir on the Mac",
@@ -1771,7 +1776,7 @@ const TUI_COMMANDS: Record<string, CommandSpec> = {
 
 async function handleHiddenTuiCommand(msg: TgMessage, command: string, reason: string): Promise<void> {
   await reply(
-    { chat_id: msg.chat.id, thread_id: msg.message_thread_id },
+    tgAddr(msg.chat.id, msg.message_thread_id),
     `\`${command}\` is a Claude Code TUI command — ${reason}`,
   );
 }
@@ -1963,7 +1968,7 @@ async function promptMountChoice(thread_id: number | "dm", chat_id: number, thre
   const cands = mountCandidates();
   const tid = String(thread_id);
   if (cands.length === 0) {
-    await reply({ chat_id, thread_id: threadIdRaw }, "This topic isn't linked to a project yet. Send `/mount <path>` (e.g. `/mount ~/projects/foo`), or set it in Pager.");
+    await reply(tgAddr(chat_id, threadIdRaw), "This topic isn't linked to a project yet. Send `/mount <path>` (e.g. `/mount ~/projects/foo`), or set it in Pager.");
     return;
   }
   const buttons = cands.map((p, i) => [{ text: mountBasename(p), callback_data: `mnt:${tid}:${i}` }]);
