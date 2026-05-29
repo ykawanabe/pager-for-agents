@@ -72,6 +72,17 @@ else
   h_dump_captures
 fi
 
+# Typing indicator must be RE-ASSERTED for the steered turn. The interrupted
+# turn's turn-end cleared the marker; without an onTurnStart re-arm the steered
+# turn runs with no "typing…" bubble and the bot looks idle while still working.
+# Marker path: $CTA_STATE_DIR/typing/<chat>__<thread>.token.
+if [[ -f "$CTA_STATE_DIR/typing/-1001234__42.token" ]]; then
+  h_ok "typing indicator re-armed for the steered turn (marker present)"
+else
+  h_ng "typing indicator NOT re-armed for steered turn (marker absent)"
+  h_dump_captures
+fi
+
 # Verify the daemon subprocess survived the interrupt (no kill/respawn).
 # The session UUID must be unchanged — interrupt does NOT rotate the session.
 UUID="$(tr -d '\n' < "$CTA_STATE_DIR/sessions/42" 2>/dev/null || true)"

@@ -666,6 +666,20 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
   void reply(tgAddr(chat_id, threadId), body);
 }
 
+/** Turn-start hook: (re-)assert the typing indicator for this topic. Fires on
+ *  every turn the registry starts — including a steered continuation after a
+ *  mid-turn interrupt, whose interrupted turn-end already cleared typing.
+ *  Without this, the bot keeps working with no "typing…" bubble (looks dead). */
+function onDaemonTurnStart(threadIdStr: string): void {
+  const chatIdStr = effectiveChatId();
+  if (!chatIdStr) return;
+  const chat_id = Number(chatIdStr);
+  if (!Number.isFinite(chat_id)) return;
+  if (isTyping(transport)) {
+    void transport.startTyping({ channel: "telegram", chatId: chat_id, threadId: parseRegistryThreadId(threadIdStr) });
+  }
+}
+
 /** Turn-end hook: clear typing keepalive (mcp-telegram normally does this
  *  on send_telegram; in daemon mode plain-text replies bypass MCP so we
  *  must clear ourselves), log cost. */
@@ -706,6 +720,7 @@ function initDaemonRegistry(): void {
     interruptDebounceMs: Number(process.env.PAGER_INTERRUPT_DEBOUNCE_MS ?? "1500"),
     onText: postTelegramTextFromDaemon,
     onFlush: onDaemonFlush,
+    onTurnStart: onDaemonTurnStart,
     onTurnEnd: onDaemonTurnEnd,
   });
 }

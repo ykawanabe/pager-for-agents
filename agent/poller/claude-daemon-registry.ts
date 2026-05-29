@@ -38,6 +38,13 @@ export interface RegistryOptions {
   onText: (threadId: string, text: string) => void;
   /** Optional: called when a batch is flushed to claude (text already sent). */
   onFlush?: (threadId: string, combinedText: string) => void;
+  /** Optional: turn-start callback — fired when a flushed batch is sent to the
+   *  daemon (turn goes inFlight). Symmetric with onTurnEnd. Lets the poller
+   *  (re-)assert the typing indicator on EVERY turn, so a steered continuation
+   *  after a mid-turn interrupt re-arms typing — the interrupted turn's turn-end
+   *  cleared the marker, and without this the bot keeps working with no
+   *  "typing…" bubble (looks dead). */
+  onTurnStart?: (threadId: string) => void;
   /** Optional: turn-end callback (post-result event) — cost logging. */
   onTurnEnd?: (threadId: string, info: TurnEndInfo) => void;
   /** Optional: backoff escalation cap. Default 60s. */
@@ -529,6 +536,11 @@ export class ClaudeDaemonRegistry {
     try {
       this.opts.onFlush?.(threadId, combined);
       await handle.daemon!.send(combined);
+      // Turn is now in-flight — signal turn-start so the poller can (re-)assert
+      // the typing indicator. Fires on EVERY turn, so a steered continuation
+      // after a mid-turn interrupt re-arms typing (the interrupted turn-end
+      // cleared the marker).
+      this.opts.onTurnStart?.(threadId);
       // Start the inactivity watchdog: if the daemon emits no text and no
       // turn-end/crash before it fires, the turn is presumed wedged.
       this.armInFlightWatchdog(threadId, handle);

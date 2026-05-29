@@ -73,6 +73,28 @@ describe("ClaudeDaemonRegistry basic dispatch", () => {
     expect(texts.some((m) => m.thread === "topic-42" && m.text.includes("from A"))).toBe(true);
     expect(texts.some((m) => m.thread === "topic-99" && m.text.includes("from B"))).toBe(true);
   });
+
+  test("onTurnStart fires once per turn (typing-indicator re-arm signal)", async () => {
+    const starts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      daemonOptsFor: () => ({ cwd: "/tmp" }),
+      onText: () => {},
+      onTurnStart: (t) => starts.push(t),
+      autoSteerEnabled: () => false, // pure sequential turns, no mid-turn interrupt
+    });
+
+    // Two sequential turns → onTurnStart must fire once per turn. This is the
+    // property that fixes the steered-turn typing bug: every (re)started turn
+    // re-asserts typing, so a mid-turn interrupt can't leave the bubble off.
+    reg.enqueue("topic-42", "first");
+    await waitFor(() => starts.length >= 1, 5000);
+    reg.enqueue("topic-42", "second");
+    await waitFor(() => starts.length >= 2, 5000);
+
+    expect(starts).toEqual(["topic-42", "topic-42"]);
+  });
 });
 
 describe("ClaudeDaemonRegistry debounce", () => {
