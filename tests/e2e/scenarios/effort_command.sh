@@ -49,6 +49,21 @@ else
   h_ng "effort/42 clobbered by invalid level"
 fi
 
+# "auto" sentinel → accepted + persisted (maps to omitting --effort at spawn,
+# so claude falls back to its own settings.json effortLevel default).
+h_inject_text 42 "/effort auto" 99 -1001234
+if h_wait_for_capture sendMessage \
+   '[.[] | select(.body.text|test("effort set to auto"))] | length >= 1' 10; then
+  h_ok "/effort auto acknowledged"
+else
+  h_ng "/effort auto not acknowledged"; h_dump_captures
+fi
+if [[ "$(cat "$CTA_STATE_DIR/effort/42" 2>/dev/null)" == "auto" ]]; then
+  h_ok "effort/42 persisted = auto"
+else
+  h_ng "effort/42 not persisted as auto (got '$(cat "$CTA_STATE_DIR/effort/42" 2>/dev/null)')"
+fi
+
 echo
 echo "scenario effort_command: $H_PASS passed, $H_FAIL failed"
 [[ "$H_FAIL" -eq 0 ]]

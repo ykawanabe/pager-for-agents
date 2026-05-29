@@ -469,9 +469,13 @@ IMPORTANT — Telegram pairing / access is handled by claude-telegram-agent, NOT
  * crash respawns) so config stays in sync with mount changes.
  */
 // ─── per-topic --effort level ────────────────────────────────────────────────
-// Valid claude --effort levels. "auto" is NOT a thing — these are the only
-// values claude accepts.
-const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+// claude's real --effort levels PLUS "auto" — a bot-level sentinel meaning
+// "don't pass --effort at all, let claude use its own settings.json effortLevel
+// default." "auto" is NEVER passed to claude (claude rejects --effort auto); it
+// is mapped to `undefined` at daemon spawn via effortArg() → buildArgv omits the
+// flag. Kept in the valid set so /effort auto and PAGER_EFFORT=auto are accepted
+// and displayed.
+const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "auto"]);
 // Bot-wide default. Overridable via PAGER_EFFORT in ~/.pager/.env. Deliberately
 // independent of the user's GLOBAL settings.json effortLevel (which also drives
 // their desktop claude) — the bot defaults to "high" for snappier phone replies.
@@ -480,13 +484,20 @@ const DEFAULT_EFFORT =
     ? process.env.PAGER_EFFORT
     : "high";
 function effortDir(): string { return join(STATE_DIR, "effort"); }
-/** Per-topic effort override (set via /effort), else the bot default. */
+/** Per-topic effort override (set via /effort), else the bot default. Returns
+ *  the RAW stored value — including the "auto" sentinel — for display. Callers
+ *  building the daemon argv must pass it through effortArg(). */
 function resolveEffort(key: number | "dm"): string {
   try {
     const v = readFileSync(join(effortDir(), String(key)), "utf8").trim();
     if (VALID_EFFORTS.has(v)) return v;
   } catch { /* no override → default */ }
   return DEFAULT_EFFORT;
+}
+/** Map a resolved effort to the actual --effort argument: "auto" → undefined
+ *  (omit the flag so claude uses its own default), every real level → itself. */
+function effortArg(eff: string): string | undefined {
+  return eff === "auto" ? undefined : eff;
 }
 
 // ─── per-topic --model ───────────────────────────────────────────────────────
@@ -533,7 +544,7 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
     // P4: no poller --mcp-config; claude inherits the user's own MCPs only.
     settingsPath: existsSync(hooksPath) ? hooksPath : undefined,
     appendSystemPrompt: process.env.BOT_APPEND_SYSTEM_PROMPT ?? DAEMON_APPEND_SYSTEM_PROMPT,
-    effort: resolveEffort(key),
+    effort: effortArg(resolveEffort(key)),
     model: resolveModel(key),
   };
 }
@@ -547,11 +558,11 @@ async function handleEffort(ev: InboundMessageEvent, args: string): Promise<void
   const level = args.trim().toLowerCase().split(/\s+/)[0];
 
   if (!level) {
-    await reply(dest, `effort for this topic: ${resolveEffort(key)} (default ${DEFAULT_EFFORT})\nUsage: /effort <low|medium|high|xhigh|max>`);
+    await reply(dest, `effort for this topic: ${resolveEffort(key)} (default ${DEFAULT_EFFORT})\nUsage: /effort <low|medium|high|xhigh|max|auto>  (auto = let claude use its own default)`);
     return;
   }
   if (!VALID_EFFORTS.has(level)) {
-    await reply(dest, `"${level}" is not valid. Choose: low, medium, high, xhigh, max.`);
+    await reply(dest, `"${level}" is not valid. Choose: low, medium, high, xhigh, max, auto.`);
     return;
   }
   try {
@@ -1752,7 +1763,7 @@ async function handleHelp(ev: InboundMessageEvent): Promise<void> {
       "  /cost           — token usage + estimated cost for this session",
       "  /usage          — Anthropic 5h/7d subscription usage",
       "  /clear          — reset the conversation (new session UUID)",
-      "  /effort <level> — set reasoning effort for this topic (low|medium|high|xhigh|max)",
+      "  /effort <level> — set reasoning effort for this topic (low|medium|high|xhigh|max|auto)",
       "  /model <name>   — set model for this topic (opus|sonnet|haiku|full-id)",
       "  /context        — approx context-window usage for this topic",
       "  /restart        — restart claude on this topic (keep session)",
@@ -2139,7 +2150,7 @@ const BOT_COMMAND_MENU = [
   { command: "usage",   description: "Anthropic 5h / 7d subscription usage" },
   { command: "status",  description: "Bot and daemon health" },
   { command: "context", description: "Approx context-window usage for this topic" },
-  { command: "effort",  description: "Set reasoning effort (low|medium|high|xhigh|max)" },
+  { command: "effort",  description: "Set reasoning effort (low|medium|high|xhigh|max|auto)" },
   { command: "model",   description: "Set model (opus|sonnet|haiku|full-id)" },
 ];
 
@@ -2319,6 +2330,7 @@ export {
   refreshMountsIfChanged,
   effectiveChatId,
   effectiveUserId,
+  effortArg,
   type TgMessage,
   type InboundMessageEvent,
   type PairedState,

@@ -712,6 +712,19 @@ describe("/clear (D14 — TUI command translated, not delegated)", () => {
   });
 });
 
+describe("effortArg — auto sentinel maps to omit --effort", () => {
+  test("auto → undefined (omit the flag → claude uses its own default)", () => {
+    expect(poller.effortArg("auto")).toBeUndefined();
+  });
+  test("real levels pass through unchanged", () => {
+    expect(poller.effortArg("low")).toBe("low");
+    expect(poller.effortArg("medium")).toBe("medium");
+    expect(poller.effortArg("high")).toBe("high");
+    expect(poller.effortArg("xhigh")).toBe("xhigh");
+    expect(poller.effortArg("max")).toBe("max");
+  });
+});
+
 // ─── Phase 1: bot-side slash command intercept ──────────────────────────────
 // /cost, /usage, /restart all run server-side instead of relaying claude TUI
 // output via the picker-watcher Format A/B parser (deleted in this phase).
