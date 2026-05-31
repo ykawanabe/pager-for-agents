@@ -5,7 +5,9 @@ struct MenuView: View {
     @ObservedObject var caffeinate: CaffeinateController
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
-    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = false
+    // Default true: see ClaudePagerApp.swift. All three @AppStorage call
+    // sites must agree — SwiftUI uses the first registration on the key.
+    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = true
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true
 
     var body: some View {

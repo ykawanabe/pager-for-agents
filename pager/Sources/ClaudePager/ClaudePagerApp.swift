@@ -29,7 +29,13 @@ struct ClaudePagerApp: App {
     @ObservedObject private var monitor = StatusMonitor.shared
     @ObservedObject private var caffeinate = CaffeinateController()
     @AppStorage("stopBotOnQuit") private var stopBotOnQuit = true
-    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = false
+    // Default ON: the bot is a 24/7 service, and macOS's aggressive battery-
+    // mode idle sleep (sleep=1 min by default on Apple Silicon) makes the bot
+    // silently unresponsive within minutes of inactivity. `onlyOnAC=true`
+    // keeps battery drain bounded: caffeinate runs only when the Mac is
+    // plugged in. Users who want awake-on-battery too can flip onlyOnAC in
+    // Settings.
+    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = true
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true
 
     init() {
