@@ -528,6 +528,49 @@ CAFFEINATE_CALLS=""
 _config_caffeinate "" >/dev/null 2>&1 && ng "_config_caffeinate (empty): should exit non-zero" \
                                       || ok "_config_caffeinate (empty): rejected"
 
+# ─── _caffeinate_external_pid: detect untracked caffeinates by argv flags ───
+#
+# When something OUTSIDE cta is holding a system-sleep assertion (Claude Code
+# bash-spawned caffeinates, third-party tooling), status should surface that
+# so users aren't confused by "Caffeinate: false" while the Mac stays awake.
+# Helper walks `pgrep -x caffeinate` and checks each argv for an awake-holding
+# flag (-i, -s, -m, -u); -d (display-only) is excluded.
+
+CAFFEINATE_PID_FILE=$(mktemp -u)   # no pidfile = no cta-tracked process
+
+# Case A: a `caffeinate -i` exists → return that PID.
+pgrep() { [[ "$1" == "-x" && "$2" == "caffeinate" ]] && echo "12345"; }
+ps()    { [[ "$3" == "-p" && "$4" == "12345" ]] && echo "caffeinate -i"; }
+[[ "$(_caffeinate_external_pid)" == "12345" ]] \
+  && ok "_caffeinate_external_pid: caffeinate -i detected" \
+  || ng "_caffeinate_external_pid: caffeinate -i not detected"
+
+# Case B: a `caffeinate -d` (display-only) is NOT awake-holding → skip.
+pgrep() { [[ "$1" == "-x" && "$2" == "caffeinate" ]] && echo "12345"; }
+ps()    { [[ "$3" == "-p" && "$4" == "12345" ]] && echo "caffeinate -d"; }
+! _caffeinate_external_pid >/dev/null \
+  && ok "_caffeinate_external_pid: display-only -d ignored" \
+  || ng "_caffeinate_external_pid: -d should be ignored"
+
+# Case C: timed -i with -t still counts (the most common Claude Code variant).
+pgrep() { [[ "$1" == "-x" && "$2" == "caffeinate" ]] && echo "67890"; }
+ps()    { [[ "$3" == "-p" && "$4" == "67890" ]] && echo "caffeinate -i -t 300"; }
+[[ "$(_caffeinate_external_pid)" == "67890" ]] \
+  && ok "_caffeinate_external_pid: -i -t 300 (timed) detected" \
+  || ng "_caffeinate_external_pid: timed -i not detected"
+
+# Case D: the tracked PID is filtered out (we're asking for *external* only).
+CAFFEINATE_PID_FILE=$(mktemp)
+echo "12345" > "$CAFFEINATE_PID_FILE"
+pgrep() { [[ "$1" == "-x" && "$2" == "caffeinate" ]] && echo "12345"; }
+ps()    { [[ "$3" == "-p" && "$4" == "12345" ]] && echo "caffeinate -i"; }
+! _caffeinate_external_pid >/dev/null \
+  && ok "_caffeinate_external_pid: tracked PID filtered out" \
+  || ng "_caffeinate_external_pid: tracked PID should be excluded"
+rm -f "$CAFFEINATE_PID_FILE"
+
+unset -f pgrep ps
+
 # ─── cmd_status: caffeinate field exposed in JSON ────────────────────────────
 #
 # Re-run cmd_status with caffeinate "alive" via stubbed PID file and confirm
@@ -546,6 +589,9 @@ _last_activity()      { echo ""; }
 
 CAFFEINATE_PID_FILE=$(mktemp)
 echo "$$" > "$CAFFEINATE_PID_FILE"
+# cta-managed alive — external detection should not fire (and `external_pid`
+# should be null) regardless of what else is on the system, because we early-
+# return before the pgrep walk.
 JSON_CAFF=$(cmd_status json)
 echo "$JSON_CAFF" | python3 -c '
 import json, sys
@@ -553,11 +599,16 @@ data = json.load(sys.stdin)
 caff = data["caffeinate"]
 assert caff["alive"] is True, "alive should be True, got " + repr(caff)
 assert isinstance(caff["pid"], int), "pid should be int, got " + repr(caff["pid"])
+assert caff["external_pid"] is None, "external_pid should be null when cta-managed alive, got " + repr(caff)
 ' \
-  && ok "cmd_status json: caffeinate.alive=true exposed" \
+  && ok "cmd_status json: caffeinate.alive=true + external_pid=null" \
   || ng "cmd_status json: caffeinate field missing or malformed"
 
 rm -f "$CAFFEINATE_PID_FILE"
+# cta-managed dead + no external — both pid and external_pid null.
+# Stub _caffeinate_external_pid to "" so we don't depend on the host having
+# (or not having) some other caffeinate running concurrently with the test.
+_caffeinate_external_pid() { return 1; }
 JSON_NOCAFF=$(cmd_status json)
 echo "$JSON_NOCAFF" | python3 -c '
 import json, sys
@@ -565,9 +616,36 @@ data = json.load(sys.stdin)
 caff = data["caffeinate"]
 assert caff["alive"] is False, "alive should be False, got " + repr(caff)
 assert caff["pid"] is None, "pid should be null, got " + repr(caff["pid"])
+assert caff["external_pid"] is None, "external_pid should be null when nothing detected, got " + repr(caff)
 ' \
-  && ok "cmd_status json: caffeinate.alive=false when no pid file" \
+  && ok "cmd_status json: caffeinate=off + external_pid=null" \
   || ng "cmd_status json: caffeinate=off state wrong"
+
+# cta-managed dead + external present — external_pid carries the foreign PID.
+_caffeinate_external_pid() { echo 99999; return 0; }
+JSON_EXT=$(cmd_status json)
+echo "$JSON_EXT" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+caff = data["caffeinate"]
+assert caff["alive"] is False, "alive should be False, got " + repr(caff)
+assert caff["pid"] is None, "pid should be null, got " + repr(caff["pid"])
+assert caff["external_pid"] == 99999, "external_pid should surface the foreign PID, got " + repr(caff)
+' \
+  && ok "cmd_status json: external caffeinate surfaced as external_pid" \
+  || ng "cmd_status json: external_pid not surfaced"
+
+# Text output: external should be mentioned so users aren't confused by
+# "Caffeinate: false" while the Mac is being kept awake by something else.
+TXT_EXT=$(cmd_status 2>/dev/null)
+echo "$TXT_EXT" | grep -q "external pid 99999" \
+  && ok "cmd_status text: external pid annotated on 'false' line" \
+  || ng "cmd_status text: external pid not annotated (got: $TXT_EXT)"
+
+# Restore a no-op (returns "nothing detected") so later cmd_status tests don't
+# hit "command not found" — leaving the real pgrep/ps walk in place here would
+# make later assertions flaky on hosts that happen to have a caffeinate up.
+_caffeinate_external_pid() { return 1; }
 
 # ─── cmd_status: file_access field (FDA probe, surfaced from the poller) ──────
 # The poller (launchd TCC context) writes $STATE_DIR/file-access.json; cta status

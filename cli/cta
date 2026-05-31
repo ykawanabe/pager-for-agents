@@ -239,12 +239,13 @@ cmd_status() {
   local activity
   activity=$(_last_activity)
 
-  local caffeinate_pid="" caffeinate_alive
+  local caffeinate_pid="" caffeinate_alive caffeinate_external_pid=""
   if _caffeinate_alive; then
     caffeinate_alive=true
     caffeinate_pid=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null)
   else
     caffeinate_alive=false
+    caffeinate_external_pid=$(_caffeinate_external_pid || true)
   fi
 
   # File-access (FDA) probe result, written by the poller in the launchd TCC
@@ -268,7 +269,7 @@ cmd_status() {
     "claude": {"name": $(_json_str_or_null "$control_session"), "alive": $tmux_claude},
     "watchdog": {"name": $(_json_str_or_null "$TMUX_SESSION_WATCHDOG"), "alive": $tmux_watchdog}
   },
-  "caffeinate": {"alive": $caffeinate_alive, "pid": $(_json_int_or_null "$caffeinate_pid")},
+  "caffeinate": {"alive": $caffeinate_alive, "pid": $(_json_int_or_null "$caffeinate_pid"), "external_pid": $(_json_int_or_null "$caffeinate_external_pid")},
   "last_activity": $(_json_str_or_null "$activity"),
   "file_access": $file_access
 }
@@ -284,6 +285,11 @@ EOF
     printf 'Watchdog:         %s\n' "$tmux_watchdog"
     if [[ "$caffeinate_alive" == "true" ]]; then
       printf 'Caffeinate:       %s (pid %s)\n' "$caffeinate_alive" "$caffeinate_pid"
+    elif [[ -n "$caffeinate_external_pid" ]]; then
+      # An external `caffeinate -i/-s/-m/-u` is keeping the Mac awake from
+      # outside cta — show it so the user isn't confused by "false" while the
+      # Mac is actually being kept awake.
+      printf 'Caffeinate:       %s (external pid %s — not cta-managed)\n' "$caffeinate_alive" "$caffeinate_external_pid"
     else
       printf 'Caffeinate:       %s\n' "$caffeinate_alive"
     fi
@@ -583,6 +589,35 @@ _caffeinate_alive() {
   pid=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null) || return 1
   [[ -n "$pid" ]] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+# Echo the PID of an external caffeinate process keeping the system awake (an
+# instance NOT tracked by our pidfile) — or empty if none. Used by `cta status`
+# so users aren't confused when something else (Claude Code's bash spawns, a
+# third-party tool) is holding the assertion: the menu/status would otherwise
+# say "Caffeinate: false" while the Mac is actually being kept awake.
+# Matches `caffeinate -i / -s / -m / -u` (the flags that hold sleep assertions);
+# excludes `-d` only (display-only, no system-sleep prevention).
+_caffeinate_external_pid() {
+  local tracked=""
+  [[ -f "$CAFFEINATE_PID_FILE" ]] && tracked=$(cat "$CAFFEINATE_PID_FILE" 2>/dev/null || true)
+  # `pgrep -f` returns one PID per line; `ps -o args=` re-fetches argv so we
+  # can filter on flags. Pure pgrep can't filter by flag set.
+  local pid
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    [[ "$pid" == "$tracked" ]] && continue
+    local args
+    args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    # Match any of -i, -s, -m, -u (with or without space, lone or in a group
+    # like -ims). Exclude rows that are ONLY -d (display sleep prevention,
+    # doesn't keep the system awake from the bot's perspective).
+    if [[ "$args" =~ caffeinate( |$).*-[ismu] ]]; then
+      echo "$pid"
+      return 0
+    fi
+  done < <(pgrep -x caffeinate 2>/dev/null || true)
+  return 1
 }
 
 # Spawn `caffeinate -i` detached from this cta process so it survives the
