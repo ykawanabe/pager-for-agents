@@ -674,6 +674,81 @@ echo "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["fi
   || ng "cmd_status json: file_access should be null when absent"
 rm -rf "$FA_TMP"
 
+# ─── sleep-fix: pmset parsing + config ───────────────────────────────────────
+# _sleep_fix_risky reads `pmset -g` (via the PMSET_BIN override) and lists the
+# settings that still permit a nap — which would freeze the long-poll. A stub
+# pmset pins each state without touching the host's real power policy. The
+# fake reads SF_STANDBY/SF_POWERNAP/SF_SLEEP from its env so we can flip states.
+SF_TMP=$(mktemp -d)
+cat > "$SF_TMP/fake-pmset" <<'EOF'
+#!/bin/bash
+[[ "${1:-}" == "-g" ]] || exit 0
+cat <<OUT
+System-wide power settings:
+Currently in use:
+ standby              ${SF_STANDBY:-1}
+ powernap             ${SF_POWERNAP:-1}
+ disksleep            10
+ sleep                ${SF_SLEEP:-1}
+OUT
+EOF
+chmod +x "$SF_TMP/fake-pmset"
+export PMSET_BIN="$SF_TMP/fake-pmset"
+
+# Hardened host: every nap setting 0 → no risk, status exits 0.
+export SF_STANDBY=0 SF_POWERNAP=0 SF_SLEEP=0
+[[ -z "$(_sleep_fix_risky)" ]] \
+  && ok "_sleep_fix_risky: all-zero pmset → no risk" \
+  || ng "_sleep_fix_risky: all-zero should be empty (got '$(_sleep_fix_risky)')"
+_config_sleep_fix status >/dev/null 2>&1 \
+  && ok "_config_sleep_fix status: hardened → exit 0" \
+  || ng "_config_sleep_fix status: hardened should exit 0"
+
+# standby + powernap still on (sleep off) → both reported, in pmset order.
+export SF_STANDBY=1 SF_POWERNAP=1 SF_SLEEP=0
+[[ "$(_sleep_fix_risky)" == "standby powernap" ]] \
+  && ok "_sleep_fix_risky: standby+powernap on → 'standby powernap'" \
+  || ng "_sleep_fix_risky: expected 'standby powernap', got '$(_sleep_fix_risky)'"
+! _config_sleep_fix status >/dev/null 2>&1 \
+  && ok "_config_sleep_fix status: risky → exit 1" \
+  || ng "_config_sleep_fix status: risky should exit non-zero"
+
+# sleep alone on → just 'sleep'.
+export SF_STANDBY=0 SF_POWERNAP=0 SF_SLEEP=1
+[[ "$(_sleep_fix_risky)" == "sleep" ]] \
+  && ok "_sleep_fix_risky: sleep-only → 'sleep'" \
+  || ng "_sleep_fix_risky: expected 'sleep', got '$(_sleep_fix_risky)'"
+
+# pmset absent (e.g. a Linux host) → no keys → no risk (nothing naps there).
+export PMSET_BIN="$SF_TMP/nope"
+[[ -z "$(_sleep_fix_risky)" ]] \
+  && ok "_sleep_fix_risky: pmset absent → no risk (Linux-safe)" \
+  || ng "_sleep_fix_risky: absent pmset should yield no risk"
+export PMSET_BIN="$SF_TMP/fake-pmset"
+
+# `on` must shell out to: sudo pmset -a sleep 0 disksleep 0 standby 0 powernap 0.
+# Stub sudo to record argv instead of mutating the real machine.
+cat > "$SF_TMP/fake-sudo" <<EOF
+#!/bin/bash
+echo "\$@" > "$SF_TMP/sudo-args"
+EOF
+chmod +x "$SF_TMP/fake-sudo"
+export PMSET_SUDO="$SF_TMP/fake-sudo"
+_config_sleep_fix on >/dev/null 2>&1
+SF_ARGS=$(cat "$SF_TMP/sudo-args" 2>/dev/null || true)
+[[ "$SF_ARGS" == *"sleep 0"* && "$SF_ARGS" == *"standby 0"* && "$SF_ARGS" == *"powernap 0"* ]] \
+  && ok "_config_sleep_fix on: sudo pmset disables sleep+standby+powernap" \
+  || ng "_config_sleep_fix on: wrong pmset args ('$SF_ARGS')"
+unset PMSET_SUDO
+
+# Bad arg → usage error, non-zero.
+_config_sleep_fix banana >/dev/null 2>&1 \
+  && ng "_config_sleep_fix banana: should exit non-zero" \
+  || ok "_config_sleep_fix banana: rejected"
+
+unset PMSET_BIN SF_STANDBY SF_POWERNAP SF_SLEEP
+rm -rf "$SF_TMP"
+
 # ─── pipefail+SIGPIPE regression guard ───────────────────────────────────────
 # Under `set -uo pipefail`, the old `launchctl list | grep -q LABEL` (and
 # similar ps|grep|head pipelines for _claude_ps_line / _mcp_alive) flipped

@@ -427,6 +427,28 @@ Tail the agent log:  tail -f $CONFIG_DIR/agent.log
 EOF
 fi
 
+# ---- 7b. Recommend the host sleep-fix --------------------------------------
+# The poller is a CONTINUOUS long-poll: macOS idle-sleep — or, on Apple
+# Silicon, standby/powernap maintenance naps — freeze it and the bot goes
+# silently quiet. caffeinate is the weak lever (it doesn't stop standby/
+# powernap); the real fix is pmset. We do NOT auto-sudo here — install
+# shouldn't change system power policy unprompted — we only surface the
+# one-liner, and only when the host isn't already hardened.
+if ! "$BIN_DIR/cta" config sleep-fix status >/dev/null 2>&1; then
+  cat <<EOF
+
+⚠  Keep the bot from going silent when the Mac is idle:
+
+   The poller freezes if macOS idle-sleeps, or (Apple Silicon) enters
+   standby/powernap. Harden the host once — needs sudo:
+
+     cta config sleep-fix on      # sudo pmset -a sleep 0 disksleep 0 standby 0 powernap 0
+
+   Check anytime: cta status      (see the "Sleep-fix:" line)
+   For true 24/7, run the agent on a never-sleep Mac or a Linux host.
+EOF
+fi
+
 # Optional: chain-install the companion Claude Pager menu bar app. The Pager
 # lives at pager/ inside this repo (merged from the old claude-telegram-agent-bar
 # repo). Build requires `swift`, so default to "ask" when it's available and

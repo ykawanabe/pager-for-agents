@@ -248,6 +248,13 @@ cmd_status() {
     caffeinate_external_pid=$(_caffeinate_external_pid || true)
   fi
 
+  # Host power-management: does the active pmset profile still allow a nap that
+  # would freeze the long-poll? Empty risky-list ⇒ hardened. The real lever for
+  # "bot goes silent when idle" — see `cta config sleep-fix`.
+  local sleep_fix_risky sleep_fix_applied
+  sleep_fix_risky=$(_sleep_fix_risky)
+  if [[ -z "$sleep_fix_risky" ]]; then sleep_fix_applied=true; else sleep_fix_applied=false; fi
+
   # File-access (FDA) probe result, written by the poller in the launchd TCC
   # context ($STATE_DIR/file-access.json). cta is the WRONG context to probe, so
   # we only surface what the poller recorded. Absent → null (older agents).
@@ -270,6 +277,7 @@ cmd_status() {
     "watchdog": {"name": $(_json_str_or_null "$TMUX_SESSION_WATCHDOG"), "alive": $tmux_watchdog}
   },
   "caffeinate": {"alive": $caffeinate_alive, "pid": $(_json_int_or_null "$caffeinate_pid"), "external_pid": $(_json_int_or_null "$caffeinate_external_pid")},
+  "sleep_fix": {"applied": $sleep_fix_applied, "risky": $(_json_str_or_null "$sleep_fix_risky")},
   "last_activity": $(_json_str_or_null "$activity"),
   "file_access": $file_access
 }
@@ -292,6 +300,11 @@ EOF
       printf 'Caffeinate:       %s (external pid %s — not cta-managed)\n' "$caffeinate_alive" "$caffeinate_external_pid"
     else
       printf 'Caffeinate:       %s\n' "$caffeinate_alive"
+    fi
+    if [[ "$sleep_fix_applied" == "true" ]]; then
+      printf 'Sleep-fix:        applied (no idle-sleep / standby / powernap)\n'
+    else
+      printf 'Sleep-fix:        NOT applied — %s still on → `cta config sleep-fix on`\n' "$sleep_fix_risky"
     fi
     printf 'Last activity:    %s\n' "${activity:-(none)}"
   fi
@@ -409,18 +422,19 @@ cmd_config() {
   case "$sub" in
     ack)        _config_ack "${1:-}" ;;
     caffeinate) _config_caffeinate "${1:-}" ;;
+    sleep-fix)  _config_sleep_fix "${1:-}" ;;
     idle-evict) _config_idle_evict "${1:-}" ;;
     interrupt-steer) _config_interrupt_steer "${1:-}" ;;
     digest-time) _config_digest_time "${1:-}" ;;
     quiet-hours) _config_quiet_hours "${1:-}" "${2:-}" ;;
     timezone) _config_timezone "${1:-}" ;;
     "")
-      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
+      echo "Usage: cta config <ack|caffeinate|sleep-fix|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
       return 1
       ;;
     *)
       echo "Unknown config subcommand: $sub" >&2
-      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
+      echo "Usage: cta config <ack|caffeinate|sleep-fix|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
       return 1
       ;;
   esac
@@ -686,6 +700,81 @@ _config_caffeinate() {
       ;;
     *)
       echo "Invalid value: $val (expected 'on' or 'off')" >&2
+      return 1
+      ;;
+  esac
+}
+
+# ─── Sleep-fix: host power-management hardening ──────────────────────────────
+# The poller is a CONTINUOUS long-poll. If the Mac idle-sleeps — or, on Apple
+# Silicon, drops into a `standby`/`powernap` maintenance nap — the process is
+# frozen and inbound Telegram updates are missed: the bot goes "silently"
+# quiet. caffeinate -i does NOT prevent standby/powernap (it only blocks idle
+# *system* sleep), so the real fix is pmset. This is the same recipe OpenClaw's
+# own gateway runbook lands on, and what our 2026-05-29 investigation found:
+# disable sleep + standby + powernap on the host. pmset itself admits this
+# "significantly reduces but does not entirely eliminate" maintenance sleep —
+# the watchdog (com.claude-watchdog) covers the residual.
+PMSET_SLEEP_FIX_ARGS=(-a sleep 0 disksleep 0 standby 0 powernap 0)
+
+# Echo the active value of a pmset setting (current power source), or empty if
+# pmset/the key is absent (e.g. on Linux — where nothing naps, so that's fine).
+_pmset_val() {
+  local key="$1" bin="${PMSET_BIN:-/usr/bin/pmset}"
+  command -v "$bin" >/dev/null 2>&1 || [[ -x "$bin" ]] || return 0
+  "$bin" -g 2>/dev/null | awk -v k="$key" '$1==k {print $2; exit}'
+}
+
+# Echo the space-separated list of settings that still permit a nap/sleep (and
+# would thus freeze the poller). Empty output ⇒ the host is hardened.
+_sleep_fix_risky() {
+  local risky="" s v
+  for s in sleep standby powernap; do
+    v=$(_pmset_val "$s")
+    # Non-empty and non-zero ⇒ this setting still allows a nap.
+    [[ -n "$v" && "$v" != "0" ]] && risky+="${risky:+ }$s"
+  done
+  echo "$risky"
+}
+
+# on  → apply the never-nap pmset profile (needs sudo; prompts in the terminal).
+# off → restore macOS-typical defaults (the Mac may idle-sleep again).
+# status / "" → report whether the fix is in effect (read-only, no sudo).
+_config_sleep_fix() {
+  local val="${1:-status}" bin="${PMSET_BIN:-/usr/bin/pmset}" sudo_bin="${PMSET_SUDO:-sudo}"
+  case "$val" in
+    on)
+      echo "Applying host sleep-fix (needs sudo):"
+      echo "  sudo pmset ${PMSET_SLEEP_FIX_ARGS[*]}"
+      echo "  → disables idle-sleep + standby + powernap so the poller never freezes."
+      if "$sudo_bin" "$bin" "${PMSET_SLEEP_FIX_ARGS[@]}"; then
+        echo "Done. Verify with: cta status"
+      else
+        echo "pmset failed (sudo declined?). Run it manually:" >&2
+        echo "  sudo pmset ${PMSET_SLEEP_FIX_ARGS[*]}" >&2
+        return 1
+      fi
+      ;;
+    off)
+      echo "Restoring macOS sleep defaults (needs sudo): sudo pmset -a sleep 1 disksleep 10 standby 1 powernap 1"
+      if "$sudo_bin" "$bin" -a sleep 1 disksleep 10 standby 1 powernap 1; then
+        echo "Done. The Mac may idle-sleep / nap again — the bot can go silent when it does."
+      else
+        return 1
+      fi
+      ;;
+    status|"")
+      local risky; risky=$(_sleep_fix_risky)
+      if [[ -z "$risky" ]]; then
+        echo "sleep-fix: applied (no idle-sleep / standby / powernap — poller stays alive)"
+      else
+        echo "sleep-fix: NOT applied — still permits a nap that freezes the poller: $risky"
+        echo "Apply with: cta config sleep-fix on   (runs: sudo pmset ${PMSET_SLEEP_FIX_ARGS[*]})"
+        return 1
+      fi
+      ;;
+    *)
+      echo "Usage: cta config sleep-fix <on|off|status>" >&2
       return 1
       ;;
   esac
@@ -2133,6 +2222,8 @@ Usage:
   cta unpair [--keep-mounts]      Release the paired chat so you can pair a different one
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
+  cta config sleep-fix <on|off|status>  Harden host sleep so the poller never freezes
+                                  (pmset: disables idle-sleep + standby + powernap; on/off need sudo)
   cta config interrupt-steer <on|off>  Toggle mid-turn steering (interrupt a running turn)
   cta config digest-time <HH:MM>  Set when the H2 daily digest fires (local time in your tz)
   cta config quiet-hours <start> <end>  Set quiet window (digest defers inside; HH:MM, wraps midnight if start>end)

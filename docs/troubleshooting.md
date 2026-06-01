@@ -58,6 +58,45 @@ cta stop      # unloads both LaunchAgents; SIGTERMs the poller + its claude daem
 
 Bring it all back with `cta start`.
 
+## The bot goes silent when the Mac is idle (sleep / standby / powernap)
+
+The poller is a **continuous long-poll** — it has to be running every second to
+receive inbound Telegram updates. When the Mac idle-sleeps, or (on Apple
+Silicon) drops into a `standby`/`powernap` maintenance nap, the process is
+frozen and messages sent during that window are missed. It looks like the bot
+"silently stopped replying," then springs back the moment you touch the
+machine.
+
+`caffeinate` is the **weak lever** here: `caffeinate -i` only blocks idle
+*system* sleep — it does **not** prevent standby or powernap, so on Apple
+Silicon the poller still freezes for most of each maintenance cycle. That's why
+the Pager's "Keep Mac awake" toggle now defaults **off**.
+
+The real fix is `pmset`. Run once on the host (needs sudo):
+
+```sh
+cta config sleep-fix on        # → sudo pmset -a sleep 0 disksleep 0 standby 0 powernap 0
+```
+
+Check the current state any time:
+
+```sh
+cta config sleep-fix status    # or look for the "Sleep-fix:" line in `cta status`
+```
+
+Caveats (the same ones OpenClaw's gateway runbook documents — this is a shared
+macOS constraint, not a bug in this project):
+
+- pmset *significantly reduces but doesn't entirely eliminate* maintenance
+  sleep (the OS still wakes briefly for TCP-keepalive / mDNS upkeep). The
+  watchdog (`com.claude-watchdog`) re-arms the poller after those.
+- It does **not** survive closing a laptop lid (clamshell sleep). For genuine
+  24/7 reachability, run the agent on a never-sleep desktop Mac (a Mac mini set
+  to never sleep) or move the poller to an always-on Linux host.
+
+Revert with `cta config sleep-fix off` (restores macOS sleep defaults — the bot
+can go silent on idle again).
+
 ## Mid-turn messages and `/stop`
 
 By default, a message you send while Claude is working will **steer** the running task: the agent waits ~1.5 seconds (in case more messages follow), then interrupts Claude gracefully and processes your new message next. The session and conversation history are preserved — only the in-flight turn is aborted.
