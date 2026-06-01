@@ -37,6 +37,13 @@ export interface RunHeartbeatOpts {
   /** UUID for `claude --resume` so day N+1 sees day N's findings. Caller
    *  manages lifecycle (create on first run, persist across fires). */
   readonly sessionUuid: string;
+  /** True when the sessionUuid refers to an existing claude session (build
+   *  argv with `--resume`). False on the first fire when the UUID was just
+   *  generated (build argv with `--session-id` so claude CREATES the
+   *  session). Mirrors claude-daemon.ts:buildArgv's `resumeExisting` flag.
+   *  Default true (assume existing) so callers that don't know just retry
+   *  on the error path. */
+  readonly resumeExisting?: boolean;
 
   // Optional / overridable
   readonly claudeBin?: string;             // default "claude"
@@ -142,10 +149,13 @@ export function buildClaudeArgv(opts: {
   prompt: string;
   sessionUuid: string;
   model: string;
+  /** True → use `--resume <uuid>` (claude requires the session to exist).
+   *  False → use `--session-id <uuid>` (claude creates a session with that ID). */
+  resumeExisting: boolean;
 }): string[] {
   return [
     "-p", opts.prompt,
-    "--resume", opts.sessionUuid,
+    opts.resumeExisting ? "--resume" : "--session-id", opts.sessionUuid,
     "--output-format", "stream-json",
     "--verbose",
     "--model", opts.model,
@@ -260,7 +270,19 @@ export async function runHeartbeat(opts: RunHeartbeatOpts): Promise<DigestResult
 
   // Step 3: spawn claude with --tools "Read,Glob,Grep" (Design A — no Bash)
   const prompt = buildUserPrompt(results, context);
-  const argv = [claudeBin, ...buildClaudeArgv({ prompt, sessionUuid: opts.sessionUuid, model })];
+  const argv = [
+    claudeBin,
+    ...buildClaudeArgv({
+      prompt,
+      sessionUuid: opts.sessionUuid,
+      model,
+      // Default true unless caller explicitly says it's a fresh session.
+      // Production scheduler in poller.ts:digestDispatch passes false on
+      // first fire (when UUID was just generated), true on subsequent
+      // fires (when UUID was read from the session file).
+      resumeExisting: opts.resumeExisting ?? true,
+    }),
+  ];
 
   // SIGTERM at sigTermMs (graceful — give claude time to flush --resume session
   // JSONL), SIGKILL at sigKillMs. Done via two timers + AbortController.

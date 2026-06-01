@@ -854,7 +854,7 @@ cmd_digest() {
     return $?
   fi
   if [[ "$action" == "on" || "$action" == "off" ]]; then
-    _digest_set "$thread" "$action"
+    _digest_set "$thread" "$@"
     return $?
   fi
   if [[ -z "$action" ]]; then
@@ -899,8 +899,22 @@ _digest_show() {
 
 _digest_set() {
   local thread="$1" action="$2"
-  bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" set-digest "$thread" "$action" >/dev/null
-  echo "digest for thread $thread: $action"
+  # Forward optional flags (currently only --send-on-empty) to mount-store.
+  local extra=()
+  shift 2 2>/dev/null || true
+  while (( $# )); do
+    case "$1" in
+      --send-on-empty) extra+=("--send-on-empty") ;;
+      *) echo "Unknown flag: $1" >&2; return 1 ;;
+    esac
+    shift
+  done
+  bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" set-digest "$thread" "$action" "${extra[@]}" >/dev/null
+  if [[ "$action" == "on" && ${#extra[@]} -gt 0 ]]; then
+    echo "digest for thread $thread: $action (${extra[*]})"
+  else
+    echo "digest for thread $thread: $action"
+  fi
   if [[ "$action" == "on" ]]; then
     local path
     path=$(bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" get "$thread" 2>/dev/null | \

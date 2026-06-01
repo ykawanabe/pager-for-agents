@@ -118,6 +118,7 @@ describe("buildClaudeArgv — Design A invariants", () => {
     prompt: "user prompt",
     sessionUuid: "session-xyz",
     model: "claude-sonnet-4-6",
+    resumeExisting: true,
   });
 
   test("includes --tools Read,Glob,Grep (no Bash)", () => {
@@ -138,6 +139,16 @@ describe("buildClaudeArgv — Design A invariants", () => {
   test("includes --resume <sessionUuid> (day-over-day continuity)", () => {
     const i = argv.indexOf("--resume");
     expect(argv[i + 1]).toBe("session-xyz");
+  });
+
+  test("uses --session-id for first fire (claude creates the session)", () => {
+    const fresh = buildClaudeArgv({
+      prompt: "x", sessionUuid: "new-uuid", model: "m", resumeExisting: false,
+    });
+    expect(fresh).toContain("--session-id");
+    expect(fresh).not.toContain("--resume");
+    const i = fresh.indexOf("--session-id");
+    expect(fresh[i + 1]).toBe("new-uuid");
   });
 
   test("includes the prompt as -p <positional>", () => {

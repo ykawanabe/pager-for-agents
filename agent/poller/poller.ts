@@ -45,6 +45,16 @@ import {
 import { ClaudeDaemonRegistry } from "./claude-daemon-registry";
 import type { ClaudeDaemonOptions } from "./claude-daemon";
 import { parseButtonsMarker } from "./buttons-marker";
+import {
+  type HeartbeatState,
+  markFiredToday,
+  readState as readHeartbeatState,
+  writeState as writeHeartbeatState,
+} from "./heartbeat-checks/heartbeat-state";
+import { shouldFire as digestShouldFire } from "./heartbeat-checks/scheduler";
+import { runHeartbeat } from "./heartbeat-checks/heartbeat-runner";
+import { appendFireLog } from "./heartbeat-checks/heartbeat-log";
+import { heartbeatSessionFile } from "../lib/paths";
 // Telegram outbound wire (Bot API egress), extracted in P1 of the ChatTransport
 // migration. `reply` is the adapter's `sendText` (same signature, 58 call sites
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
@@ -238,6 +248,29 @@ let idleEvictMinutes = 0;
 // `cta config interrupt-steer off` (the Pager steering toggle). Live-reloaded
 // from settings.json each poll loop, same path as idle_evict_minutes.
 let interruptOnMessage = true;
+// H2 daily digest settings — live-reloaded from settings.json, same gating as
+// the other fields. `digestTime` defaults to "09:00", `digestTimezone`
+// defaults to the system TZ (Intl resolved at process start), `digestQuietHours`
+// absent → no quiet window. Operator writes via `cta config digest-time` /
+// `cta config quiet-hours` / `cta config timezone`.
+let digestTime = "09:00";
+let digestTimezone = ((): string => {
+  try {
+    return new Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+})();
+let digestQuietHours: { start: string; end: string } | null = null;
+// H2 daily-digest scheduler state. Loaded from disk on poller boot (the
+// `firedToday` map survives restarts so we never fire twice on the same
+// local-tz day, even if the poller relaunches mid-day). Mutated in
+// digestDispatch and persisted before the runner spawns (write-through —
+// a crash during runHeartbeat counts as "fired today" so we don't retry
+// on next tick). `digestInFlight` is the in-memory collision guard so two
+// housekeep ticks can't race a second runner for the same mount.
+let heartbeatState: HeartbeatState = { version: 1, firedToday: {} };
+const digestInFlight = new Set<string>();
 let settingsMtimeMs = 0;
 // Idle-clear tuning. When an idle topic's transcript exceeds this many bytes,
 // the idle sweep flushes durable memory then rotates the session UUID (a real
@@ -292,7 +325,14 @@ function refreshSettingsIfChanged(): void {
     let next = 0;
     if (mtimeMs !== 0) {
       const raw = readFileSync(SETTINGS_FILE, "utf8");
-      const parsed = JSON.parse(raw) as { version?: number; idle_evict_minutes?: number; interrupt_on_message?: boolean };
+      const parsed = JSON.parse(raw) as {
+        version?: number;
+        idle_evict_minutes?: number;
+        interrupt_on_message?: boolean;
+        digestTime?: string;
+        timezone?: string;
+        quietHours?: { start?: string; end?: string };
+      };
       if (parsed.version !== 1) throw new Error("settings.json: unknown version");
       const n = Number(parsed.idle_evict_minutes ?? 0);
       next = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
@@ -300,6 +340,25 @@ function refreshSettingsIfChanged(): void {
       if (typeof steer === "boolean" && steer !== interruptOnMessage) {
         interruptOnMessage = steer;
         process.stdout.write(`[${new Date().toISOString()}] settings reloaded: interrupt_on_message=${interruptOnMessage}\n`);
+      }
+      // H2 digest settings — reload with logging on change so the operator
+      // can see in agent.log when `cta config` writes took effect.
+      if (typeof parsed.digestTime === "string" && parsed.digestTime !== digestTime) {
+        digestTime = parsed.digestTime;
+        process.stdout.write(`[${new Date().toISOString()}] settings reloaded: digestTime=${digestTime}\n`);
+      }
+      if (typeof parsed.timezone === "string" && parsed.timezone !== digestTimezone) {
+        digestTimezone = parsed.timezone;
+        process.stdout.write(`[${new Date().toISOString()}] settings reloaded: timezone=${digestTimezone}\n`);
+      }
+      const qh = parsed.quietHours;
+      const nextQh = (qh && typeof qh.start === "string" && typeof qh.end === "string")
+        ? { start: qh.start, end: qh.end }
+        : null;
+      const qhChanged = JSON.stringify(nextQh) !== JSON.stringify(digestQuietHours);
+      if (qhChanged) {
+        digestQuietHours = nextQh;
+        process.stdout.write(`[${new Date().toISOString()}] settings reloaded: quietHours=${JSON.stringify(digestQuietHours)}\n`);
       }
     }
     settingsMtimeMs = mtimeMs;
@@ -2177,6 +2236,159 @@ async function registerBotCommands(): Promise<void> {
   process.stdout.write(`[${new Date().toISOString()}] registered ${BOT_COMMAND_MENU.length} bot commands (/ menu)\n`);
 }
 
+// ─── H2 digest dispatcher ────────────────────────────────────────────────────
+// Called from housekeep on every tick. For each mount where digest.enabled is
+// true, call shouldFire(). On fire=true: persist firedToday BEFORE spawning
+// (write-through so a crash mid-fire is still "done for today"), spawn
+// runHeartbeat detached, on completion log + reply if status="sent".
+//
+// Detached: fires never block the housekeep tick. The next tick re-enters
+// digestDispatch and finds the in-flight mount via digestInFlight, skipping
+// without a re-spawn.
+function digestDispatch(): void {
+  // No paired chat → no place to deliver. Skip silently. (Tests construct
+  // mountsCache directly so they don't hit this gate unless they want to.)
+  const chatIdStr = effectiveChatId();
+  if (!chatIdStr) return;
+  const chatId = Number(chatIdStr);
+  if (!Number.isFinite(chatId)) return;
+
+  const now = new Date();
+
+  for (const mount of mountsCache.values()) {
+    if (mount.channel !== "telegram") continue;       // H2 is Telegram-only for v1
+    if (mount.thread_id === "*") continue;            // wildcard isn't a real topic
+    if (!mount.digest || mount.digest.enabled !== true) continue;
+
+    const threadIdStr = String(mount.thread_id);
+    if (digestInFlight.has(threadIdStr)) continue;
+
+    const decision = digestShouldFire({
+      state: heartbeatState,
+      threadId: threadIdStr,
+      digestTime,
+      quietHours: digestQuietHours,
+      timezone: digestTimezone,
+      isInFlight: () => digestInFlight.has(threadIdStr),
+      isMidTurn: () => {
+        // The interactive daemon's state machine has 5 states; we treat
+        // pending / inFlight / released / crashed as "user-busy". "idle"
+        // and "absent" (no daemon for this thread yet) are both "not busy".
+        // Bug we hit on first live setup: getStatus returns the literal
+        // string "absent" for an unknown thread, NOT null — a null check
+        // here silently skipped every mount on a fresh boot.
+        if (!daemonRegistry) return false;
+        const s = daemonRegistry.getStatus(threadIdStr);
+        return s !== "absent" && s !== "idle";
+      },
+      now,
+    });
+
+    if (!decision.fire) continue;
+
+    // Write-through: persist BEFORE spawn so a crash during fire still
+    // counts as "fired today" (we don't want a retry that double-sends).
+    heartbeatState = markFiredToday(heartbeatState, threadIdStr, decision.ymd);
+    try { writeHeartbeatState(heartbeatState); }
+    catch (e) {
+      process.stderr.write(`poller: heartbeat-state persist failed (continuing): ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+    digestInFlight.add(threadIdStr);
+
+    // Resolve / create the per-thread heartbeat session UUID. First fire
+    // generates a UUID and uses `--session-id` (claude creates the
+    // session). Subsequent fires read the UUID and use `--resume` so
+    // claude inherits yesterday's context. `resumeExisting` tracks
+    // which path we're on this call.
+    const sessionFile = heartbeatSessionFile(threadIdStr);
+    let sessionUuid: string;
+    let resumeExisting: boolean;
+    try {
+      sessionUuid = readFileSync(sessionFile, "utf8").trim();
+      if (!sessionUuid) throw new Error("empty");
+      resumeExisting = true;
+    } catch {
+      sessionUuid = randomUUID();
+      resumeExisting = false;
+      try {
+        mkdirSync(join(STATE_DIR, "heartbeat-sessions"), { recursive: true, mode: 0o700 });
+        writeFileSync(sessionFile, sessionUuid + "\n", { mode: 0o600 });
+      } catch (e) {
+        process.stderr.write(`poller: heartbeat-session write failed (continuing): ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+    }
+
+    const startedAt = new Date().toISOString();
+    const mountPath = mount.path;
+    process.stdout.write(`[${new Date().toISOString()}] digest dispatch: thread=${threadIdStr} mount=${mountPath} ymd=${decision.ymd}\n`);
+
+    // Detached fire — never block the housekeep tick. The closure captures
+    // a snapshot of (chatId, threadId, mount) so a later mount change
+    // doesn't race the in-flight runner.
+    void (async () => {
+      try {
+        const result = await runHeartbeat({
+          mountPath,
+          threadId: threadIdStr,
+          sessionUuid,
+          resumeExisting,
+        });
+        process.stdout.write(`[${new Date().toISOString()}] digest result: thread=${threadIdStr} status=${result.status} cost=$${result.totalCostUsd.toFixed(4)} ran=[${result.checksRan.join(",")}] errored=[${result.checksErrored.join(",")}]\n`);
+
+        // Append per-fire log (cta digest log will tail this).
+        try {
+          appendFireLog({
+            thread_id: threadIdStr,
+            started_at: startedAt,
+            trigger: "daily",
+            duration_ms: result.durationMs,
+            checks_ran: result.checksRan,
+            checks_errored: result.checksErrored,
+            result: result.status,
+            total_cost_usd: result.totalCostUsd,
+            skip_reason: result.status === "no-heartbeat-md" ? "no-heartbeat-md" : null,
+            ...(result.errorMessage ? { error_message: result.errorMessage } : {}),
+          });
+        } catch (e) {
+          process.stderr.write(`poller: digest log append failed: ${e instanceof Error ? e.message : String(e)}\n`);
+        }
+
+        // Decide whether to deliver. Three branches:
+        //  - status="sent": always deliver the model's digest text.
+        //  - status="empty" + digest.sendOnEmpty=true: deliver a fixed
+        //    "nothing actionable" confirmation so the operator gets a
+        //    daily heartbeat even on a quiet day.
+        //  - everything else (no-heartbeat-md, error, timeout, empty
+        //    without sendOnEmpty): no ping. operator inspects via
+        //    `cta digest log` / `cta digest doctor`.
+        const shouldSend = result.status === "sent"
+          || (result.status === "empty" && mount.digest?.sendOnEmpty === true);
+        if (shouldSend) {
+          const body = result.status === "sent" && result.digestText
+            ? result.digestText
+            : "Nothing actionable today.";
+          // Tag the message so it's distinguishable from interactive
+          // replies in Pager Watch and Telegram search.
+          const text = `📋 Daily digest\n\n${body}`;
+          const address: ChatAddress = {
+            channel: "telegram",
+            chatId,
+            threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
+          };
+          try { await reply(address, text); }
+          catch (e) {
+            process.stderr.write(`poller: digest reply failed: ${e instanceof Error ? e.message : String(e)}\n`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`poller: digest run crashed: ${e instanceof Error ? e.message : String(e)}\n`);
+      } finally {
+        digestInFlight.delete(threadIdStr);
+      }
+    })();
+  }
+}
+
 export async function main(): Promise<void> {
   // Install signal handlers BEFORE any work — if SIGTERM arrives during
   // preflight/initDaemonRegistry, default node behavior is silent exit,
@@ -2228,6 +2440,11 @@ export async function main(): Promise<void> {
   runFileAccessProbe(STATE_DIR);
   lastFileAccessProbe = Date.now();
 
+  // H2: load persisted "fired today" state so a mid-day poller restart
+  // can't cause a duplicate digest fire. Corrupt / missing file → empty
+  // state (readHeartbeatState is defensive).
+  heartbeatState = readHeartbeatState();
+
   const startupChat = effectiveChatId() ?? "(unpaired — awaiting /pair)";
   process.stdout.write(`[${new Date().toISOString()}] poller starting (Phase 4 daemon mode), offset=${offset}, chat=${startupChat}, mounts=${mountsCache.size}\n`);
 
@@ -2260,6 +2477,9 @@ export async function main(): Promise<void> {
         refreshMountsIfChanged();
         refreshPairedIfChanged();
         refreshSettingsIfChanged();
+        // H2 daily digest scheduler — pure-logic shouldFire() per mount,
+        // detached runHeartbeat on fire=true. Never blocks the tick.
+        digestDispatch();
         // Re-probe file access at most once a minute (FDA is granted rarely;
         // no need to readdir the canary every 5s tick).
         if (Date.now() - lastFileAccessProbe > 60_000) {
