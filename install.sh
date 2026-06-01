@@ -164,7 +164,7 @@ rm -f "$BIN_DIR/restart_claude.sh" 2>/dev/null || true
 # ~/.local/share).
 AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
-  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
+  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/poller/heartbeat-checks" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
      "$REPO_DIR/agent/poller/package.json" \
@@ -175,6 +175,21 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/poller/watch-render.ts" \
      "$REPO_DIR/agent/poller/file-access-probe.ts" \
      "$AGENT_DIR/poller/"
+  # H2 daily-digest heartbeat (Design A): registry + per-check handlers +
+  # runner + scheduler + state/log/quiet-hours helpers. Production .ts only;
+  # .test.ts files stay in the repo. Per
+  # memory/project_install_sh_explicit_file_list.md, NEW files added under
+  # this subtree must be listed here OR they silently don't deploy and the
+  # poller's import would fail at module-load.
+  cp "$REPO_DIR/agent/poller/heartbeat-checks/registry.ts" \
+     "$REPO_DIR/agent/poller/heartbeat-checks/open-prs.ts" \
+     "$REPO_DIR/agent/poller/heartbeat-checks/heartbeat-md.ts" \
+     "$REPO_DIR/agent/poller/heartbeat-checks/heartbeat-runner.ts" \
+     "$REPO_DIR/agent/poller/heartbeat-checks/heartbeat-state.ts" \
+     "$REPO_DIR/agent/poller/heartbeat-checks/heartbeat-log.ts" \
+     "$REPO_DIR/agent/poller/heartbeat-checks/quiet-hours.ts" \
+     "$REPO_DIR/agent/poller/heartbeat-checks/scheduler.ts" \
+     "$AGENT_DIR/poller/heartbeat-checks/"
   # Chat-channel modules (ChatTransport migration). Platform-agnostic core
   # contract (types.ts) + Telegram wire adapter. poller.ts imports the adapter
   # via ../channels/telegram/adapter; without these copies the installed poller

@@ -161,7 +161,7 @@ cat > "$STATE/mounts.json" <<'EOF'
 EOF
 
 V1_OUT=$(bun run "$STORE" list)
-[[ "$(echo "$V1_OUT" | jq -r '.version')" == "2" ]] && ok "v1 read: upgraded to version 2 in memory" || ng "v1 read: upgraded to version 2 in memory"
+[[ "$(echo "$V1_OUT" | jq -r '.version')" == "3" ]] && ok "v1 read: upgraded to version 3 in memory" || ng "v1 read: upgraded to version 3 in memory"
 [[ "$(echo "$V1_OUT" | jq -r '.mounts[0].channel')" == "telegram" ]] && ok "v1 read: stamps channel=telegram" || ng "v1 read: stamps channel=telegram"
 [[ "$(echo "$V1_OUT" | jq -r '.mounts[0].thread_id')" == "42" ]] && ok "v1 read: thread_id preserved" || ng "v1 read: thread_id preserved"
 [[ "$(echo "$V1_OUT" | jq -r '.mounts[0].session_id')" == "legacy-uuid-1" ]] && ok "v1 read: session_id preserved" || ng "v1 read: session_id preserved"
@@ -169,14 +169,15 @@ V1_OUT=$(bun run "$STORE" list)
 # File on disk stays v1 until a mutation rewrites it (no surprise writes).
 [[ "$(jq -r '.version' "$STATE/mounts.json")" == "1" ]] && ok "v1 read: file on disk untouched" || ng "v1 read: file on disk untouched"
 
-# Next mutation upgrades the file to v2.
+# Next mutation upgrades the file to v3.
 bun run "$STORE" add 99 /tmp/other >/dev/null
-[[ "$(jq -r '.version' "$STATE/mounts.json")" == "2" ]] && ok "post-mutation: file rewritten to v2" || ng "post-mutation: file rewritten to v2"
+[[ "$(jq -r '.version' "$STATE/mounts.json")" == "3" ]] && ok "post-mutation: file rewritten to v3" || ng "post-mutation: file rewritten to v3"
 [[ "$(jq -r '.mounts[0].channel' "$STATE/mounts.json")" == "telegram" ]] && ok "post-mutation: legacy row gets channel" || ng "post-mutation: legacy row gets channel"
 [[ "$(jq -r '.mounts[1].channel' "$STATE/mounts.json")" == "telegram" ]] && ok "post-mutation: new row defaults to telegram" || ng "post-mutation: new row defaults to telegram"
 
-# ─── schema v2 round-trip ────────────────────────────────────────────────────
-# A native-v2 file (with explicit channel) reads back without modification.
+# ─── schema v2 → v3 read-and-upgrade ─────────────────────────────────────────
+# A v2 file (no digest field) reads back as v3 in memory; rows pass through
+# without modification. The file on disk stays v2 until the next mutation.
 
 rm -rf "$STATE" && mkdir -p "$STATE"
 cat > "$STATE/mounts.json" <<'EOF'
@@ -196,8 +197,44 @@ cat > "$STATE/mounts.json" <<'EOF'
 EOF
 
 V2_OUT=$(bun run "$STORE" list)
-[[ "$(echo "$V2_OUT" | jq -r '.version')" == "2" ]] && ok "v2 read: version=2" || ng "v2 read: version=2"
+[[ "$(echo "$V2_OUT" | jq -r '.version')" == "3" ]] && ok "v2 read: upgraded to version 3 in memory" || ng "v2 read: upgraded to version 3 in memory"
 [[ "$(echo "$V2_OUT" | jq -r '.mounts[0].channel')" == "telegram" ]] && ok "v2 read: explicit channel preserved" || ng "v2 read: explicit channel preserved"
+[[ "$(jq -r '.version' "$STATE/mounts.json")" == "2" ]] && ok "v2 read: file on disk left at v2" || ng "v2 read: file on disk left at v2"
+
+# ─── schema v3 round-trip with digest field ──────────────────────────────────
+# A v3 file with the new per-mount digest config round-trips through read+
+# write without losing the digest field. v3 + unknown field also preserved
+# (forward-compat for hypothetical v4 fields).
+
+rm -rf "$STATE" && mkdir -p "$STATE"
+cat > "$STATE/mounts.json" <<'EOF'
+{
+  "version": 3,
+  "mounts": [
+    {
+      "channel": "telegram",
+      "thread_id": 42,
+      "path": "/tmp/iron-flow",
+      "session_id": "v3-uuid-1",
+      "tmux_session": "topic-42",
+      "created_at": "2026-06-01T00:00:00.000Z",
+      "digest": { "enabled": true, "sendOnEmpty": false },
+      "future_field_v4": "preserve-me"
+    }
+  ]
+}
+EOF
+
+V3_OUT=$(bun run "$STORE" list)
+[[ "$(echo "$V3_OUT" | jq -r '.version')" == "3" ]] && ok "v3 read: version=3" || ng "v3 read: version=3"
+[[ "$(echo "$V3_OUT" | jq -r '.mounts[0].digest.enabled')" == "true" ]] && ok "v3 read: digest.enabled preserved" || ng "v3 read: digest.enabled preserved"
+[[ "$(echo "$V3_OUT" | jq -r '.mounts[0].digest.sendOnEmpty')" == "false" ]] && ok "v3 read: digest.sendOnEmpty preserved" || ng "v3 read: digest.sendOnEmpty preserved"
+[[ "$(echo "$V3_OUT" | jq -r '.mounts[0].future_field_v4')" == "preserve-me" ]] && ok "v3 read: unknown future field preserved" || ng "v3 read: unknown future field preserved"
+
+# After a mutation, both digest and unknown field survive the rewrite.
+bun run "$STORE" add 999 /tmp/another >/dev/null
+[[ "$(jq -r '.mounts[0].digest.enabled' "$STATE/mounts.json")" == "true" ]] && ok "v3 write: digest survives mutation" || ng "v3 write: digest survives mutation"
+[[ "$(jq -r '.mounts[0].future_field_v4' "$STATE/mounts.json")" == "preserve-me" ]] && ok "v3 write: unknown future field survives mutation (forward-compat)" || ng "v3 write: unknown future field survives mutation"
 
 # ─── provisional / replace / gc-provisional ─────────────────────────────────
 # Helper-mode features added 2026-05-17 for auto-mount.
@@ -294,9 +331,9 @@ bun run "$STORE" clear >/dev/null
 [[ "$(jq '.mounts | length' "$STATE/mounts.json")" == "0" ]] \
   && ok "clear: mounts array is empty" \
   || ng "clear: mounts array not empty (got $(jq '.mounts | length' "$STATE/mounts.json"))"
-[[ "$(jq -r '.version' "$STATE/mounts.json")" == "2" ]] \
-  && ok "clear: preserves schema version 2" \
-  || ng "clear: version field not 2 (got $(jq -r '.version' "$STATE/mounts.json"))"
+[[ "$(jq -r '.version' "$STATE/mounts.json")" == "3" ]] \
+  && ok "clear: preserves schema version 3" \
+  || ng "clear: version field not 3 (got $(jq -r '.version' "$STATE/mounts.json"))"
 
 # clear is idempotent.
 bun run "$STORE" clear >/dev/null

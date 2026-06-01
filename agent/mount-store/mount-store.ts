@@ -14,9 +14,9 @@
  * the writer logic in one language with proper atomic-rename + a portable
  * O_EXCL-based mutex. Bash callers shell out via `bun run mount-store.ts <op>`.
  *
- * Schema (version 2 — current):
+ * Schema (version 3 — current, 2026-06-01):
  *   {
- *     "version": 2,
+ *     "version": 3,
  *     "mounts": [
  *       {
  *         "channel": "telegram",
@@ -25,7 +25,8 @@
  *         "label": "iron-flow",
  *         "session_id": "uuid-pinned",
  *         "tmux_session": "topic-42",
- *         "created_at": "2026-05-13T03:14:00.000Z"
+ *         "created_at": "2026-05-13T03:14:00.000Z",
+ *         "digest": { "enabled": true, "sendOnEmpty": false }
  *       },
  *       {
  *         "channel": "telegram",
@@ -36,9 +37,15 @@
  *     ]
  *   }
  *
- * Schema v1 (legacy) is the same minus the `channel` field. readMounts
- * auto-upgrades v1 to v2 in memory by stamping `channel: "telegram"` on
- * each row; the file is rewritten to v2 only when a mutation occurs.
+ * v3 added the optional per-mount `digest` field for H2 daily digest. v2
+ * differs only in the absence of `digest`. v1 (legacy) lacks the `channel`
+ * field; readMounts stamps `channel: "telegram"` on each row.
+ *
+ * Read accepts v1, v2, v3. Write always emits v3. The file on disk is left
+ * at its original version until the next mutation rewrites it (read is
+ * idempotent — background readers don't surprise-write). Unknown per-mount
+ * fields (e.g. a hypothetical v4 field) are preserved verbatim through
+ * read+write cycles via Mount's [extraField] forward-compat carrier.
  *
  * `channel` is the messaging platform identifier ("telegram" today; "line",
  * "discord", etc. when added). Routing keys are scoped per-channel — two
@@ -114,6 +121,18 @@ export type { Channel };
 
 export const DEFAULT_CHANNEL: Channel = "telegram";
 
+/**
+ * Per-mount H2 daily-digest config. Absent on a mount → digest disabled for
+ * this mount. v3 schema addition (2026-06-01). See
+ * docs/plans/heartbeat-h2-digest.md.
+ */
+export interface DigestConfig {
+  enabled: boolean;
+  /** When true, send the digest even when the model returned NOTHING_TO_REPORT.
+   *  Default false (skip the send entirely on empty days). */
+  sendOnEmpty?: boolean;
+}
+
 export interface Mount {
   channel: Channel;
   thread_id: ThreadId;
@@ -130,14 +149,25 @@ export interface Mount {
    * Absent on all non-helper mounts.
    */
   provisional?: boolean;
+  /** v3: per-mount digest config. Absent → disabled. */
+  digest?: DigestConfig;
+  /**
+   * Forward-compat carrier: any unknown per-mount field read from disk is
+   * preserved here and written back verbatim. A future v4 field added by a
+   * newer agent will survive a v3 writer (the v3 writer doesn't drop it).
+   * Per the autoplan 2026-06-01 finding "all writers upgraded together AND
+   * unknown per-mount fields preserved". Typed `unknown` so a careless
+   * read of `mount.someFutureField` is a TS error, not a silent any.
+   */
+  [extraField: string]: unknown;
 }
 
 export interface MountsFile {
-  version: 2;
+  version: 3;
   mounts: Mount[];
 }
 
-const EMPTY: MountsFile = { version: 2, mounts: [] };
+const EMPTY: MountsFile = { version: 3, mounts: [] };
 
 /**
  * Cache / lookup key for cross-channel uniqueness. Two channels can share
@@ -235,42 +265,61 @@ interface AnyMount {
   tmux_session: string;
   created_at: string;
   provisional?: boolean;
+  digest?: DigestConfig;
+  // Plus any unknown forward-compat fields.
+  [extraField: string]: unknown;
 }
 
 interface AnyMountsFile {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   mounts: AnyMount[];
 }
 
 /**
- * Read mounts.json and return the v2 in-memory representation, upgrading
- * v1 on the fly. v1 → v2 maps every row to `channel: "telegram"` (the only
- * channel that existed in v1). The file on disk is left as v1 until the
- * next mutation rewrites it; this keeps reads idempotent and avoids
- * surprise writes from background processes.
+ * Read mounts.json and return the v3 in-memory representation. Accepts v1,
+ * v2, v3 on read; emits v3 on every write. The file on disk is left at its
+ * original version until the next mutation rewrites it (read is idempotent —
+ * background readers don't surprise-write).
+ *
+ * v1 → v3: every row gets `channel: "telegram"` (the only channel that
+ * existed in v1). No digest field on legacy rows.
+ * v2 → v3: pure schema bump. Rows pass through. No digest field on v2 rows.
+ * v3 → v3: identity. digest field round-trips. Unknown per-mount fields
+ *          (e.g. a hypothetical v4 field written by a newer agent) are
+ *          preserved verbatim — see Mount.[extraField] forward-compat
+ *          carrier.
  */
 export function readMounts(): MountsFile {
-  if (!existsSync(MOUNTS_JSON)) return { version: 2, mounts: [] };
+  if (!existsSync(MOUNTS_JSON)) return { version: 3, mounts: [] };
   try {
     const raw = readFileSync(MOUNTS_JSON, "utf8");
     const parsed = JSON.parse(raw) as Partial<AnyMountsFile>;
     if (
-      (parsed.version !== 1 && parsed.version !== 2) ||
+      (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) ||
       !Array.isArray(parsed.mounts)
     ) {
       throw new Error("mounts.json: unrecognized schema");
     }
-    const mounts: Mount[] = (parsed.mounts as AnyMount[]).map((m) => ({
-      channel: (m.channel as Channel) ?? DEFAULT_CHANNEL,
-      thread_id: m.thread_id,
-      path: m.path,
-      label: m.label,
-      session_id: m.session_id,
-      tmux_session: m.tmux_session,
-      created_at: m.created_at,
-      ...(m.provisional ? { provisional: true } : {}),
-    }));
-    return { version: 2, mounts };
+    const mounts: Mount[] = (parsed.mounts as AnyMount[]).map((m) => {
+      // Spread first so unknown forward-compat fields survive. Then overlay
+      // the known fields with their normalized values. `channel` defaults to
+      // telegram for v1 rows. `digest` (v3) round-trips if present.
+      const out: Mount = {
+        ...m,
+        channel: (m.channel as Channel) ?? DEFAULT_CHANNEL,
+        thread_id: m.thread_id,
+        path: m.path,
+        label: m.label,
+        session_id: m.session_id,
+        tmux_session: m.tmux_session,
+        created_at: m.created_at,
+      };
+      // Clean up provisional=false → undefined (legacy rows occasionally had
+      // explicit false; we treat absence as the canonical "not provisional").
+      if (!m.provisional) delete out.provisional;
+      return out;
+    });
+    return { version: 3, mounts };
   } catch (e) {
     throw new Error(`mounts.json: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -426,7 +475,7 @@ export async function removeMount(
  */
 export async function clearMounts(): Promise<void> {
   return withLock(() => {
-    writeMountsAtomic({ version: 2, mounts: [] });
+    writeMountsAtomic({ version: 3, mounts: [] });
   });
 }
 

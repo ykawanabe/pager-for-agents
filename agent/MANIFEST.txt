@@ -32,6 +32,17 @@ poller/slash-commands.ts	agent	644
 poller/watch-render.ts	agent	644
 poller/file-access-probe.ts	agent	644
 
+# H2 daily-digest heartbeat (Design A — no Bash; per-check TS handlers).
+# See docs/plans/heartbeat-h2-digest.md.
+poller/heartbeat-checks/registry.ts	agent	644
+poller/heartbeat-checks/open-prs.ts	agent	644
+poller/heartbeat-checks/heartbeat-md.ts	agent	644
+poller/heartbeat-checks/heartbeat-runner.ts	agent	644
+poller/heartbeat-checks/heartbeat-state.ts	agent	644
+poller/heartbeat-checks/heartbeat-log.ts	agent	644
+poller/heartbeat-checks/quiet-hours.ts	agent	644
+poller/heartbeat-checks/scheduler.ts	agent	644
+
 # Chat-channel adapters (ChatTransport migration). Platform-agnostic core
 # contract + per-platform wire adapters.
 channels/types.ts	agent	644
