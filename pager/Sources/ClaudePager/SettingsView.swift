@@ -175,11 +175,12 @@ private struct PagerTab: View {
     @ObservedObject var monitor: StatusMonitor
     @AppStorage("stopBotOnQuit") private var stopBotOnQuit = true
     @AppStorage("autoStartAtLogin") private var autoStartAtLogin = true
-    // Default true: bot must stay reachable. See ClaudePagerApp.swift for the
-    // full rationale. Keep both @AppStorage default values in sync — SwiftUI
-    // resolves the first registration on the key, but matching defaults
-    // protect against load-order regressions.
-    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = true
+    // Default false: caffeinate doesn't fix poller silence on Apple Silicon
+    // (standby/powernap freeze it regardless — see ClaudePagerApp.swift). Keep
+    // all three @AppStorage default values in sync — SwiftUI resolves the
+    // first registration on the key, but matching defaults protect against
+    // load-order regressions.
+    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = false
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true
 
     // Idle-daemon eviction is agent state (settings.json via cta), not a Mac

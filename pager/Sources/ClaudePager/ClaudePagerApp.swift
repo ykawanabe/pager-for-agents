@@ -30,13 +30,15 @@ struct ClaudePagerApp: App {
     @ObservedObject private var caffeinate = CaffeinateController()
     private let wakeObserver = WakeObserver()
     @AppStorage("stopBotOnQuit") private var stopBotOnQuit = true
-    // Default ON: the bot is a 24/7 service, and macOS's aggressive battery-
-    // mode idle sleep (sleep=1 min by default on Apple Silicon) makes the bot
-    // silently unresponsive within minutes of inactivity. `onlyOnAC=true`
-    // keeps battery drain bounded: caffeinate runs only when the Mac is
-    // plugged in. Users who want awake-on-battery too can flip onlyOnAC in
-    // Settings.
-    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = true
+    // Default OFF: caffeinate (`-i`, idle-sleep assertion) does NOT keep the
+    // poller alive through standby/powernap on Apple Silicon — those freeze
+    // the process ~15 of every ~16 min regardless, so the real silence fix is
+    // `sudo pmset -a powernap 0 standby 0`, not caffeinate. Leaving it on by
+    // default just held the Mac awake (battery drain) and leaked orphan
+    // caffeinates on power-state churn for no reliability gain. Users who
+    // still want it can flip it on in Settings; `onlyOnAC=true` then bounds
+    // battery drain to when the Mac is plugged in.
+    @AppStorage("caffeinateEnabled") private var caffeinateEnabled = false
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true
 
     init() {
