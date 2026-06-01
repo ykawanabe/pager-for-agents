@@ -411,13 +411,16 @@ cmd_config() {
     caffeinate) _config_caffeinate "${1:-}" ;;
     idle-evict) _config_idle_evict "${1:-}" ;;
     interrupt-steer) _config_interrupt_steer "${1:-}" ;;
+    digest-time) _config_digest_time "${1:-}" ;;
+    quiet-hours) _config_quiet_hours "${1:-}" "${2:-}" ;;
+    timezone) _config_timezone "${1:-}" ;;
     "")
-      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer> <value>" >&2
+      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
       return 1
       ;;
     *)
       echo "Unknown config subcommand: $sub" >&2
-      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer> <value>" >&2
+      echo "Usage: cta config <ack|caffeinate|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
       return 1
       ;;
   esac
@@ -686,6 +689,286 @@ _config_caffeinate() {
       return 1
       ;;
   esac
+}
+
+# ─── H2 daily-digest config (settings.json fields) ──────────────────────────
+# Three knobs the poller's heartbeat scheduler reads. All live in
+# settings.json under top-level keys (siblings of idle_evict_minutes /
+# interrupt_on_message). Read with no arg → print current value. Set with
+# explicit value. Use "off" / "none" to remove (digest-time/quiet-hours/
+# timezone all default-safe when absent).
+
+# Validate HH:MM, 24h. Returns 0 if valid, 1 otherwise. Stays loose enough
+# to accept "9:00" as well as "09:00" (both valid clock-time strings).
+_validate_hhmm() {
+  local v="$1"
+  [[ "$v" =~ ^([0-9]|[01][0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
+# Merge a single key into $SETTINGS_FILE atomically. Pattern mirrors
+# _config_idle_evict / _config_interrupt_steer (python3 JSON-merge).
+# Args: <key> <json-encoded-value>
+# Use "__DELETE__" as the value to remove the key entirely.
+_settings_merge() {
+  local key="$1" jval="$2"
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  python3 - "$SETTINGS_FILE" "$key" "$jval" <<'PY'
+import json, os, sys
+path, key, jval = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+data["version"] = 1
+if jval == "__DELETE__":
+    data.pop(key, None)
+else:
+    data[key] = json.loads(jval)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+  chmod 600 "$SETTINGS_FILE"
+}
+
+# Read a single key from settings.json. Args: <key> [<default>].
+# Echoes the raw scalar (or the default) on stdout.
+_settings_read() {
+  local key="$1" default="${2:-}"
+  if [[ ! -f "$SETTINGS_FILE" ]]; then echo "$default"; return 0; fi
+  python3 - "$SETTINGS_FILE" "$key" "$default" <<'PY'
+import json, sys
+path, key, default = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as f:
+        data = json.load(f)
+    v = data.get(key)
+    if v is None:
+        print(default); raise SystemExit
+    if isinstance(v, (dict, list)):
+        print(json.dumps(v))
+    else:
+        print(v)
+except Exception:
+    print(default)
+PY
+}
+
+_config_digest_time() {
+  local val="${1:-}"
+  if [[ -z "$val" ]]; then
+    _settings_read "digestTime" "09:00"
+    return 0
+  fi
+  if [[ "$val" == "off" || "$val" == "none" ]]; then
+    _settings_merge "digestTime" "__DELETE__"
+    echo "digest-time: cleared (default 09:00 applies)"
+    return 0
+  fi
+  if ! _validate_hhmm "$val"; then
+    echo "Invalid value: $val (expected HH:MM, e.g. 09:00)" >&2
+    return 1
+  fi
+  _settings_merge "digestTime" "\"$val\""
+  echo "digest-time: $val (live — applies within ~25s, no restart)"
+}
+
+_config_quiet_hours() {
+  local start="${1:-}" end="${2:-}"
+  if [[ -z "$start" ]]; then
+    _settings_read "quietHours" "(none)"
+    return 0
+  fi
+  if [[ "$start" == "off" || "$start" == "none" ]]; then
+    _settings_merge "quietHours" "__DELETE__"
+    echo "quiet-hours: cleared"
+    return 0
+  fi
+  if [[ -z "$end" ]]; then
+    echo "Usage: cta config quiet-hours <start HH:MM> <end HH:MM>   (use 'off' to clear)" >&2
+    return 1
+  fi
+  if ! _validate_hhmm "$start" || ! _validate_hhmm "$end"; then
+    echo "Invalid time(s): start=$start end=$end (expected HH:MM)" >&2
+    return 1
+  fi
+  _settings_merge "quietHours" "{\"start\":\"$start\",\"end\":\"$end\"}"
+  if [[ "$start" > "$end" ]]; then
+    echo "quiet-hours: ${start} → ${end} (wraps midnight; digest will defer inside this window)"
+  else
+    echo "quiet-hours: ${start} → ${end} (digest will defer inside this window)"
+  fi
+}
+
+_config_timezone() {
+  local val="${1:-}"
+  if [[ -z "$val" ]]; then
+    _settings_read "timezone" "(system default)"
+    return 0
+  fi
+  if [[ "$val" == "off" || "$val" == "none" ]]; then
+    _settings_merge "timezone" "__DELETE__"
+    echo "timezone: cleared (system default applies)"
+    return 0
+  fi
+  # IANA tz strings have the shape Continent/City or aliases (UTC, GMT).
+  # We accept anything matching [A-Za-z][A-Za-z0-9_/+-]* and trust Intl /
+  # the underlying tzdata to reject truly bogus values at runtime.
+  if [[ ! "$val" =~ ^[A-Za-z][A-Za-z0-9_/+-]+$ ]]; then
+    echo "Invalid timezone: $val (expected an IANA name like Asia/Tokyo)" >&2
+    return 1
+  fi
+  _settings_merge "timezone" "\"$val\""
+  echo "timezone: $val (live — applies within ~25s, no restart)"
+}
+
+# ─── H2 daily-digest per-mount toggle (mount-store v3) ──────────────────────
+# `cta digest` is the user-facing toggle for the H2 daily digest. Per-mount
+# `digest.enabled` lives in mounts.json (v3 schema). The runner reads
+# settings.json for time / tz / quiet-hours.
+
+cmd_digest() {
+  local sub="${1:-}"
+  shift 2>/dev/null || true
+
+  if [[ -z "$sub" ]]; then
+    echo "Usage: cta digest <thread> [on|off|init]   (or 'cta digest list')" >&2
+    return 1
+  fi
+
+  if [[ "$sub" == "list" ]]; then
+    _digest_list
+    return $?
+  fi
+
+  # Other forms: cta digest <thread> [on|off|init]
+  local thread="$sub" action="${1:-}"
+  if [[ "$action" == "init" ]]; then
+    _digest_init "$thread"
+    return $?
+  fi
+  if [[ "$action" == "on" || "$action" == "off" ]]; then
+    _digest_set "$thread" "$action"
+    return $?
+  fi
+  if [[ -z "$action" ]]; then
+    _digest_show "$thread"
+    return $?
+  fi
+  echo "Unknown action: $action (expected on|off|init or no action to show)" >&2
+  return 1
+}
+
+_digest_show() {
+  local thread="$1"
+  if [[ ! -f "$STATE_DIR/mounts.json" ]]; then
+    echo "No mounts yet — run 'cta mount $thread <path>' first." >&2
+    return 1
+  fi
+  local row
+  row=$(bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" get "$thread" 2>/dev/null)
+  if [[ -z "$row" || "$row" == "null" ]]; then
+    echo "No mount for thread $thread." >&2
+    return 1
+  fi
+  local enabled send_on_empty path
+  enabled=$(echo "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("digest") or {}).get("enabled", False))')
+  send_on_empty=$(echo "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("digest") or {}).get("sendOnEmpty", False))')
+  path=$(echo "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("path",""))')
+  printf 'thread:           %s\n' "$thread"
+  printf 'mount path:       %s\n' "$path"
+  printf 'digest enabled:   %s\n' "$enabled"
+  printf 'send-on-empty:    %s\n' "$send_on_empty"
+  if [[ -f "$path/HEARTBEAT.md" ]]; then
+    printf 'HEARTBEAT.md:     present (%s lines)\n' "$(wc -l < "$path/HEARTBEAT.md" | tr -d ' ')"
+  else
+    printf 'HEARTBEAT.md:     MISSING — run "cta digest %s init" to scaffold\n' "$thread"
+  fi
+  printf '\n'
+  printf 'Global digest config (settings.json):\n'
+  printf '  digest-time: %s\n' "$(_settings_read digestTime "09:00 (default)")"
+  printf '  timezone:    %s\n' "$(_settings_read timezone "(system default)")"
+  printf '  quiet-hours: %s\n' "$(_settings_read quietHours "(none)")"
+}
+
+_digest_set() {
+  local thread="$1" action="$2"
+  bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" set-digest "$thread" "$action" >/dev/null
+  echo "digest for thread $thread: $action"
+  if [[ "$action" == "on" ]]; then
+    local path
+    path=$(bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" get "$thread" 2>/dev/null | \
+      python3 -c 'import json,sys; print(json.load(sys.stdin).get("path",""))' 2>/dev/null)
+    if [[ -n "$path" && ! -f "$path/HEARTBEAT.md" ]]; then
+      echo "Warning: $path/HEARTBEAT.md is missing — digests will skip until you run:"
+      echo "         cta digest $thread init"
+    fi
+  fi
+}
+
+_digest_init() {
+  local thread="$1"
+  local row path
+  row=$(bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" get "$thread" 2>/dev/null)
+  path=$(echo "$row" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("path",""))' 2>/dev/null)
+  if [[ -z "$path" ]]; then
+    echo "No mount for thread $thread — run 'cta mount $thread <path>' first." >&2
+    return 1
+  fi
+  local target="$path/HEARTBEAT.md"
+  if [[ -f "$target" ]]; then
+    echo "$target already exists — leaving it alone."
+    return 0
+  fi
+  mkdir -p "$path" 2>/dev/null || true
+  cat > "$target" <<'HEARTBEAT_TEMPLATE'
+# Heartbeat — daily morning digest
+# One check ID per line. Lines starting with # are comments.
+# See `cta digest list` for available IDs (open-prs ships first).
+
+open-prs                 # gh pr list, author:@me state:open older than 24h
+
+## Free-form context (read by the model via Read tool)
+Project context: edit me. What should the digest treat as higher urgency?
+Summary format: 3-7 lines max, one bullet per actionable item. If nothing
+actionable, return the exact phrase NOTHING_TO_REPORT.
+HEARTBEAT_TEMPLATE
+  chmod 644 "$target"
+  echo "Scaffolded $target"
+  echo "Edit it, then run 'cta digest $thread on' to enable daily digests."
+}
+
+_digest_list() {
+  if [[ ! -f "$STATE_DIR/mounts.json" ]]; then
+    echo "(no mounts yet)"
+    return 0
+  fi
+  # Write JSON to a temp then read via sys.argv[1] in a heredoc'd python
+  # script. Matches the _config_idle_evict pattern and dodges the
+  # heredoc-replaces-pipe-stdin issue when both are needed.
+  local tmp
+  tmp=$(mktemp)
+  bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" list 2>/dev/null > "$tmp"
+  python3 - "$tmp" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+mounts = data.get("mounts", [])
+if not mounts:
+    print("(no mounts)"); raise SystemExit
+print(f"{'thread':<10} {'enabled':<8} path")
+for m in mounts:
+    digest = m.get("digest") or {}
+    enabled = digest.get("enabled", False)
+    print(f"{str(m.get('thread_id','?')):<10} {str(enabled).lower():<8} {m.get('path','')}")
+PY
+  rm -f "$tmp"
 }
 
 # ─── Phase 3 pairing (one-time bootstrap secret) ────────────────────────────
@@ -1834,6 +2117,13 @@ Usage:
   cta config ack <on|off>         Toggle the bot's per-message ack reaction
   cta config caffeinate <on|off>  Toggle caffeinate -i (keep Mac awake)
   cta config interrupt-steer <on|off>  Toggle mid-turn steering (interrupt a running turn)
+  cta config digest-time <HH:MM>  Set when the H2 daily digest fires (local time in your tz)
+  cta config quiet-hours <start> <end>  Set quiet window (digest defers inside; HH:MM, wraps midnight if start>end)
+  cta config timezone <IANA>      Set the tz used by digest-time + quiet-hours (e.g. Asia/Tokyo)
+  cta digest <thread> [on|off|init]
+                                  Show or toggle per-mount H2 daily digest. \`init\`
+                                  scaffolds HEARTBEAT.md in the mount dir
+  cta digest list                 List all mounts with their digest state
   cta migrate-state               Move v0.1 ~/.claude-telegram-agent/ → ~/.pager/
   cta init                        First-run setup wizard (token → pair → default mount)
   cta open <thread>               Open a TUI for a topic (β handoff — daemon yields, claude --resume)
@@ -1869,6 +2159,7 @@ main() {
     pair) cmd_pair "$@" ;;
     unpair) cmd_unpair "$@" ;;
     config) cmd_config "$@" ;;
+    digest) cmd_digest "$@" ;;
     migrate-state) cmd_migrate_state "$@" ;;
     init) cmd_init "$@" ;;
     open) cmd_open "$@" ;;

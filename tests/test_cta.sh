@@ -916,6 +916,96 @@ else
   ng "Phase 4: _last_activity still uses only bot.pid → null in daemon mode"
 fi
 
+# ─── H2 daily digest config knobs ─────────────────────────────────────────────
+# _config_digest_time, _config_quiet_hours, _config_timezone all write to
+# settings.json under their respective keys. Validate input, round-trip.
+
+DIGEST_TMP=$(mktemp -d)
+SETTINGS_FILE="$DIGEST_TMP/settings.json"
+STATE_DIR="$DIGEST_TMP"
+
+# digest-time happy path
+_config_digest_time "09:30" >/dev/null
+DT_READ=$(_config_digest_time)
+[[ "$DT_READ" == "09:30" ]] && ok "_config_digest_time: round-trips HH:MM" \
+                            || ng "_config_digest_time: expected 09:30 got '$DT_READ'"
+
+# digest-time validates HH:MM (reject garbage)
+if _config_digest_time "garbage" 2>/dev/null; then
+  ng "_config_digest_time: should reject 'garbage'"
+else
+  ok "_config_digest_time: rejects non-HH:MM input"
+fi
+
+# digest-time clear via 'off'
+_config_digest_time "off" >/dev/null
+DT_CLEARED=$(_config_digest_time)
+[[ "$DT_CLEARED" == "09:00" ]] && ok "_config_digest_time: 'off' clears to default 09:00" \
+                               || ng "_config_digest_time: 'off' clear failed (got '$DT_CLEARED')"
+
+# quiet-hours non-wrap
+_config_quiet_hours "13:00" "17:00" >/dev/null
+QH_READ=$(_config_quiet_hours)
+echo "$QH_READ" | grep -q '"start": *"13:00"' && echo "$QH_READ" | grep -q '"end": *"17:00"' \
+  && ok "_config_quiet_hours: round-trips non-wrapping window" \
+  || ng "_config_quiet_hours: round-trip failed (got '$QH_READ')"
+
+# quiet-hours wrap-midnight (gives wrap notice in output)
+QH_OUT=$(_config_quiet_hours "23:00" "07:00" 2>&1)
+echo "$QH_OUT" | grep -q "wraps midnight" \
+  && ok "_config_quiet_hours: notes wrap-midnight in confirmation" \
+  || ng "_config_quiet_hours: wrap-midnight notice missing (got '$QH_OUT')"
+
+# quiet-hours validates each half independently
+if _config_quiet_hours "garbage" "07:00" 2>/dev/null; then
+  ng "_config_quiet_hours: should reject bad 'start'"
+else
+  ok "_config_quiet_hours: rejects malformed start HH:MM"
+fi
+
+# quiet-hours clear via 'off'
+_config_quiet_hours "off" "" >/dev/null
+QH_CLEARED=$(_config_quiet_hours)
+[[ "$QH_CLEARED" == "(none)" ]] && ok "_config_quiet_hours: 'off' clears" \
+                                || ng "_config_quiet_hours: 'off' clear failed (got '$QH_CLEARED')"
+
+# timezone IANA round-trip
+_config_timezone "Asia/Tokyo" >/dev/null
+TZ_READ=$(_config_timezone)
+[[ "$TZ_READ" == "Asia/Tokyo" ]] && ok "_config_timezone: round-trips IANA tz" \
+                                 || ng "_config_timezone: round-trip failed (got '$TZ_READ')"
+
+# timezone rejects obviously bad input (shell-metachar-bearing strings)
+if _config_timezone "Asia/Tokyo;rm" 2>/dev/null; then
+  ng "_config_timezone: should reject input with shell metachars"
+else
+  ok "_config_timezone: rejects shell-metachar input"
+fi
+
+# timezone clear via 'off'
+_config_timezone "off" >/dev/null
+TZ_CLEARED=$(_config_timezone)
+[[ "$TZ_CLEARED" == "(system default)" ]] && ok "_config_timezone: 'off' clears" \
+                                          || ng "_config_timezone: 'off' clear failed (got '$TZ_CLEARED')"
+
+# Settings file shape: all keys present at once should round-trip without
+# clobbering each other. Pin the JSON-merge contract.
+_config_digest_time "10:00" >/dev/null
+_config_quiet_hours "22:00" "06:00" >/dev/null
+_config_timezone "America/Los_Angeles" >/dev/null
+python3 - "$SETTINGS_FILE" <<'PY' && ok "settings.json: digest fields coexist without clobber" \
+                                   || ng "settings.json: field clobber"
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+assert d.get("digestTime") == "10:00"
+assert d.get("quietHours") == {"start":"22:00", "end":"06:00"}
+assert d.get("timezone") == "America/Los_Angeles"
+assert d.get("version") == 1
+PY
+
+rm -rf "$DIGEST_TMP"
+
 # ─── summary ─────────────────────────────────────────────────────────────────
 
 echo

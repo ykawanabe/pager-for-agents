@@ -467,6 +467,40 @@ export async function removeMount(
 }
 
 /**
+ * Set or clear the H2 digest config on a single mount. Caller passes either
+ * the full DigestConfig (sets enabled and sendOnEmpty) or null (removes the
+ * field entirely so the row goes back to "digest disabled" — the absence
+ * of digest is the canonical disabled state).
+ *
+ * Returns the updated Mount, or null if no mount with that thread_id+channel
+ * exists. Idempotent: calling with the same config is a no-op write (still
+ * rewrites the file but produces the same content).
+ */
+export async function setDigest(args: {
+  thread_id: ThreadId;
+  channel?: Channel;
+  /** null → remove the digest field entirely. */
+  digest: DigestConfig | null;
+}): Promise<Mount | null> {
+  const ch = args.channel ?? DEFAULT_CHANNEL;
+  return withLock(() => {
+    const data = readMounts();
+    const idx = data.mounts.findIndex((m) => sameTarget(m, ch, args.thread_id));
+    if (idx < 0) return null;
+    const existing = data.mounts[idx];
+    const updated: Mount = { ...existing };
+    if (args.digest === null) {
+      delete updated.digest;
+    } else {
+      updated.digest = args.digest;
+    }
+    data.mounts[idx] = updated;
+    writeMountsAtomic(data);
+    return updated;
+  });
+}
+
+/**
  * Atomically clear ALL mounts. Used by `cta unpair` (and the poller's
  * /unpair confirm handler) to wipe state on chat reset without bypassing
  * the lock. `rm -f mounts.json` worked but raced with concurrent `cta
@@ -563,6 +597,27 @@ async function main(): Promise<void> {
       try {
         const id = parseThreadId(rest[0] ?? "");
         const m = await removeMount(id);
+        process.stdout.write(`${JSON.stringify(m)}\n`);
+      } catch (e) {
+        bail(e instanceof Error ? e.message : String(e));
+      }
+      return;
+    }
+    case "set-digest": {
+      // Args: <thread_id> on|off [--send-on-empty]
+      // Toggles the v3 digest field on a mount. Off removes the field
+      // entirely (digest disabled = canonical absence). `cta digest`
+      // shells out to this verb.
+      const val = rest[1];
+      if (val !== "on" && val !== "off") {
+        bail("set-digest: second arg must be 'on' or 'off'");
+      }
+      try {
+        const id = parseThreadId(rest[0] ?? "");
+        const sendOnEmpty = rest.includes("--send-on-empty");
+        const digest = val === "on" ? { enabled: true, sendOnEmpty } : null;
+        const m = await setDigest({ thread_id: id, digest });
+        if (m === null) bail(`set-digest: no mount for thread_id ${JSON.stringify(rest[0])}`);
         process.stdout.write(`${JSON.stringify(m)}\n`);
       } catch (e) {
         bail(e instanceof Error ? e.message : String(e));
