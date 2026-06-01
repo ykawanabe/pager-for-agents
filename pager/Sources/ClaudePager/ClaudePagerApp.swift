@@ -28,6 +28,7 @@ struct ClaudePagerApp: App {
     // StatusMonitor is a long-lived singleton elsewhere.
     @ObservedObject private var monitor = StatusMonitor.shared
     @ObservedObject private var caffeinate = CaffeinateController()
+    private let wakeObserver = WakeObserver()
     @AppStorage("stopBotOnQuit") private var stopBotOnQuit = true
     // Default ON: the bot is a 24/7 service, and macOS's aggressive battery-
     // mode idle sleep (sleep=1 min by default on Apple Silicon) makes the bot
@@ -46,18 +47,23 @@ struct ClaudePagerApp: App {
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didFinishLaunchingNotification, object: nil, queue: .main
-        ) { _ in
+        ) { [wakeObserver] _ in
             StatusMonitor.shared.start()
             AgentControl.ensureBotRunning()
+            // Surface macOS wake events to the poller so a stale-after-sleep
+            // long-poll socket aborts immediately instead of burning the full
+            // ~40s timeout budget while the user waits for a reply.
+            wakeObserver.start()
         }
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: nil
-        ) { [caffeinate] _ in
+        ) { [caffeinate, wakeObserver] _ in
             // Always drop the caffeinate assertion when Pager goes away.
             // Surprising for the user if the Mac stayed awake forever after
             // they quit Pager. Idempotent — cta returns "Not running" cleanly.
             caffeinate.stop()
+            wakeObserver.stop()
             if UserDefaults.standard.object(forKey: "stopBotOnQuit") as? Bool ?? true {
                 AgentControl.stopBot()
             }

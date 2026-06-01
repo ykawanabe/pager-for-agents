@@ -66,7 +66,7 @@ import type {
   TgChatMemberUpdated,
 } from "../channels/telegram/adapter";
 import { makeTransport } from "../channels/transport-factory";
-import { isButtonCapable, isEditable, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
+import { isButtonCapable, isEditable, isInterruptible, isReactable, isTyping, type AckHandle, type ChatAddress, type ChatTransport, type Channel, type InboundEvent } from "../channels/types";
 
 /** The normalized message-kind event the command pipeline consumes (replaces the
  *  raw TgMessage every handler used to take). Carries everything a handler needs
@@ -139,7 +139,7 @@ async function editMessageText(chat_id: number, message_id: number, text: string
 function tgKey(thread_id: ThreadId): string {
   return mountKey("telegram", thread_id);
 }
-import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs, settingsJson } from "../lib/paths";
+import { stateDir, pollerOffsetFile, heartbeatFile, mountsJson, pairingCodeFile, pairedStateFile, topicsJson, sessionsDir, installAgentDir, installMountStoreTs, settingsJson, wakeFlagFile } from "../lib/paths";
 import { runFileAccessProbe } from "./file-access-probe";
 
 // ─── env ─────────────────────────────────────────────────────────────────────
@@ -158,6 +158,7 @@ const MOUNTS_JSON = mountsJson();
 const PAIRING_CODE_FILE = pairingCodeFile();
 const PAIRED_STATE_FILE = pairedStateFile();
 const SETTINGS_FILE = settingsJson();
+const WAKE_FLAG = wakeFlagFile();
 // Topic-name cache: poller writes, Pager reads. Updated when we see a
 // forum_topic_created / forum_topic_edited service message fly past. Key is
 // "<chat_id>/<message_thread_id>" so multi-chat installs don't collide on
@@ -2241,6 +2242,20 @@ export async function main(): Promise<void> {
     housekeeping = true;
     void (async () => {
       try {
+        // Wake-event interrupt (Pager touches WAKE_FLAG on
+        // NSWorkspace.didWakeNotification). If observed, abort the in-flight
+        // getUpdates so the next loop iteration dials a fresh socket — a
+        // socket suspended through the sleep cycle would otherwise burn the
+        // full ~40s long-poll budget before its own AbortController fires.
+        // Single observation per flag write; unlink before signalling so a
+        // racing housekeep tick doesn't double-fire.
+        if (existsSync(WAKE_FLAG)) {
+          try { unlinkSync(WAKE_FLAG); } catch { /* racing unlink — accept */ }
+          if (isInterruptible(transport)) {
+            transport.interruptInbound();
+            process.stdout.write(`[${new Date().toISOString()}] wake-flag observed → forced inbound retry\n`);
+          }
+        }
         touchHeartbeat();
         refreshMountsIfChanged();
         refreshPairedIfChanged();

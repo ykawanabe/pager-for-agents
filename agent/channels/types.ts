@@ -232,11 +232,25 @@ export interface ProactiveCapable {
   sendProactive(args: { to: ChatAddress; text: string }): Promise<MessageRef>;
 }
 
+export interface InboundInterruptible {
+  /** Force the current inbound read in flight to abort and the loop to retry
+   *  immediately with a fresh socket. Wired to a host wake-event (macOS
+   *  NSWorkspace.didWakeNotification surfaced via a flag file the poller
+   *  observes in housekeep): a stale long-poll socket that survived a sleep
+   *  cycle would otherwise burn the full timeoutSec+slack before the abort
+   *  fires. Idempotent — multiple calls collapse to one abort.
+   *  Transports without a controllable abort (e.g. webhook-push) may skip
+   *  implementing this; the housekeep guard feature-detects via
+   *  isInterruptible(). */
+  interruptInbound(): void;
+}
+
 // ─── type guards (poller feature-detects on capability, never on `channel`) ──
 
 export const isEditable = (t: ChatTransport): t is ChatTransport & Editable => "editText" in t;
 export const isReactable = (t: ChatTransport): t is ChatTransport & Reactable => "setDeliveredAck" in t;
 export const isTyping = (t: ChatTransport): t is ChatTransport & TypingIndicating => "startTyping" in t;
+export const isInterruptible = (t: ChatTransport): t is ChatTransport & InboundInterruptible => "interruptInbound" in t;
 export const isFileCapable = (t: ChatTransport): t is ChatTransport & FileCapable => "sendFile" in t;
 export const isSlashCommandable = (t: ChatTransport): t is ChatTransport & SlashCommandable =>
   "registerCommands" in t;

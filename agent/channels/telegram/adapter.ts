@@ -257,13 +257,33 @@ export interface TgResp { ok: boolean; result?: TgUpdate[]; description?: string
  * Generic (not Telegram-specific) but colocated with its only consumers
  * (getUpdates/getMe); promote to a shared lib if another transport needs it.
  */
-export async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestInit): Promise<Response> {
+export async function fetchWithTimeout(
+  url: string,
+  timeoutMs: number,
+  init?: RequestInit,
+  externalSignal?: AbortSignal,
+): Promise<Response> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  // Forward an external abort (e.g. host wake-event → poller interrupts the
+  // long-poll to force-refresh the socket) into our own controller so the
+  // pending fetch unblocks. We attach manually instead of using AbortSignal.any
+  // for portability across bun/node versions; the cleanup in finally removes
+  // the listener so a long-lived externalSignal can't leak references to dead
+  // controllers across many poll cycles.
+  const onExternalAbort = () => ctrl.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      ctrl.abort();
+    } else {
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
   try {
     return await fetch(url, { ...init, signal: ctrl.signal });
   } finally {
     clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
   }
 }
 
@@ -275,12 +295,16 @@ export async function fetchWithTimeout(url: string, timeoutMs: number, init?: Re
  * allowed_updates is sent every call (Telegram drops my_chat_member /
  * callback_query otherwise on a fresh deploy — no server-side state assumed).
  */
-export async function getUpdates(offset: number, timeoutSec: number): Promise<TgUpdate[]> {
+export async function getUpdates(
+  offset: number,
+  timeoutSec: number,
+  externalSignal?: AbortSignal,
+): Promise<TgUpdate[]> {
   const allowed = encodeURIComponent(JSON.stringify([
     "message", "edited_message", "my_chat_member", "callback_query",
   ]));
   const url = `${getApiBase()}/getUpdates?timeout=${timeoutSec}&offset=${offset}&allowed_updates=${allowed}`;
-  const resp = await fetchWithTimeout(url, (timeoutSec + 15) * 1000);
+  const resp = await fetchWithTimeout(url, (timeoutSec + 15) * 1000, undefined, externalSignal);
   const json = (await resp.json()) as TgResp;
   if (!json.ok) {
     throw new Error(`getUpdates: ${json.description ?? "(no description)"}`);

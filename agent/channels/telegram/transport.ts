@@ -138,6 +138,11 @@ export class TelegramTransport
 
   private handler: ((e: InboundEvent) => Promise<void>) | null = null;
   private running = false;
+  // The AbortController for the *current* getUpdates iteration. Created fresh
+  // per long-poll, cleared on iteration end. interruptInbound() flips this so
+  // a host wake-event can drop a socket that was suspended through the sleep
+  // and force the next iteration to dial a fresh one immediately.
+  private currentPollAbort: AbortController | undefined;
 
   // ─── required core ─────────────────────────────────────────────────────────
 
@@ -146,18 +151,30 @@ export class TelegramTransport
   }
 
   /** Drive the long-poll loop: getUpdates → persist offset BEFORE dispatch
-   *  (drop-not-double-deliver durability contract) → normalize → handler. */
+   *  (drop-not-double-deliver durability contract) → normalize → handler.
+   *  Each iteration carries its own AbortController so external code
+   *  (poller's wake-flag housekeep) can abort the in-flight fetch. */
   async start(_opts: { publicUrl?: string }): Promise<void> {
     this.running = true;
     let offset = this.readOffset();
     while (this.running) {
+      this.currentPollAbort = new AbortController();
       let updates: TgUpdate[];
       try {
-        updates = await getUpdates(offset, this.pollTimeoutSec);
+        updates = await getUpdates(offset, this.pollTimeoutSec, this.currentPollAbort.signal);
       } catch (e) {
-        process.stderr.write(`telegram: getUpdates failed: ${e instanceof Error ? e.message : String(e)}\n`);
-        await new Promise((r) => setTimeout(r, 5_000));
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`telegram: getUpdates failed: ${msg}\n`);
+        // Aborts (timeout-abort, wake-abort) mean the prior socket is dead; a
+        // fresh fetch is the recovery — no need to wait. Hard errors (5xx,
+        // token rejected, JSON parse) get the 5s backoff to avoid hot loops.
+        const isAbort =
+          e instanceof Error &&
+          (e.name === "AbortError" || msg.includes("aborted") || msg.includes("operation was aborted"));
+        if (!isAbort) await new Promise((r) => setTimeout(r, 5_000));
         continue;
+      } finally {
+        this.currentPollAbort = undefined;
       }
       if (updates.length === 0) continue;
       const maxId = updates[updates.length - 1].update_id;
@@ -168,6 +185,14 @@ export class TelegramTransport
         if (ev && this.handler) await this.handler(ev);
       }
     }
+  }
+
+  /** InboundInterruptible — abort the in-flight long-poll so the next loop
+   *  iteration dials a fresh socket immediately. Wired to the host wake-flag
+   *  via poller housekeep. No-op when no poll is in flight (between iterations
+   *  or before start()). */
+  interruptInbound(): void {
+    this.currentPollAbort?.abort();
   }
 
   async stop(): Promise<void> {

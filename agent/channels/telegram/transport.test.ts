@@ -299,3 +299,88 @@ describe("start/onEvent long-poll loop", () => {
     expect(got).toContain("from-loop");
   });
 });
+
+describe("interruptInbound — wake-event abort", () => {
+  test("advertises InboundInterruptible capability", () => {
+    const t = new TelegramTransport();
+    expect(guards.isInterruptible(t)).toBe(true);
+    expect(typeof (t as { interruptInbound?: unknown }).interruptInbound).toBe("function");
+  });
+
+  test("aborts in-flight getUpdates and retries immediately (no 5s blind sleep)", async () => {
+    // Fake server holds the long-poll open for 10s normally; the test's wake
+    // signal must abort it well inside that window. We measure the gap between
+    // the abort call and the NEXT getUpdates call landing on the fake server
+    // — pre-fix that gap was ≥ 5s (the blind backoff after the AbortError
+    // catch); post-fix it's near-zero.
+    const realFetch = globalThis.fetch;
+    let getUpdatesCalls = 0;
+    let firstCallStartedAt = 0;
+    let secondCallStartedAt = 0;
+    globalThis.fetch = (async (...args: Parameters<typeof realFetch>) => {
+      const url = String(args[0]);
+      if (url.includes("/getUpdates")) {
+        getUpdatesCalls++;
+        if (getUpdatesCalls === 1) {
+          firstCallStartedAt = Date.now();
+          // Long-block this call so the abort path is exercised. Resolved via
+          // the signal (abort propagation through fetch's standard contract).
+          const init = args[1] as RequestInit | undefined;
+          const signal = init?.signal;
+          return await new Promise<Response>((resolve, reject) => {
+            const timer = setTimeout(
+              () => resolve(Response.json({ ok: true, result: [] })),
+              10_000,
+            );
+            signal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              const err = new Error("The operation was aborted");
+              err.name = "AbortError";
+              reject(err);
+            }, { once: true });
+          });
+        }
+        if (getUpdatesCalls === 2) secondCallStartedAt = Date.now();
+      }
+      return realFetch(...args);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const t = new TelegramTransport();
+      t.onEvent(async () => {});
+      const loop = t.start({});
+
+      // Wait until the first getUpdates is actually in flight, then fire the
+      // wake interrupt. Spin until firstCallStartedAt is set; 500ms ceiling.
+      const armDeadline = Date.now() + 500;
+      while (firstCallStartedAt === 0 && Date.now() < armDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(firstCallStartedAt).toBeGreaterThan(0);
+
+      const abortAt = Date.now();
+      t.interruptInbound();
+
+      // Wait for the retry (second call) to land. <1s if the abort path
+      // skipped the 5s sleep; ≥5s otherwise. 2s deadline.
+      const retryDeadline = Date.now() + 2000;
+      while (secondCallStartedAt === 0 && Date.now() < retryDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      await t.stop();
+      await loop;
+      expect(secondCallStartedAt).toBeGreaterThan(0);
+      expect(secondCallStartedAt - abortAt).toBeLessThan(1000);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("interruptInbound is a no-op when no poll is in flight", () => {
+    const t = new TelegramTransport();
+    // start() has not been called → currentPollAbort is undefined. The call
+    // must not throw, and must not leave any side-effect that would corrupt
+    // a future start().
+    expect(() => t.interruptInbound()).not.toThrow();
+  });
+});

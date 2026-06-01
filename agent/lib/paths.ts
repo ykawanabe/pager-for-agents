@@ -54,6 +54,11 @@ export function mountsJson(): string { return join(stateDir(), "mounts.json"); }
 export function topicsJson(): string { return join(stateDir(), "topics.json"); }
 export function pollerOffsetFile(): string { return join(stateDir(), "poller-offset"); }
 export function heartbeatFile(): string { return join(stateDir(), "heartbeat-poller"); }
+/** Wake-event flag. Pager (NSWorkspace.didWakeNotification) touches this on
+ *  macOS system wake; the poller's housekeep observes it and aborts the
+ *  current getUpdates so a stale-after-sleep socket can't burn the full
+ *  long-poll budget before the next fetch refreshes. */
+export function wakeFlagFile(): string { return join(stateDir(), "wake.flag"); }
 export function caffeinatePidFile(): string { return join(stateDir(), "caffeinate.pid"); }
 export function sessionsDir(): string { return join(stateDir(), "sessions"); }
 export function typingDir(): string { return join(stateDir(), "typing"); }
