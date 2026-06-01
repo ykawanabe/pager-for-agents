@@ -59,6 +59,26 @@ export function heartbeatFile(): string { return join(stateDir(), "heartbeat-pol
  *  current getUpdates so a stale-after-sleep socket can't burn the full
  *  long-poll budget before the next fetch refreshes. */
 export function wakeFlagFile(): string { return join(stateDir(), "wake.flag"); }
+
+// ─── H2 daily digest heartbeat (Design A) ────────────────────────────────────
+// Per-thread session UUIDs let the heartbeat-runner --resume yesterday's claude
+// session so day N+1 sees day N's findings (avoids re-flagging the same item).
+// Lives in its own subtree so a `cta digest reset` can wipe it without
+// touching anything else.
+export function heartbeatSessionsDir(): string { return join(stateDir(), "heartbeat-sessions"); }
+export function heartbeatSessionFile(threadId: string | "dm"): string {
+  return join(heartbeatSessionsDir(), `${threadId}`);
+}
+/** Per-fire append-only JSONL log of digest runs (cost, duration, result,
+ *  per-check status). `cta digest log <thread>` tails this. */
+export function heartbeatLogDir(): string { return join(stateDir(), "heartbeat-log"); }
+export function heartbeatLogFile(threadId: string | "dm"): string {
+  return join(heartbeatLogDir(), `${threadId}.jsonl`);
+}
+/** Scheduler state: `{ version: 1, firedToday: { "<thread>:<YYYY-MM-DD>": <epoch_ms>, ... } }`.
+ *  Atomic-rename written; persisted BEFORE the runner spawns so a crash
+ *  during fire() doesn't cause a same-day retry. */
+export function heartbeatStateFile(): string { return join(stateDir(), "heartbeat-state.json"); }
 export function caffeinatePidFile(): string { return join(stateDir(), "caffeinate.pid"); }
 export function sessionsDir(): string { return join(stateDir(), "sessions"); }
 export function typingDir(): string { return join(stateDir(), "typing"); }
