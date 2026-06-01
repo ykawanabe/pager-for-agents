@@ -276,6 +276,8 @@ private struct PagerTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            DigestSection()
         }
         .formStyle(.grouped)
         .onAppear {
@@ -831,5 +833,116 @@ private struct AboutTab: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Daily digest section (H2)
+
+/// Per-mount H2 daily-digest controls. v1 keeps Pager intentionally thin —
+/// the on/off toggle here writes via `cta digest <thread> on|off`; the
+/// reminder time / quiet hours / timezone all live in `cta config` (CLI
+/// only, per the H2 plan's "stable core / volatile edges" discipline).
+///
+/// The list refreshes on appear and after each toggle. Wildcard mounts
+/// ("*") are filtered out — they aren't a real topic the digest can fire
+/// against. Mounts without HEARTBEAT.md show a small inline hint about
+/// running `cta digest <thread> init`.
+private struct DigestSection: View {
+    @State private var mounts: [CTAClient.MountJSON] = []
+    @State private var loading = false
+    @State private var error: String? = nil
+
+    var body: some View {
+        Section {
+            if let err = error {
+                Label(err, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+                    .font(.caption)
+            }
+            if mounts.isEmpty && !loading {
+                Text("No mounts yet. Mount a topic first (cta mount <thread> <path>).")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            } else {
+                ForEach(filteredMounts, id: \.id) { mount in
+                    digestRow(mount: mount)
+                }
+            }
+            Text("Daily fire time, quiet hours, and timezone live in your terminal: cta config digest-time / quiet-hours / timezone. Edit HEARTBEAT.md inside each project to control what shows up.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("Daily digest")
+        } footer: {
+            Text("A once-a-day summary of each project's open PRs, CI status, and any urgent TODOs you've flagged with HEARTBEAT_URGENT. Plays nice with quiet hours.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .onAppear { reload() }
+    }
+
+    private var filteredMounts: [CTAClient.MountJSON] {
+        mounts.filter { m in
+            // Skip the "*" wildcard mount — it's a catch-all template, not
+            // a real topic. The digest can't fire against it.
+            m.threadId.stringValue != "*"
+        }
+    }
+
+    @ViewBuilder
+    private func digestRow(mount: CTAClient.MountJSON) -> some View {
+        let threadStr = mount.threadId.stringValue
+        let enabled = mount.digest?.enabled ?? false
+        let topicName = mount.topicName ?? mount.label ?? threadStr
+        Toggle(isOn: Binding(
+            get: { enabled },
+            set: { on in toggle(thread: threadStr, on: on) }
+        )) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(topicName).font(.body)
+                Text("thread \(threadStr) · \(mount.path)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+    }
+
+    private func reload() {
+        loading = true
+        error = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let list = try CTAClient.listMounts()
+                DispatchQueue.main.async {
+                    mounts = list
+                    loading = false
+                }
+            } catch let e {
+                DispatchQueue.main.async {
+                    error = "Failed to load mounts: \(e.localizedDescription)"
+                    loading = false
+                }
+            }
+        }
+    }
+
+    private func toggle(thread: String, on: Bool) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                // sendOnEmpty default false in Pager v1 — operator can opt
+                // into it via `cta digest <thread> on --send-on-empty`.
+                // Pager's toggle is the binary "do you want daily digests
+                // for this project" question; the empty-day confirmation
+                // is a power-user preference.
+                _ = try CTAClient.setDigest(thread: thread, on: on)
+                DispatchQueue.main.async { reload() }
+            } catch let e {
+                DispatchQueue.main.async {
+                    error = "Toggle failed: \(e.localizedDescription)"
+                }
+            }
+        }
     }
 }

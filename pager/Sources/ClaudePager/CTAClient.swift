@@ -234,6 +234,33 @@ enum CTAClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    /// Toggle the H2 daily-digest for a single mount. Shells to
+    /// `cta digest <thread> on|off`. cta mutates mounts.json's `digest`
+    /// field (v3 schema) via mount-store's set-digest verb; the poller
+    /// live-reloads on mtime change and picks up the new state on the
+    /// next housekeep tick.
+    ///
+    /// `sendOnEmpty: true` opts into receiving a "Nothing actionable today"
+    /// confirmation message even on quiet days. Pager surfaces this as a
+    /// separate sub-toggle below the main on/off — see SettingsView.
+    @discardableResult
+    static func setDigest(thread: String, on: Bool, sendOnEmpty: Bool = false) throws -> String {
+        var args = ["digest", thread, on ? "on" : "off"]
+        if on && sendOnEmpty { args.append("--send-on-empty") }
+        let data = try run(args: args)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Scaffold a starter HEARTBEAT.md in the mount's path via `cta digest
+    /// <thread> init`. Idempotent on the cta side — won't overwrite an
+    /// existing file. Returns the cta stdout for surfacing in the UI
+    /// (operator sees "Scaffolded …/HEARTBEAT.md" or "already exists").
+    @discardableResult
+    static func digestInit(thread: String) throws -> String {
+        let data = try run(args: ["digest", thread, "init"])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     // MARK: - Mounts (Phase 2: per-topic project bindings)
 
     /// Mirrors a single entry in `cta list --json` → `.mounts[]`. thread_id
@@ -253,6 +280,15 @@ enum CTAClient {
         /// re-deriving the label from threadId so the CLI stays the single
         /// source of truth for labeling.
         let topicName: String?
+        /// v3 (2026-06-01): per-mount H2 daily-digest config. Absent → digest
+        /// disabled for this mount. Pager renders a toggle per mount in
+        /// Settings; flipping it shells to `cta digest <thread> on|off`.
+        let digest: DigestConfig?
+
+        struct DigestConfig: Decodable, Equatable {
+            let enabled: Bool
+            let sendOnEmpty: Bool?
+        }
 
         var id: String { threadId.stringValue }
 
@@ -283,6 +319,7 @@ enum CTAClient {
             case tmuxSession = "tmux_session"
             case createdAt = "created_at"
             case topicName = "topic_name"
+            case digest
         }
     }
 

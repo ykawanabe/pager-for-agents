@@ -909,7 +909,10 @@ _digest_set() {
     esac
     shift
   done
-  bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" set-digest "$thread" "$action" "${extra[@]}" >/dev/null
+  # ${extra[@]+"${extra[@]}"} expands to nothing when the array is empty
+  # under `set -u` (the script's mode). Plain "${extra[@]}" would trip
+  # the unbound-variable trap on the off path where no flags are passed.
+  bun run "$INSTALL_DIR/agent/mount-store/mount-store.ts" set-digest "$thread" "$action" ${extra[@]+"${extra[@]}"} >/dev/null
   if [[ "$action" == "on" && ${#extra[@]} -gt 0 ]]; then
     echo "digest for thread $thread: $action (${extra[*]})"
   else
