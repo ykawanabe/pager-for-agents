@@ -112,6 +112,13 @@ while IFS= read -r line; do
     continue
   fi
 
+  if [[ "$MODE" == "crash-always" ]]; then
+    # Exit 1 on EVERY turn BEFORE emitting a result (no turn-end). The registry's
+    # crashCount accumulates (it resets only on a healthy turn-end) → drives the
+    # onCrashLoop notice once it crosses the threshold.
+    exit 1
+  fi
+
   if [[ "$MODE" == "multiblock" ]]; then
     emit_assistant_text "thinking…"
     emit_assistant_text "answer: $text"

@@ -279,6 +279,36 @@ describe("ClaudeDaemonRegistry crash recovery", () => {
 
     expect(reg.spawnedCount).toBeGreaterThan(initialSpawnCount);
   });
+
+  // Note: a missing `claude` binary does NOT make daemon.start() throw (Node's
+  // spawn surfaces ENOENT async as a 'close'/'error' → 'crash'), so the real
+  // "claude is broken" failure mode is the crash-loop below, not onSpawnFail.
+  // onSpawnFail stays wired as a defensive hook for the rare start()-throws case.
+  test("onCrashLoop fires exactly once after crashLoopThreshold consecutive crashes", async () => {
+    let loopFired = 0;
+    let loopCount = 0;
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 30,
+      maxBackoffMs: 100,                 // short respawn backoff so the test is fast
+      crashLoopThreshold: 3,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "crash-always" } }),
+      onText: () => {},
+      onCrashLoop: (_t, n) => { loopFired++; loopCount = n; },
+    });
+    // Each message: spawn → send → the fake exits before turn-end → crash with no
+    // healthy turn to reset the counter. Gate each re-enqueue on the previous
+    // daemon having spawned-then-left inFlight (i.e. crashed); the 3rd crash
+    // crosses the threshold and fires the notice once.
+    for (let i = 1; i <= 3; i++) {
+      reg!.enqueue("topic-42", `m${i}`);
+      await waitFor(() => reg!.spawnedCount >= i, 5000);
+      await waitFor(() => reg!.getStatus("topic-42") !== "inFlight", 3000);
+    }
+    await waitFor(() => loopFired > 0, 4000);
+    expect(loopFired).toBe(1);   // exactly once, at the threshold (not on crash 4, 5…)
+    expect(loopCount).toBe(3);
+  });
 });
 
 describe("ClaudeDaemonRegistry self-heal (incident 2026-05-21)", () => {

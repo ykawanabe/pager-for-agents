@@ -63,6 +63,19 @@ export interface RegistryOptions {
    *  crash path respawns. Reset on every text block (so a long-but-active turn
    *  is never killed). Default 5min. */
   inFlightTimeoutMs?: number;
+  /** Optional: fired when the daemon can't be spawned at all (claude not on the
+   *  launchd PATH, immediate start failure). Without it the user gets total
+   *  silence — message queued, typing times out, no error ever reaches the chat.
+   *  Lets the poller surface a one-shot notice. Fires per failed flush. */
+  onSpawnFail?: (threadId: string) => void;
+  /** Optional: fired ONCE when a topic hits `crashLoopThreshold` consecutive
+   *  crashes with no healthy turn in between (a bad `/model`, a corrupt session
+   *  JSONL that `--resume` rejects, an auth failure). The other half of the
+   *  "bot silently stops replying" class — claude spawns fine but dies every
+   *  turn. crashCount resets to 0 on any healthy turn-end. */
+  onCrashLoop?: (threadId: string, crashCount: number) => void;
+  /** Optional: consecutive-crash count that trips onCrashLoop. Default 3. */
+  crashLoopThreshold?: number;
 }
 
 type DaemonState = "idle" | "pending" | "inFlight" | "released" | "crashed";
@@ -76,6 +89,9 @@ interface DaemonHandle {
   debounceTimer: ReturnType<typeof setTimeout> | null;
   /** Exponential backoff on crash respawn. */
   backoffMs: number;
+  /** Consecutive crashes with no healthy turn-end in between. Drives the
+   *  onCrashLoop notice; reset to 0 on any healthy turn-end. */
+  crashCount: number;
   /** Spawned count — exposed for tests to detect respawns. */
   spawnedCount: number;
   /** Wall-clock ms when releaseForTerminal was last called; null when not
@@ -159,6 +175,7 @@ export class ClaudeDaemonRegistry {
         queue: [],
         debounceTimer: null,
         backoffMs: 0,
+        crashCount: 0,
         spawnedCount: 0,
         releasedAt: null,
         inFlightTimer: null,
@@ -521,6 +538,9 @@ export class ClaudeDaemonRegistry {
       const ok = await this.spawn(threadId, handle);
       if (!ok) {
         handle.state = "crashed";
+        // Surface the spawn failure — otherwise the user's message sits queued
+        // in silence (typing times out, no error ever reaches the chat).
+        this.opts.onSpawnFail?.(threadId);
         return;
       }
     }
@@ -591,8 +611,9 @@ export class ClaudeDaemonRegistry {
       if (!h) return;
       this.clearInFlightTimer(h);
       if (h.state === "released") return; // user yanked the daemon mid-turn
-      // Healthy turn — reset crash backoff.
+      // Healthy turn — reset crash backoff + the consecutive-crash counter.
       h.backoffMs = 0;
+      h.crashCount = 0;
       h.state = "idle";
       // Idle clock starts now: the daemon just went quiescent. idleCandidates
       // measures from here.
@@ -625,6 +646,12 @@ export class ClaudeDaemonRegistry {
       if (h.stopping) { h.daemon = null; return; }
       h.daemon = null;
       h.state = "crashed";
+      // A crash with no healthy turn since the last one → count it, and fire the
+      // crash-loop notice exactly once when we cross the threshold (claude spawns
+      // fine but dies every turn — bad /model, corrupt session JSONL, auth error).
+      h.crashCount += 1;
+      const crashThreshold = this.opts.crashLoopThreshold ?? 3;
+      if (h.crashCount === crashThreshold) this.opts.onCrashLoop?.(threadId, h.crashCount);
       // Schedule a respawn attempt with exponential backoff. If the queue
       // is non-empty, the respawn will flush; otherwise stays idle until
       // the next enqueue.

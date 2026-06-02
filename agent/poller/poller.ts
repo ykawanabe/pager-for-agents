@@ -726,6 +726,35 @@ function postTelegramTextFromDaemon(threadIdStr: string, text: string): void {
   void reply(tgAddr(chat_id, threadId), body);
 }
 
+/** Send a plain operational notice into a topic (spawn-fail / crash-loop). Same
+ *  chat/thread resolution as postTelegramTextFromDaemon, minus button parsing. */
+function notifyTopic(threadIdStr: string, text: string): void {
+  const chatIdStr = effectiveChatId();
+  if (!chatIdStr) return;
+  const chat_id = Number(chatIdStr);
+  if (!Number.isFinite(chat_id)) return;
+  void reply(tgAddr(chat_id, parseRegistryThreadId(threadIdStr)), text);
+}
+
+/** The daemon couldn't be spawned at all — surface it instead of going silent. */
+function onDaemonSpawnFail(threadIdStr: string): void {
+  process.stderr.write(`[${new Date().toISOString()}] daemon spawn failed for thread ${threadIdStr}\n`);
+  notifyTopic(
+    threadIdStr,
+    "⚠️ Couldn't start a Claude session in this topic. Check that claude is on the agent's PATH (run cta status), the model, and the mounted directory. Logs: ~/.pager/agent.log",
+  );
+}
+
+/** claude spawns but dies every turn (bad /model, corrupt session, auth) — tell
+ *  the user once at the threshold rather than leaving them in silence. */
+function onDaemonCrashLoop(threadIdStr: string, crashCount: number): void {
+  process.stderr.write(`[${new Date().toISOString()}] daemon crash-loop for thread ${threadIdStr} (${crashCount}x)\n`);
+  notifyTopic(
+    threadIdStr,
+    `⚠️ Claude keeps crashing in this topic (${crashCount}x in a row) — likely a bad /model, an unreadable session, or an auth error. Check ~/.pager/agent.log; /clear may help.`,
+  );
+}
+
 /** Turn-start hook: (re-)assert the typing indicator for this topic. Fires on
  *  every turn the registry starts — including a steered continuation after a
  *  mid-turn interrupt, whose interrupted turn-end already cleared typing.
@@ -782,6 +811,8 @@ function initDaemonRegistry(): void {
     onFlush: onDaemonFlush,
     onTurnStart: onDaemonTurnStart,
     onTurnEnd: onDaemonTurnEnd,
+    onSpawnFail: onDaemonSpawnFail,
+    onCrashLoop: onDaemonCrashLoop,
   });
 }
 
@@ -1008,6 +1039,20 @@ const PENDING_PAIR_TTL_MS = 5 * 60 * 1000; // 5 minutes
  * new status ∈ {member,administrator}) AND we don't have a paired chat yet.
  */
 export async function handleMyChatMember(mcm: TgChatMemberUpdated): Promise<void> {
+  // Backfill botUserId if the boot-time preflight getMe failed (Wi-Fi not up at
+  // launchd start, captive portal, transient DNS). Without this it stays null
+  // for the whole process lifetime and the auto-pair-on-invite flow below never
+  // fires (the comment at preflight said "will retry in main loop" but nothing
+  // did). my_chat_member is rare, so a getMe here is cheap and self-limiting.
+  if (botUserId == null) {
+    try {
+      const me = await getMe();
+      if (me.ok && me.result?.id != null) {
+        botUserId = me.result.id;
+        process.stdout.write(`[${new Date().toISOString()}] backfilled bot id=${botUserId} (boot preflight had failed)\n`);
+      }
+    } catch { /* still offline — bail; the next my_chat_member retries */ }
+  }
   if (mcm.new_chat_member.user.id !== botUserId) return; // not us
   const oldS = mcm.old_chat_member.status;
   const newS = mcm.new_chat_member.status;
@@ -2015,33 +2060,26 @@ function refreshMountsIfChanged(): void {
  * Returns the persisted `tmux_session` field (still recorded in mount-store
  * for legacy schema compatibility) on success, null on failure.
  */
-function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): string | null {
-  const servicesDir = process.env.MOUNT_STORE_PATH
-    ? join(process.env.MOUNT_STORE_PATH, "..", "..")
-    : installAgentDir();
-  const storePath = join(servicesDir, "mount-store/mount-store.ts");
-
-  // Persist the new mount so subsequent restarts pick it up.
-  const addResult = spawnSync("bun", ["run", storePath, "add", String(thread_id), templatePath, "auto"], { encoding: "utf8" });
-  if (addResult.status !== 0) {
-    process.stderr.write(`poller: wildcard auto-mount add failed for ${thread_id}: ${addResult.stderr}\n`);
-    return null;
-  }
-  let mount: { tmux_session: string };
+async function autoSpawnFromWildcard(thread_id: number | "dm", templatePath: string): Promise<string | null> {
   try {
-    mount = JSON.parse(addResult.stdout);
+    // In-process addMount — was `spawnSync("bun","run","mount-store.ts","add")`,
+    // whose ~100s-of-ms `bun` cold start blocked the inbound long-poll on the
+    // FIRST message to any unmounted thread. addMount goes through the same
+    // O_EXCL withLock, so it's race-safe and persists for restarts.
+    const mount = await addMount({ thread_id, path: templatePath, label: "auto" });
+    // Refresh local cache so subsequent messages find the new mount directly.
+    refreshMountsIfChanged();
+    process.stdout.write(`[${new Date().toISOString()}] wildcard auto-mount: thread ${thread_id} → ${templatePath} (${mount.tmux_session})\n`);
+    return mount.tmux_session;
   } catch (e) {
-    process.stderr.write(`poller: wildcard auto-mount: unparseable mount-store output: ${addResult.stdout}\n`);
+    // Includes the "already mounted" race (a concurrent message won) — same
+    // null result the old non-zero exit status produced.
+    process.stderr.write(`poller: wildcard auto-mount failed for ${thread_id}: ${e instanceof Error ? e.message : String(e)}\n`);
     return null;
   }
-
-  // Refresh local cache so subsequent messages find the new mount directly.
-  refreshMountsIfChanged();
-  process.stdout.write(`[${new Date().toISOString()}] wildcard auto-mount: thread ${thread_id} → ${templatePath} (${mount.tmux_session})\n`);
-  return mount.tmux_session;
 }
 
-function routeMessage(ev: InboundMessageEvent): string | null {
+async function routeMessage(ev: InboundMessageEvent): Promise<string | null> {
   const chatId = chatIdOf(ev);
   const fromId = ev.from.id;
   const threadLabel = ev.routingKey === "dm" ? "-" : ev.routingKey;
@@ -2072,7 +2110,7 @@ function routeMessage(ev: InboundMessageEvent): string | null {
   // mount + tmux session using the wildcard's path as the project dir.
   const wildcard = mountsCache.get(tgKey("*"));
   if (wildcard) {
-    return autoSpawnFromWildcard(key, wildcard.path);
+    return await autoSpawnFromWildcard(key, wildcard.path);
   }
   return null;
 }
@@ -2157,7 +2195,7 @@ async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
     // No specific mount — try wildcard auto-spawn (existing behavior).
     const wildcard = mountsCache.get(tgKey("*"));
     if (wildcard) {
-      const spawned = autoSpawnFromWildcard(routeKey, wildcard.path);
+      const spawned = await autoSpawnFromWildcard(routeKey, wildcard.path);
       if (spawned) {
         mount = mountsCache.get(tgKey(routeKey)); // refreshMountsIfChanged ran inside autoSpawn
       }
