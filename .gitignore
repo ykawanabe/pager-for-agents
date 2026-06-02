@@ -138,3 +138,6 @@ __pycache__/
 /.claude/scheduled_tasks.lock
 .playwright-mcp/
 HEARTBEAT.md
+
+# Internal planning docs — kept local, never published.
+/docs/plans/
