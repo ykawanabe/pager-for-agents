@@ -140,14 +140,6 @@ export interface Mount {
   session_id: string;
   tmux_session: string;
   created_at: string;
-  /**
-   * Helper-mode marker. When true, the row was written by the poller's
-   * spawnHelper path as a placeholder so subsequent messages route to
-   * the helper-<thread_id> tmux session. cta mount replaces it with a
-   * real entry; gcProvisional drops it if the helper tmux is dead.
-   * Absent on all non-helper mounts.
-   */
-  provisional?: boolean;
   /** v3: per-mount digest config. Absent → disabled. */
   digest?: DigestConfig;
   /**
@@ -263,7 +255,6 @@ interface AnyMount {
   session_id: string;
   tmux_session: string;
   created_at: string;
-  provisional?: boolean;
   digest?: DigestConfig;
   // Plus any unknown forward-compat fields.
   [extraField: string]: unknown;
@@ -313,9 +304,6 @@ export function readMounts(): MountsFile {
         tmux_session: m.tmux_session,
         created_at: m.created_at,
       };
-      // Clean up provisional=false → undefined (legacy rows occasionally had
-      // explicit false; we treat absence as the canonical "not provisional").
-      if (!m.provisional) delete out.provisional;
       return out;
     });
     return { version: 3, mounts };
@@ -354,12 +342,6 @@ export async function addMount(args: {
    * tmux session as the routing target instead of spawning a fresh one.
    */
   tmux_session?: string;
-  /**
-   * Optional. Marks the row as a helper-mode placeholder (see Mount.provisional).
-   * Used by the poller's spawnHelper path; cta mount replaces these with
-   * real entries via replaceMount.
-   */
-  provisional?: boolean;
 }): Promise<Mount> {
   const channel = args.channel ?? DEFAULT_CHANNEL;
   return withLock(() => {
@@ -375,7 +357,6 @@ export async function addMount(args: {
       session_id: randomUUID(),
       tmux_session: args.tmux_session ?? `topic-${args.thread_id}`,
       created_at: new Date().toISOString(),
-      ...(args.provisional ? { provisional: true } : {}),
     };
     data.mounts.push(mount);
     writeMountsAtomic(data);
@@ -384,10 +365,9 @@ export async function addMount(args: {
 }
 
 /**
- * Atomic remove-and-add. The intended use is the helper-mode commit path:
- * `cta mount` detects an existing provisional row and overwrites it with
- * the user-chosen real path under a single lock acquisition. Unlike
- * addMount, this never throws on duplicate — it is the duplicate handler.
+ * Atomic remove-and-add: overwrite any existing mount for the target under a
+ * single lock acquisition. Unlike addMount, this never throws on duplicate —
+ * it is the duplicate handler.
  */
 export async function replaceMount(args: {
   channel?: Channel;
@@ -412,42 +392,6 @@ export async function replaceMount(args: {
     filtered.push(mount);
     writeMountsAtomic({ ...data, mounts: filtered });
     return mount;
-  });
-}
-
-/**
- * Drop provisional rows whose helper tmux session is dead. Called by the
- * poller at startup to clean up state left behind when a helper crashed,
- * a host rebooted mid-conversation, or `cta umount` partially ran. Real
- * (non-provisional) mounts are never touched. Returns the number dropped.
- *
- * `graceMs` (optional): preserve provisional rows whose `created_at` is
- * within this many ms of now, even if their tmux is dead. Closes D15
- * (cold-boot wipe): after a host reboot every helper-<id> tmux is gone,
- * but the row may have been written seconds ago by spawnHelper. Without
- * a grace window, the user's in-progress helper conversation is wiped.
- * The default (`undefined` / no grace) preserves the original behavior:
- * dead tmux → drop, regardless of age.
- */
-export async function gcProvisional(
-  isAlive: (tmuxSession: string) => boolean,
-  graceMs?: number,
-): Promise<number> {
-  return withLock(() => {
-    const data = readMounts();
-    const now = Date.now();
-    const kept = data.mounts.filter((m) => {
-      if (!m.provisional) return true;
-      if (graceMs != null && m.created_at) {
-        const age = now - new Date(m.created_at).getTime();
-        if (Number.isFinite(age) && age >= 0 && age < graceMs) return true;
-      }
-      if (!m.tmux_session) return false;
-      return isAlive(m.tmux_session);
-    });
-    const dropped = data.mounts.length - kept.length;
-    if (dropped > 0) writeMountsAtomic({ ...data, mounts: kept });
-    return dropped;
   });
 }
 
@@ -552,10 +496,9 @@ async function main(): Promise<void> {
     }
     case "add": {
       // Args: <thread_id> <path> [label] [tmux_session]
-      // Flags: --provisional, --tmux-session <name> (alternative to positional)
+      // Flags: --tmux-session <name> (alternative to positional)
       // tmux_session positional (4th arg) is used by `cta bind` to pin the
       // current pane's tmux name; absent → defaults to `topic-<thread_id>`.
-      const provisional = rest.includes("--provisional");
       const tmuxFlagIdx = rest.indexOf("--tmux-session");
       const tmuxFromFlag = tmuxFlagIdx >= 0 ? rest[tmuxFlagIdx + 1] : undefined;
       const positional = rest.filter((a, i) =>
@@ -570,7 +513,7 @@ async function main(): Promise<void> {
       if (!path) bail("add: path is required");
       try {
         const id = parseThreadId(positional[0] ?? "");
-        const m = await addMount({ thread_id: id, path, label, tmux_session, provisional });
+        const m = await addMount({ thread_id: id, path, label, tmux_session });
         process.stdout.write(`${JSON.stringify(m)}\n`);
       } catch (e) {
         bail(e instanceof Error ? e.message : String(e));
@@ -623,30 +566,13 @@ async function main(): Promise<void> {
       }
       return;
     }
-    case "gc-provisional": {
-      // Optional --grace-ms <N> flag: preserve provisional rows whose
-      // created_at is within N ms of now, even if tmux is dead. Used by
-      // the poller to ride out cold-boot wipes (D15).
-      const graceIdx = rest.indexOf("--grace-ms");
-      const graceMs = graceIdx >= 0 ? Number(rest[graceIdx + 1]) : undefined;
-      const dropped = await gcProvisional((s) => {
-        try {
-          const r = Bun.spawnSync(["tmux", "has-session", "-t", s]);
-          return r.exitCode === 0;
-        } catch {
-          return false;
-        }
-      }, graceMs);
-      process.stdout.write(`${JSON.stringify({ dropped })}\n`);
-      return;
-    }
     case "clear": {
       await clearMounts();
       process.stdout.write(`${JSON.stringify({ cleared: true })}\n`);
       return;
     }
     default:
-      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, replace, remove, gc-provisional, clear`);
+      bail(`unknown op: ${op ?? "(none)"}. Try: list, get, add, replace, remove, clear`);
   }
 }
 

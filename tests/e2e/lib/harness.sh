@@ -126,12 +126,8 @@ EOF
 # Seed a mount directly via mount-store CLI. Useful for scenarios that
 # want to start at "topic 42 is already mounted at X."
 h_seed_mount() {
-  local thread_id="$1" path="$2" label="${3:-test}" provisional="${4:-}"
-  local args=("$thread_id" "$path" "$label")
-  if [[ "$provisional" == "provisional" ]]; then
-    args+=("--provisional")
-  fi
-  bun run "$CTA_INSTALL_DIR/agent/mount-store/mount-store.ts" add "${args[@]}" >/dev/null
+  local thread_id="$1" path="$2" label="${3:-test}"
+  bun run "$CTA_INSTALL_DIR/agent/mount-store/mount-store.ts" add "$thread_id" "$path" "$label" >/dev/null
 }
 
 # Seed a per-thread session UUID file (what the poller reads for

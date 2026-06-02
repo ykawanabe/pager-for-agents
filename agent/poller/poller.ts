@@ -31,7 +31,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, st
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { addMount, mountKey, readMounts, removeMount, type Mount, type ThreadId } from "../mount-store/mount-store";
+import { addMount, mountKey, readMounts, type Mount, type ThreadId } from "../mount-store/mount-store";
 import {
   aggregateCostFromJsonl,
   contextWindowFor,
@@ -1343,14 +1343,6 @@ async function handleClear(ev: InboundMessageEvent): Promise<void> {
     return;
   }
 
-  if (mount.provisional) {
-    await reply(
-      dest,
-      "This topic has a pending mount, not a running session — nothing to clear. Send `/cancel` to drop it, or `cta mount <path>` from your Mac.",
-    );
-    return;
-  }
-
   // Rotate per-topic session UUID. The new daemon (spawned by the registry
   // on the next enqueue) reads this file at start and uses --session-id with
   // a fresh UUID → no --resume → cold conversation.
@@ -1377,29 +1369,6 @@ async function handleClear(ev: InboundMessageEvent): Promise<void> {
   await reply(
     dest,
     "Cleared. New session starts on the next message (cold-start adds ~5–15s).",
-  );
-}
-
-async function handleCancel(ev: InboundMessageEvent): Promise<void> {
-  const dest = ev.address;
-  const key = threadIdOf(ev);
-  const mount = mountsCache.get(tgKey(key));
-  if (!mount?.provisional) {
-    await reply(
-      dest,
-      "Nothing to cancel — this topic has no pending mount.",
-    );
-    return;
-  }
-  try {
-    await removeMount(key);
-  } catch (e) {
-    process.stderr.write(`poller: handleCancel removeMount failed: ${e instanceof Error ? e.message : String(e)}\n`);
-  }
-  refreshMountsIfChanged();
-  await reply(
-    dest,
-    "Cancelled. Send any message here to start over, or use `cta mount` from your Mac to point this topic at a project directly.",
   );
 }
 
@@ -1990,7 +1959,6 @@ async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
     case "/mount": await handleMount(ev, args); return true;
     case "/dm":    await handleDm(ev, args); return true;
     case "/unmount": await handleUnmount(ev); return true;
-    case "/cancel": await handleCancel(ev); return true;
     case "/stop":   await handleStop(ev); return true;
     case "/list":  await handleList(ev); return true;
     case "/effort": await handleEffort(ev, args); return true;
@@ -2247,8 +2215,8 @@ async function preflightBotToken(): Promise<void> {
 }
 
 // The "/" autocomplete menu Telegram shows. Static operational commands the
-// paired operator uses most; pairing/edge commands (/pair, /unpair, /cancel,
-// /start) are intentionally omitted to keep the menu focused — they still work
+// paired operator uses most; pairing/edge commands (/pair, /unpair, /start)
+// are intentionally omitted to keep the menu focused — they still work
 // when typed. Registered once at boot via setMyCommands (default scope).
 const BOT_COMMAND_MENU = [
   { command: "help",    description: "Show available commands" },

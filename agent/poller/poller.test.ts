@@ -618,7 +618,6 @@ describe("/clear (D14 — TUI command translated, not delegated)", () => {
 
   function seedMount(args: {
     thread_id: number | "dm";
-    provisional?: boolean;
     tmux_session?: string;
   }): void {
     const tid = args.thread_id;
@@ -630,7 +629,6 @@ describe("/clear (D14 — TUI command translated, not delegated)", () => {
       session_id: "test-session-id",
       tmux_session: args.tmux_session ?? (typeof tid === "number" ? `topic-${tid}` : "topic-dm"),
       created_at: new Date().toISOString(),
-      ...(args.provisional ? { provisional: true } : {}),
     };
     writeFileSync(MOUNTS_JSON, JSON.stringify({ version: 2, mounts: [mount] }, null, 2));
     poller.refreshMountsIfChanged();
@@ -666,24 +664,6 @@ describe("/clear (D14 — TUI command translated, not delegated)", () => {
     expect(sent[0].text.toLowerCase()).toMatch(/clear|new session/);
     expect(sent[0].chat_id).toBe(-1001);
     expect(sent[0].message_thread_id).toBe(42);
-  });
-
-  test("/clear on provisional (helper-mode) mount: refuses, directs to /cancel", async () => {
-    pair({ chat_id: -1001, user_id: 99 });
-    seedMount({ thread_id: 88, provisional: true, tmux_session: "helper-88" });
-    const sessionFile = seedSessionUuid(88, "helper-uuid-xxxx");
-
-    const handled = await poller.tryHandleCommand(
-      msg({ text: "/clear", chat_id: -1001, thread_id: 88, from_id: 99 }),
-    );
-    expect(handled).toBe(true);
-
-    // UUID must NOT be rotated — we don't kill the helper mid-flight.
-    expect(readFileSync(sessionFile, "utf8").trim()).toBe("helper-uuid-xxxx");
-
-    // Reply points the user at /cancel (the helper's own teardown).
-    expect(sent.length).toBe(1);
-    expect(sent[0].text.toLowerCase()).toMatch(/cancel|helper/);
   });
 
   test("/clear on unmounted topic: friendly nothing-to-clear reply", async () => {

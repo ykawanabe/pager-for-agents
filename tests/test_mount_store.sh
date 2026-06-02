@@ -236,85 +236,19 @@ bun run "$STORE" add 999 /tmp/another >/dev/null
 [[ "$(jq -r '.mounts[0].digest.enabled' "$STATE/mounts.json")" == "true" ]] && ok "v3 write: digest survives mutation" || ng "v3 write: digest survives mutation"
 [[ "$(jq -r '.mounts[0].future_field_v4' "$STATE/mounts.json")" == "preserve-me" ]] && ok "v3 write: unknown future field survives mutation (forward-compat)" || ng "v3 write: unknown future field survives mutation"
 
-# ─── provisional / replace / gc-provisional ─────────────────────────────────
-# Helper-mode features added 2026-05-17 for auto-mount.
-
+# ─── replace op ─────────────────────────────────────────────────────────────
 rm -rf "$STATE" && mkdir -p "$STATE"
 
-# Round-trip the provisional flag through add → get.
-PROV=$(bun run "$STORE" add 11 /tmp/foo helper-test --provisional)
-[[ "$(echo "$PROV" | jq -r '.provisional')" == "true" ]] && ok "add --provisional: flag set on returned mount" || ng "add --provisional: flag set on returned mount"
-[[ "$(jq -r '.mounts[] | select(.thread_id==11) | .provisional' "$STATE/mounts.json")" == "true" ]] && ok "add --provisional: flag persisted to disk" || ng "add --provisional: flag persisted to disk"
-
-# Plain add omits provisional entirely (absent, not false).
-bun run "$STORE" add 12 /tmp/bar baz >/dev/null
-PROV_PLAIN=$(jq -r '.mounts[] | select(.thread_id==12) | .provisional // "absent"' "$STATE/mounts.json")
-[[ "$PROV_PLAIN" == "absent" ]] && ok "add without flag: provisional field absent on disk" || ng "add without flag: provisional field absent (got $PROV_PLAIN)"
-
-# replace overwrites a provisional row and clears the flag.
+# replace overwrites an existing row atomically (no "already mounted" throw).
+bun run "$STORE" add 11 /tmp/foo old-label >/dev/null
 REPLACED=$(bun run "$STORE" replace 11 /tmp/foo-real real-label)
 [[ "$(echo "$REPLACED" | jq -r '.path')" == "/tmp/foo-real" ]] && ok "replace 11: path updated" || ng "replace 11: path updated"
 [[ "$(echo "$REPLACED" | jq -r '.label')" == "real-label" ]] && ok "replace 11: label updated" || ng "replace 11: label updated"
-[[ "$(echo "$REPLACED" | jq -r '.provisional // "absent"')" == "absent" ]] && ok "replace 11: provisional flag cleared" || ng "replace 11: provisional flag cleared"
+[[ "$(jq -r '[.mounts[] | select(.thread_id==11)] | length' "$STATE/mounts.json")" == "1" ]] && ok "replace 11: not duplicated" || ng "replace 11: row duplicated"
 
 # replace on a missing thread_id creates the row (no throw).
 REPLACED_NEW=$(bun run "$STORE" replace 22 /tmp/new new-label)
 [[ "$(echo "$REPLACED_NEW" | jq -r '.thread_id')" == "22" ]] && ok "replace on missing thread_id: creates row" || ng "replace on missing thread_id: creates row"
-
-# gc-provisional drops provisional rows whose tmux is dead, keeps live rows.
-rm -rf "$STATE" && mkdir -p "$STATE"
-bun run "$STORE" add 33 /tmp/dead helper --provisional --tmux-session helper-33-DEAD >/dev/null
-bun run "$STORE" add 44 /tmp/real real-mount >/dev/null
-GC_OUT=$(bun run "$STORE" gc-provisional)
-[[ "$(echo "$GC_OUT" | jq -r '.dropped')" == "1" ]] && ok "gc-provisional: drops orphan helper" || ng "gc-provisional: drops orphan helper (got $GC_OUT)"
-[[ "$(bun run "$STORE" get 33)" == "null" ]] && ok "gc-provisional: removed thread 33" || ng "gc-provisional: removed thread 33"
-[[ "$(bun run "$STORE" get 44 | jq -r '.thread_id')" == "44" ]] && ok "gc-provisional: kept non-provisional mount" || ng "gc-provisional: kept non-provisional mount"
-
-# gc-provisional is idempotent.
-GC_OUT_2=$(bun run "$STORE" gc-provisional)
-[[ "$(echo "$GC_OUT_2" | jq -r '.dropped')" == "0" ]] && ok "gc-provisional: idempotent (0 on second run)" || ng "gc-provisional: idempotent"
-
-# ─── gc-provisional grace period (P2.3 / D15) ───────────────────────────────
-# Cold-boot scenario: every helper-<id> tmux is dead after a Mac reboot,
-# but the provisional row was created seconds ago by spawnHelper. Without
-# a grace window, gc wipes the user's in-progress helper conversation.
-
-rm -rf "$STATE" && mkdir -p "$STATE"
-
-# A fresh provisional row + a long grace window → preserved despite dead tmux.
-bun run "$STORE" add 55 /tmp/fresh helper-fresh --provisional --tmux-session helper-55-DEAD >/dev/null
-GC_GRACE=$(bun run "$STORE" gc-provisional --grace-ms 60000)
-[[ "$(echo "$GC_GRACE" | jq -r '.dropped')" == "0" ]] \
-  && ok "gc-provisional --grace-ms: fresh provisional row preserved within grace" \
-  || ng "gc-provisional --grace-ms: fresh provisional should be preserved (got $GC_GRACE)"
-[[ "$(bun run "$STORE" get 55 | jq -r '.thread_id')" == "55" ]] \
-  && ok "gc-provisional --grace-ms: fresh row still present after gc" \
-  || ng "gc-provisional --grace-ms: fresh row missing"
-
-# An old provisional row (created_at backdated) + a short grace → still dropped.
-# We backdate by rewriting mounts.json directly (the only test-friendly way).
-jq '.mounts |= map(if .thread_id == 55 then .created_at = "2000-01-01T00:00:00Z" else . end)' \
-  "$STATE/mounts.json" > "$STATE/mounts.json.tmp" && mv "$STATE/mounts.json.tmp" "$STATE/mounts.json"
-GC_AGED=$(bun run "$STORE" gc-provisional --grace-ms 60000)
-[[ "$(echo "$GC_AGED" | jq -r '.dropped')" == "1" ]] \
-  && ok "gc-provisional --grace-ms: aged provisional (older than grace) dropped" \
-  || ng "gc-provisional --grace-ms: aged provisional should be dropped (got $GC_AGED)"
-
-# Real (non-provisional) rows untouched regardless of grace.
-rm -rf "$STATE" && mkdir -p "$STATE"
-bun run "$STORE" add 66 /tmp/real real-mount >/dev/null
-GC_REAL=$(bun run "$STORE" gc-provisional --grace-ms 60000)
-[[ "$(echo "$GC_REAL" | jq -r '.dropped')" == "0" ]] \
-  && ok "gc-provisional --grace-ms: real rows untouched" \
-  || ng "gc-provisional --grace-ms: real row was dropped (got $GC_REAL)"
-
-# Default (no --grace-ms) preserves current behavior: dead tmux → drop.
-rm -rf "$STATE" && mkdir -p "$STATE"
-bun run "$STORE" add 77 /tmp/x helper-x --provisional --tmux-session helper-77-DEAD >/dev/null
-GC_DEFAULT=$(bun run "$STORE" gc-provisional)
-[[ "$(echo "$GC_DEFAULT" | jq -r '.dropped')" == "1" ]] \
-  && ok "gc-provisional: default (no grace) still drops dead provisional" \
-  || ng "gc-provisional default behavior changed (got $GC_DEFAULT)"
 
 # ─── clear op (P2.5) ────────────────────────────────────────────────────────
 # `cta unpair` historically `rm -f mounts.json` which bypassed the mount-store

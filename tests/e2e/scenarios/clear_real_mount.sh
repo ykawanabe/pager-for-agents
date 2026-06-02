@@ -1,5 +1,5 @@
 #!/bin/bash
-# E2E scenario: /clear on a real (non-provisional) mount.
+# E2E scenario: /clear on a mounted topic.
 #
 # Validates D14 fix end-to-end through the real poller process:
 #   1. Inject /clear via mock getUpdates.
