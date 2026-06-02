@@ -32,8 +32,7 @@
  *
  * These extensions follow the jehy/telegram-test-api pattern (mock + test
  * helpers in one process) so E2E scenarios can drive the full inbound→
- * claude→outbound loop. See docs/plans/e2e-test-harness.md for the broader
- * harness design.
+ * claude→outbound loop.
  */
 import { appendFileSync, writeFileSync } from "node:fs";
 

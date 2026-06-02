@@ -123,8 +123,7 @@ export const DEFAULT_CHANNEL: Channel = "telegram";
 
 /**
  * Per-mount H2 daily-digest config. Absent on a mount → digest disabled for
- * this mount. v3 schema addition (2026-06-01). See
- * docs/plans/heartbeat-h2-digest.md.
+ * this mount. v3 schema addition (2026-06-01).
  */
 export interface DigestConfig {
   enabled: boolean;

@@ -43,7 +43,7 @@ struct MenuView: View {
         // inside the poller process, no per-topic tmux). The unified Watch-Live
         // window shows every active topic in one place — sidebar lists them
         // with activity dots + 1-line previews; main pane renders the focused
-        // topic's JSONL transcript as chat bubbles. See docs/plans/pager-watch-live.md.
+        // topic's JSONL transcript as chat bubbles.
         // Power users can still drop to Terminal via `cta open <thread>` —
         // β handoff signals the poller to release the daemon and execs
         // `claude --resume` in the project dir.

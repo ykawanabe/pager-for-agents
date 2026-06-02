@@ -1511,7 +1511,7 @@ cmd_list() {
 
 # `cta watch <thread>` — print the current pane content of a topic's
 # tmux session to stdout. Single-shot snapshot; the streaming variant
-# is Phase B of the watch-live plan (see docs/plans/pager-watch-live.md).
+# is Phase B of the watch-live plan.
 #
 # Used by Pager's WatchLive window (Phase A.2) and ad-hoc debugging.
 # Pager is the primary client — keep the contract stable when iterating.

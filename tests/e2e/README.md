@@ -1,8 +1,7 @@
 # E2E Scenarios
 
 Agent-runnable end-to-end scenarios that exercise the real poller process
-through a mocked Telegram Bot API. See `docs/plans/e2e-test-harness.md` for
-the broader design.
+through a mocked Telegram Bot API.
 
 ## Running
 

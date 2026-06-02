@@ -33,7 +33,6 @@ poller/watch-render.ts	agent	644
 poller/file-access-probe.ts	agent	644
 
 # H2 daily-digest heartbeat (Design A — no Bash; per-check TS handlers).
-# See docs/plans/heartbeat-h2-digest.md.
 poller/heartbeat-checks/registry.ts	agent	644
 poller/heartbeat-checks/open-prs.ts	agent	644
 poller/heartbeat-checks/heartbeat-md.ts	agent	644

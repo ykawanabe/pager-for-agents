@@ -1,6 +1,6 @@
 /**
  * Telegram outbound wire — the Bot API egress, extracted from poller.ts in
- * Phase 1 of the ChatTransport migration (see docs/plans/chat-transport-interface.md §9).
+ * Phase 1 of the ChatTransport migration.
  *
  * Scope (P1): the full Bot API WIRE — outbound egress (send/react/typing/
  * button/edit/answer) AND inbound fetch (getUpdates/getMe) + the raw Tg* wire

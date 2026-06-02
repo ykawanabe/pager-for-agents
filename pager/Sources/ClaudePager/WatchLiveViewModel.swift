@@ -1,8 +1,8 @@
 import Foundation
 import SwiftUI
 
-/// View model for the unified Watch-Live window (docs/plans/pager-watch-live.md
-/// Phase A.2). Periodically refreshes the sidebar (mounts list + 1-line preview
+/// View model for the unified Watch-Live window (Phase A.2). Periodically
+/// refreshes the sidebar (mounts list + 1-line preview
 /// per topic) and the focused-topic pane content. Data providers are injected
 /// so tests can drive the model without spawning real `cta` processes.
 @MainActor

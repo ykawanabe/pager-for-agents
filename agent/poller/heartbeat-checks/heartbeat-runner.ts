@@ -14,7 +14,7 @@
  * Safety invariant (Design A): claude is spawned with `--tools "Read,Glob,Grep"`.
  * Bash is absent from the tool list. The model literally cannot call shell,
  * cannot reach `gh`/`git`, cannot escape via metacharacter — there's no Bash
- * tool to escape. See docs/plans/allowlist-spike-2026-06-01.md.
+ * tool to escape.
  *
  * This module does NOT decide WHEN to fire (the scheduler in poller.ts does),
  * does NOT persist run state (the scheduler does), does NOT send to Telegram
@@ -51,7 +51,7 @@ export interface RunHeartbeatOpts {
   /** Per-check timeout ms (passed to handlers). Default 10s. */
   readonly checkTimeoutMs?: number;
   /** Runner overall budget. SIGTERM at sigTermMs, SIGKILL at sigKillMs.
-   *  Defaults: 75s / 90s — matches docs/plans/heartbeat-h2-digest.md. */
+   *  Defaults: 75s / 90s. */
   readonly sigTermMs?: number;
   readonly sigKillMs?: number;
 

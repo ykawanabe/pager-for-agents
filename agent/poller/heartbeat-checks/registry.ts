@@ -5,8 +5,7 @@
  * external state (gh, git, filesystem) via direct `execFile`-style spawns
  * with `shell: false`. There is intentionally no Bash escape hatch: the
  * model that produces the digest runs with `--tools "Read,Glob,Grep"` and
- * has no shell access (see docs/plans/heartbeat-h2-digest.md → "Safety
- * guards — Design A").
+ * has no shell access (Design A "Safety guards").
  *
  * HEARTBEAT.md lists check IDs (one per line). The runner parses the list,
  * dispatches each handler in parallel via `runCheck()`, and feeds the

@@ -8,8 +8,6 @@
  * (e.g. LINE has no reactions) simply omits the interface instead of shipping
  * silent no-op landmines.
  *
- * Full rationale + per-platform method walkthrough: docs/plans/chat-transport-interface.md.
- *
  * STATUS: P2 (1/n) — the contract only. Nothing imports this yet; the poller
  * still calls the Telegram adapter directly. P2 (2/n) adds the TelegramTransport
  * implementation; P3 cuts the poller over to this interface.
