@@ -16,6 +16,7 @@ No `tmux`, no separate outbound server. `install.sh` also (optionally) provision
 - `bash` (the scripts are bash, not zsh)
 - [`claude`](https://code.claude.com/docs/en/getting-started) v2.1.80+ on `PATH`
 - `bun` on `PATH` (runs the poller and the `cta` helpers)
+- `tmux` and `jq` on `PATH` (`install.sh` offers to `brew install` them if missing)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram numeric user ID — DM [@userinfobot](https://t.me/userinfobot), or [@username_to_id_bot](https://t.me/username_to_id_bot) / [@getmyid_bot](https://t.me/getmyid_bot) if the first one's offline
 
@@ -47,9 +48,8 @@ After install, the bot is running but isn't connected to a chat yet. Pairing fix
 
 ### DM (easiest case)
 
-1. Search Telegram for your bot's @username.
-2. Send `/start`. The bot replies with a "✓ Yes, pair me here" button.
-3. Tap it.
+1. Search Telegram for your bot's @username and open a chat.
+2. Send `/pair XXXX-XXXX` using the pairing code `install.sh` printed (re-show it any time with `cta pair-code` on your Mac).
 
 Every message you DM the bot now reaches claude.
 
@@ -59,19 +59,18 @@ Groups need one extra step, because of a Telegram default:
 
 1. Open [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Otherwise, in groups, the bot only sees messages that @-mention it or reply to its own. (DMs aren't affected — this is a group-only quirk.)
 2. Invite the bot to the chat.
-3. Tap "✓ Yes, pair me here" when the bot asks. Only the person who invited it can confirm.
+3. Send `/pair XXXX-XXXX` in the group. Only the person who invited the bot can pair it.
 
 In a forum group, every topic spawns its own claude session in whatever default project dir you picked at install. Pin a topic to a different dir with `/mount ~/path` inside it.
 
-### Fallback: manual pairing code
+### Host-side pairing (skip the code)
 
-If the button never appears (privacy mode cached, bot isn't admin), use the code printed by `install.sh`:
+You can also pair straight from your Mac, no Telegram code round-trip:
 
 ```
-/pair XXXX-XXXX
+cta pair --auto                # list chats the bot has recently seen, then pick one
+cta pair <chat_id> [user_id]   # claim a chat directly (negative chat_id + your user_id for groups)
 ```
-
-Run `cta pair-code` on your Mac to re-show it.
 
 ### Available commands
 
@@ -86,6 +85,7 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `/unmount` | The mounted topic/DM | Remove that mount |
 | `/list` | Anywhere | Show current mounts |
 | `/help` | Anywhere | List commands |
+| `/stop` | The active topic | Abort the running Claude turn; your next message resumes the same session |
 
 ### Host-side commands (terminal)
 
@@ -99,6 +99,7 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `cta mount <thread> <path>` | Same as `/mount` but in your terminal |
 | `cta config idle-evict <min>` | Evict idle Claude sessions after N minutes to free RAM (`0` = off; default off). Quiet topics are closed and resume on your next message; same knob as the Pager "Memory" toggle. Applies within ~25s, no restart |
 | `cta config interrupt-steer <on\|off>` | Mid-turn steering (`on` by default). When on, a message sent while Claude is working interrupts and redirects it after a ~1.5s debounce. Set `off` to make new messages queue until the current task finishes. Same knob as the Pager "Mid-turn steering" toggle. Applies within ~25s, no restart |
+| `cta config sleep-fix <on\|off\|status>` | Harden macOS power settings so the poller never freezes when the Mac idles. `on` runs `sudo pmset -a sleep 0 disksleep 0 standby 0 powernap 0`; `status` reports it. See [troubleshooting](docs/troubleshooting.md) |
 
 ### Troubleshooting
 
@@ -149,6 +150,7 @@ Common issues:
 - `claude: command not found` from the LaunchAgent — PATH issue in the plist, see troubleshooting doc.
 - Messages not arriving — check the allowlist matches your Telegram user ID.
 - After a network outage, the bot doesn't reconnect — run `cta status`; the watchdog kickstarts a stale poller on its own, or `cta start` forces it.
+- Bot goes silent when the Mac sits idle — macOS idle-sleep (and Apple-Silicon standby/powernap) freeze the poller. Run `cta config sleep-fix on` (needs sudo); for true 24/7 run on a never-sleep Mac or a Linux host. See the [troubleshooting doc](docs/troubleshooting.md).
 
 ## Development
 

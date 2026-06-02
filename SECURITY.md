@@ -13,7 +13,7 @@ If your bot token leaks, **assume your Mac has been compromised** until you rota
 
 ## Defenses this project provides
 
-- **Allowlist policy.** `install.sh` prompts for your Telegram numeric user ID and writes `dmPolicy: allowlist` to `~/.claude/channels/telegram/access.json`. The official Claude Code Telegram plugin enforces this — DMs from other users are silently dropped.
+- **Allowlist policy.** `install.sh` prompts for your Telegram numeric user ID and writes `dmPolicy: allowlist` to `~/.claude/channels/telegram/access.json`. The poller enforces this on every inbound message — DMs from users not in `allowFrom` are silently dropped.
 - **Token storage.** The bot token lives at `~/.claude/channels/telegram/.env` with mode `600` (owner read/write only), in a directory with mode `700`. The installer never echoes the token to stdout.
 - **Local-only.** No data leaves your Mac except Telegram messages routed through Telegram's API. There is no telemetry, no third-party logging, no remote update mechanism.
 - **No automatic privilege escalation.** The agent runs as your user. It does not request `sudo`.
@@ -29,7 +29,7 @@ If your bot token leaks, **assume your Mac has been compromised** until you rota
 
 If you find a security issue, please **do not file a public GitHub issue**. Use GitHub's [Private Vulnerability Reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability) on this repo — click **Report a vulnerability** under the Security tab. I'll acknowledge within 72 hours.
 
-If the issue is in the official Claude Code Telegram plugin (`telegram@claude-plugins-official`) rather than this repo, please report it to Anthropic instead — see <https://www.anthropic.com/security>.
+If the issue is in Claude Code itself rather than this repo, please report it to Anthropic instead — see <https://www.anthropic.com/security>.
 
 ## Hardening checklist (for users)
 

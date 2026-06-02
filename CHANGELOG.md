@@ -99,7 +99,7 @@ Hotfix release. Two v0.1.0 regressions surfaced during live `/qa` verification.
 
 ## [0.1.0] - 2026-05-12
 
-First tagged release. The bot survives crash, sleep, and network drops on macOS; companion menu-bar app ([Claude Pager](https://github.com/ykawanabe/claude-telegram-agent-bar)) now talks to the agent through `cta` instead of greping `ps`.
+First tagged release. The bot survives crash, sleep, and network drops on macOS; companion menu-bar app ([Claude Pager](https://github.com/ykawanabe/pager-for-agents/tree/main/pager)) now talks to the agent through `cta` instead of grepping `ps`.
 
 ### Added
 - `install.sh` interactive installer (deps check, token + allowlist prompts, LaunchAgent registration).
