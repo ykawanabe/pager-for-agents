@@ -1,14 +1,14 @@
 # Claude Pager
 
-Use [Claude Code](https://code.claude.com/) from your phone, through the chat apps you already have. A local CLI bridges your chat app to Claude Code on your Mac, and a tiny menu bar app sits on top to drive it. Currently Telegram only. Nothing goes through a third-party server — the bridge runs locally, and survives crashes, network blips, and reboots.
+Use [Claude Code](https://code.claude.com/) from your phone, through the chat apps you already have. A local CLI bridges your chat app to Claude Code on your Mac, and a tiny menu bar app sits on top to drive it. Telegram only, for now. Nothing goes through a third party server: the bridge runs locally, and survives crashes, network blips, and reboots.
 
 `install.sh` wires together three things:
 
-1. A `launchd` LaunchAgent that runs the **poller** — one Telegram long-poll loop. With Pager installed, the poller is launched through the menu bar app (`Claude Pager.app --agent-launcher`) so macOS attributes its file access to "Claude Pager"; a CLI-only install runs `bun` directly.
-2. The poller routes each chat — and each forum topic — to its own long-lived `claude` session (`claude -p --input-format stream-json`, one daemon per topic), through a small platform-agnostic `ChatTransport` layer. Replies, the 👀→👌 read receipts, the typing indicator, and inline buttons all flow back through it.
-3. A second LaunchAgent — the **watchdog** — kickstarts the poller if its heartbeat goes stale, catching hangs that `launchd`'s own crash-respawn would miss.
+1. A `launchd` LaunchAgent that runs the **poller**: one Telegram long-poll loop. With Pager installed, the poller is launched through the menu bar app (`Claude Pager.app --agent-launcher`) so macOS attributes its file access to "Claude Pager"; a CLI-only install runs `bun` directly.
+2. The poller routes each chat (and each forum topic) to its own long-lived `claude` session (`claude -p --input-format stream-json`, one daemon per topic), through a small platform-agnostic `ChatTransport` layer. Replies, the 👀→👌 read receipts, the typing indicator, and inline buttons all flow back through it.
+3. A second LaunchAgent, the **watchdog**, kickstarts the poller when its heartbeat goes stale. It catches hangs that `launchd`'s own crash-respawn would miss.
 
-No `tmux`, no separate outbound server. `install.sh` also (optionally) provisions the bot token and allowlist under `~/.claude/channels/telegram/` — so once it finishes, the bot is live.
+No `tmux`, no separate outbound server. `install.sh` also (optionally) provisions the bot token and allowlist under `~/.claude/channels/telegram/`, so once it finishes, the bot is live.
 
 ## Requirements
 
@@ -57,7 +57,7 @@ Every message you DM the bot now reaches claude.
 
 Groups need one extra step, because of a Telegram default:
 
-1. Open [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Otherwise, in groups, the bot only sees messages that @-mention it or reply to its own. (DMs aren't affected — this is a group-only quirk.)
+1. Open [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Otherwise, in groups, the bot only sees messages that @-mention it or reply to its own. (DMs aren't affected; this is a group-only quirk.)
 2. Invite the bot to the chat.
 3. Send `/pair XXXX-XXXX` in the group. Only the person who invited the bot can pair it.
 
@@ -123,7 +123,7 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `~/Library/LaunchAgents/com.claude-agent.plist` | Poller LaunchAgent | 644 |
 | `~/Library/LaunchAgents/com.claude-watchdog.plist` | Watchdog LaunchAgent | 644 |
 
-The poller reads the bot token from `~/.claude/channels/telegram/.env` directly — there's no separate Telegram channel plugin or MCP server in the loop anymore.
+The poller reads the bot token from `~/.claude/channels/telegram/.env` directly. There's no separate Telegram channel plugin or MCP server in the loop anymore.
 
 ## Security — read this before you run it
 
@@ -139,7 +139,7 @@ Mandatory hardening:
 3. **Treat this Mac as the trusted machine.** Don't run the agent on a shared or unattended computer.
 4. **Audit periodically.** `tail -f ~/.pager/agent.log` shows what Claude is doing in real time.
 
-If any of those bullets makes you uncomfortable, **do not run this**. Use the official `/telegram:configure` interactive flow inside Claude Code instead — it has a per-message approval mode.
+If any of those bullets makes you uncomfortable, **do not run this**. Use the official `/telegram:configure` interactive flow inside Claude Code instead; it has a per-message approval mode.
 
 ## Troubleshooting
 
@@ -160,7 +160,7 @@ Run the shell test suite locally:
 tests/run.sh
 ```
 
-Covers the `cta` CLI, the mount-store, the LaunchAgent entrypoints, the watchdog, and the `check-no-secrets` pre-commit hook. CI runs the same suite on every push. The TypeScript unit tests live alongside the code (`cd agent && bun test`); the agent-runnable end-to-end harness is `tests/e2e/run.sh`. The test suite needs `tmux` (it simulates per-topic sessions) — `brew install tmux`. The runtime itself does not use tmux.
+Covers the `cta` CLI, the mount-store, the LaunchAgent entrypoints, the watchdog, and the `check-no-secrets` pre-commit hook. CI runs the same suite on every push. The TypeScript unit tests live alongside the code (`cd agent && bun test`); the agent-runnable end-to-end harness is `tests/e2e/run.sh`. The test suite needs `tmux` (it simulates per-topic sessions): `brew install tmux`. The runtime itself doesn't use tmux.
 
 ## Uninstall
 
