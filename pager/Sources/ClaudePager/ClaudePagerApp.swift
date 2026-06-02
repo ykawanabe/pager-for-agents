@@ -27,6 +27,11 @@ struct ClaudePagerApp: App {
     // ObservedObject — StateObject is for SwiftUI-owned lifetimes; the
     // StatusMonitor is a long-lived singleton elsewhere.
     @ObservedObject private var monitor = StatusMonitor.shared
+    // Intentionally @ObservedObject, NOT @StateObject: init() below captures
+    // `caffeinate` in the willTerminate observer to call stop(), and a
+    // @StateObject can't be accessed from init() (SwiftUI installs it lazily and
+    // would hand back a throwaway instance). An App struct is a stable singleton
+    // created once, so the @ObservedObject recreation footgun doesn't apply here.
     @ObservedObject private var caffeinate = CaffeinateController()
     private let wakeObserver = WakeObserver()
     @AppStorage("stopBotOnQuit") private var stopBotOnQuit = true

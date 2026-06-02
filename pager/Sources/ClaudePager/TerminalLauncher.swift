@@ -102,16 +102,20 @@ enum TerminalLauncher {
         proc.arguments = [path]
         let errPipe = Pipe()
         proc.standardError = errPipe
-        proc.standardOutput = Pipe()
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
             return .scriptFailed(stderr: error.localizedDescription)
         }
+        // Drain BOTH pipes before waitUntilExit — reading after wait risks a
+        // full-pipe deadlock if the child ever writes >64KB (mirrors CTAClient.run).
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        _ = outPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
         if proc.terminationStatus != 0 {
-            let data = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let msg = String(data: data, encoding: .utf8) ?? "unknown open error"
+            let msg = String(data: errData, encoding: .utf8) ?? "unknown open error"
             return .scriptFailed(stderr: msg)
         }
         return .launched
