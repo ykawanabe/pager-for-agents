@@ -307,6 +307,7 @@ EOF
     else
       printf 'Caffeinate:       %s\n' "$caffeinate_alive"
     fi
+    # shellcheck disable=SC2016  # the backticks in the NOT-applied arm are literal output copy
     case "$sleep_fix_state" in
       applied) printf 'Sleep-fix:        applied (no idle-sleep / standby / powernap)\n' ;;
       unknown) printf 'Sleep-fix:        n/a (no pmset on this host)\n' ;;

@@ -12,7 +12,8 @@ Thanks for your interest. This project is small and opinionated; here's how to l
 ```sh
 git clone https://github.com/ykawanabe/pager-for-agents.git
 cd pager-for-agents
-shellcheck install.sh uninstall.sh scripts/*.sh
+# Same set + severity CI lints (so local passes ⇒ CI passes):
+shellcheck --severity=warning install.sh uninstall.sh cli/cta agent/start_agents.sh agent/watch_network.sh scripts/check-no-secrets.sh
 bash -n install.sh        # syntax check
 ./install.sh              # run on your own machine
 ```

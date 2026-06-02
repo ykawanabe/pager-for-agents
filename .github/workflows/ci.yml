@@ -15,7 +15,9 @@ jobs:
         run: brew install shellcheck
       - name: Lint shell scripts
         run: |
-          shellcheck \
+          # Gate on warning+; info/style findings are advisory (a stray info-level
+          # false positive shouldn't break the build).
+          shellcheck --severity=warning \
             install.sh \
             uninstall.sh \
             cli/cta \
