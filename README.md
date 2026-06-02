@@ -125,7 +125,7 @@ Send these inside Telegram (in the paired chat, as the paired user):
 
 The poller reads the bot token from `~/.claude/channels/telegram/.env` directly. There's no separate Telegram channel plugin or MCP server in the loop anymore.
 
-## Security — read this before you run it
+## Security: read this before you run it
 
 The poller spawns each topic's `claude` with `--dangerously-skip-permissions`. That flag means:
 
@@ -134,10 +134,10 @@ The poller spawns each topic's `claude` with `--dangerously-skip-permissions`. T
 
 Mandatory hardening:
 
-1. **Set the allowlist.** `dmPolicy: "allowlist"` with your numeric Telegram user ID in `allowFrom`. The installer asks for this; don't skip it.
-2. **Don't share the bot token.** It's stored at `~/.claude/channels/telegram/.env` with `chmod 600`. Don't commit it. Don't paste it into chats.
-3. **Treat this Mac as the trusted machine.** Don't run the agent on a shared or unattended computer.
-4. **Audit periodically.** `tail -f ~/.pager/agent.log` shows what Claude is doing in real time.
+1. Set the allowlist. Put your numeric Telegram user ID in `allowFrom` and set `dmPolicy: "allowlist"`. The installer asks for this, so don't skip it.
+2. Don't share the bot token. It lives at `~/.claude/channels/telegram/.env` with `chmod 600`. Don't commit it, don't paste it into chats.
+3. Treat this Mac as the trusted machine. Don't run the agent on a shared or unattended computer.
+4. Audit now and then. `tail -f ~/.pager/agent.log` shows what Claude is doing in real time.
 
 If any of those bullets makes you uncomfortable, **do not run this**. Use the official `/telegram:configure` interactive flow inside Claude Code instead; it has a per-message approval mode.
 
@@ -147,10 +147,10 @@ See [docs/troubleshooting.md](docs/troubleshooting.md).
 
 Common issues:
 
-- `claude: command not found` from the LaunchAgent — PATH issue in the plist, see troubleshooting doc.
-- Messages not arriving — check the allowlist matches your Telegram user ID.
-- After a network outage, the bot doesn't reconnect — run `cta status`; the watchdog kickstarts a stale poller on its own, or `cta start` forces it.
-- Bot goes silent when the Mac sits idle — macOS idle-sleep (and Apple-Silicon standby/powernap) freeze the poller. Run `cta config sleep-fix on` (needs sudo); for true 24/7 run on a never-sleep Mac or a Linux host. See the [troubleshooting doc](docs/troubleshooting.md).
+- `claude: command not found` from the LaunchAgent: a PATH issue in the plist, see the troubleshooting doc.
+- Messages not arriving: check the allowlist matches your Telegram user ID.
+- The bot doesn't reconnect after a network outage: run `cta status`. The watchdog kickstarts a stale poller on its own, or `cta start` forces it.
+- The bot goes silent when the Mac sits idle: macOS idle-sleep (and Apple-Silicon standby/powernap) freeze the poller. Run `cta config sleep-fix on` (needs sudo); for true 24/7, run on a never-sleep Mac or a Linux host. See the [troubleshooting doc](docs/troubleshooting.md).
 
 ## Development
 
