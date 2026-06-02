@@ -141,3 +141,6 @@ HEARTBEAT.md
 
 # Internal planning docs — kept local, never published.
 /docs/plans/
+
+# Internal agent plans/specs — kept local, never published (same as docs/plans).
+/docs/superpowers/
