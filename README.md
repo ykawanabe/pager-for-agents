@@ -16,7 +16,7 @@ No `tmux`, no separate outbound server. `install.sh` also (optionally) provision
 - `bash` (the scripts are bash, not zsh)
 - [`claude`](https://code.claude.com/docs/en/getting-started) v2.1.80+ on `PATH`
 - `bun` on `PATH` (runs the poller and the `cta` helpers)
-- `tmux` and `jq` on `PATH` (`install.sh` offers to `brew install` them if missing)
+- `jq` on `PATH` (`install.sh` offers to `brew install` it if missing)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram numeric user ID — DM [@userinfobot](https://t.me/userinfobot), or [@username_to_id_bot](https://t.me/username_to_id_bot) / [@getmyid_bot](https://t.me/getmyid_bot) if the first one's offline
 
@@ -160,7 +160,7 @@ Run the shell test suite locally:
 tests/run.sh
 ```
 
-Covers the `cta` CLI, the mount-store, the LaunchAgent entrypoints, the watchdog, and the `check-no-secrets` pre-commit hook. CI runs the same suite on every push. The TypeScript unit tests live alongside the code (`cd agent && bun test`); the agent-runnable end-to-end harness is `tests/e2e/run.sh`.
+Covers the `cta` CLI, the mount-store, the LaunchAgent entrypoints, the watchdog, and the `check-no-secrets` pre-commit hook. CI runs the same suite on every push. The TypeScript unit tests live alongside the code (`cd agent && bun test`); the agent-runnable end-to-end harness is `tests/e2e/run.sh`. The test suite needs `tmux` (it simulates per-topic sessions) — `brew install tmux`. The runtime itself does not use tmux.
 
 ## Uninstall
 

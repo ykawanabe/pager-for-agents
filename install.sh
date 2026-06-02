@@ -80,7 +80,6 @@ require() {
 # Last arg = Homebrew formula; if present and brew is on PATH, installer offers
 # 'brew install <formula>' interactively before bailing out.
 require claude "npm install -g @anthropic-ai/claude-code  (or use bun/pnpm)"
-require tmux   "brew install tmux"                                                            "tmux"
 require bun    "brew install oven-sh/bun/bun  (or curl -fsSL https://bun.sh/install | bash)"  "oven-sh/bun/bun"
 require jq     "brew install jq"                                                              "jq"
 
