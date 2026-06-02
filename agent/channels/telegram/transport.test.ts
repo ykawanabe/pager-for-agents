@@ -232,6 +232,16 @@ describe("normalizeUpdate (pure)", () => {
     expect(ev?.kind === "message" && ev.routingKey).toBe("dm");
   });
 
+  test("edited_message is ignored, NOT replayed as a fresh turn", () => {
+    // Editing an OLD message (a common phone gesture) must not re-run it as a
+    // new turn/command. Only u.message produces a message event.
+    const ev = normalizeUpdate({
+      update_id: 9,
+      edited_message: { message_id: 1, from: { id: 99 }, chat: { id: 5 }, text: "fixed a typo" },
+    });
+    expect(ev).toBeNull();
+  });
+
   test("forum_topic_created → topic-created (with raw)", () => {
     const ev = normalizeUpdate({
       update_id: 3,

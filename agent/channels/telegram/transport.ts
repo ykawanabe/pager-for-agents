@@ -181,8 +181,18 @@ export class TelegramTransport
       this.writeOffset(maxId + 1);
       offset = maxId + 1;
       for (const u of updates) {
-        const ev = normalizeUpdate(u);
-        if (ev && this.handler) await this.handler(ev);
+        // One poison update must not tear down the whole poll loop (which would
+        // hit the top-level process.exit and rely on launchd to respawn). The
+        // offset was already advanced above, so a throwing update is skipped on
+        // the next iteration rather than reprocessed.
+        try {
+          const ev = normalizeUpdate(u);
+          if (ev && this.handler) await this.handler(ev);
+        } catch (e) {
+          process.stderr.write(
+            `[${new Date().toISOString()}] inbound dispatch error (update ${u.update_id}, skipped): ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`,
+          );
+        }
       }
     }
   }
@@ -369,7 +379,11 @@ export class TelegramTransport
  * Exported for direct unit testing.
  */
 export function normalizeUpdate(u: TgUpdate): InboundEvent<TgUpdate> | null {
-  const msg = u.message ?? u.edited_message;
+  // Only act on NEW messages + forum service events. An edited_message (the user
+  // fixing a typo on an OLD message — a common phone gesture) must NOT be replayed
+  // as a fresh turn/command; that would silently re-run a months-old message or
+  // re-trigger an old /mount. Edits fall through to the null return below.
+  const msg = u.message;
   if (msg) {
     if (msg.forum_topic_created) {
       return { kind: "topic-created", routingKey: threadRoutingKey(msg), name: msg.forum_topic_created.name, raw: u };
