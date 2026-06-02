@@ -675,10 +675,13 @@ echo "$JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["fi
 rm -rf "$FA_TMP"
 
 # ─── sleep-fix: pmset parsing + config ───────────────────────────────────────
-# _sleep_fix_risky reads `pmset -g` (via the PMSET_BIN override) and lists the
-# settings that still permit a nap — which would freeze the long-poll. A stub
-# pmset pins each state without touching the host's real power policy. The
-# fake reads SF_STANDBY/SF_POWERNAP/SF_SLEEP from its env so we can flip states.
+# _sleep_fix_state reads `pmset -g` (via the PMSET_BIN override) ONCE and reports
+# applied|unknown|<risky list> — the settings that still permit a nap would
+# freeze the long-poll. A stub pmset pins each state without touching the host.
+# The fake reads SF_* from its env so we can flip states, and emits REAL
+# `pmset -g` shapes (the "Sleep On Power Button" multi-word key, the active-source
+# annotation, minutes-valued keys) so a future parser refactor can't silently
+# regress against production output.
 SF_TMP=$(mktemp -d)
 cat > "$SF_TMP/fake-pmset" <<'EOF'
 #!/bin/bash
@@ -686,60 +689,80 @@ cat > "$SF_TMP/fake-pmset" <<'EOF'
 cat <<OUT
 System-wide power settings:
 Currently in use:
+ Sleep On Power Button 1
  standby              ${SF_STANDBY:-1}
  powernap             ${SF_POWERNAP:-1}
  disksleep            10
- sleep                ${SF_SLEEP:-1}
+ sleep                ${SF_SLEEP:-1}${SF_SLEEP_ANNOT:-}
 OUT
 EOF
 chmod +x "$SF_TMP/fake-pmset"
 export PMSET_BIN="$SF_TMP/fake-pmset"
 
-# Hardened host: every nap setting 0 → no risk, status exits 0.
+# Hardened host: every nap setting 0 → applied, status exits 0.
 export SF_STANDBY=0 SF_POWERNAP=0 SF_SLEEP=0
-[[ -z "$(_sleep_fix_risky)" ]] \
-  && ok "_sleep_fix_risky: all-zero pmset → no risk" \
-  || ng "_sleep_fix_risky: all-zero should be empty (got '$(_sleep_fix_risky)')"
+[[ "$(_sleep_fix_state)" == "applied" ]] \
+  && ok "_sleep_fix_state: all-zero pmset → applied" \
+  || ng "_sleep_fix_state: all-zero should be 'applied' (got '$(_sleep_fix_state)')"
 _config_sleep_fix status >/dev/null 2>&1 \
   && ok "_config_sleep_fix status: hardened → exit 0" \
   || ng "_config_sleep_fix status: hardened should exit 0"
 
-# standby + powernap still on (sleep off) → both reported, in pmset order.
+# standby + powernap still on → both reported in pmset order; the multi-word
+# "Sleep On Power Button 1" line must NOT be mistaken for the sleep key.
 export SF_STANDBY=1 SF_POWERNAP=1 SF_SLEEP=0
-[[ "$(_sleep_fix_risky)" == "standby powernap" ]] \
-  && ok "_sleep_fix_risky: standby+powernap on → 'standby powernap'" \
-  || ng "_sleep_fix_risky: expected 'standby powernap', got '$(_sleep_fix_risky)'"
+[[ "$(_sleep_fix_state)" == "standby powernap" ]] \
+  && ok "_sleep_fix_state: standby+powernap on → 'standby powernap'" \
+  || ng "_sleep_fix_state: expected 'standby powernap', got '$(_sleep_fix_state)'"
 ! _config_sleep_fix status >/dev/null 2>&1 \
   && ok "_config_sleep_fix status: risky → exit 1" \
   || ng "_config_sleep_fix status: risky should exit non-zero"
 
-# sleep alone on → just 'sleep'.
-export SF_STANDBY=0 SF_POWERNAP=0 SF_SLEEP=1
-[[ "$(_sleep_fix_risky)" == "sleep" ]] \
-  && ok "_sleep_fix_risky: sleep-only → 'sleep'" \
-  || ng "_sleep_fix_risky: expected 'sleep', got '$(_sleep_fix_risky)'"
+# Real-world annotated value line: `sleep 1 (sleep prevented by caffeinate, ...)`
+# — the parser must take the value (1), not choke on the annotation.
+export SF_STANDBY=0 SF_POWERNAP=0 SF_SLEEP=1 SF_SLEEP_ANNOT=" (sleep prevented by caffeinate, powerd)"
+[[ "$(_sleep_fix_state)" == "sleep" ]] \
+  && ok "_sleep_fix_state: annotated 'sleep 1 (...)' → 'sleep'" \
+  || ng "_sleep_fix_state: annotated sleep line mis-parsed (got '$(_sleep_fix_state)')"
+unset SF_SLEEP_ANNOT
 
-# pmset absent (e.g. a Linux host) → no keys → no risk (nothing naps there).
+# Minutes-valued sleep (e.g. `sleep 10`) still permits a nap → risky.
+export SF_STANDBY=0 SF_POWERNAP=0 SF_SLEEP=10
+[[ "$(_sleep_fix_state)" == "sleep" ]] \
+  && ok "_sleep_fix_state: 'sleep 10' (minutes) → 'sleep'" \
+  || ng "_sleep_fix_state: 'sleep 10' should be risky (got '$(_sleep_fix_state)')"
+
+# pmset absent (e.g. a Linux host) → unknown (NOT a false 'applied'); the install
+# recommendation is suppressed (status exits 0) but status is honest.
 export PMSET_BIN="$SF_TMP/nope"
-[[ -z "$(_sleep_fix_risky)" ]] \
-  && ok "_sleep_fix_risky: pmset absent → no risk (Linux-safe)" \
-  || ng "_sleep_fix_risky: absent pmset should yield no risk"
+[[ "$(_sleep_fix_state)" == "unknown" ]] \
+  && ok "_sleep_fix_state: pmset absent → unknown (Linux-safe, honest)" \
+  || ng "_sleep_fix_state: absent pmset should be 'unknown' (got '$(_sleep_fix_state)')"
+_config_sleep_fix status >/dev/null 2>&1 \
+  && ok "_config_sleep_fix status: unknown → exit 0 (suppresses install nag)" \
+  || ng "_config_sleep_fix status: unknown should exit 0"
 export PMSET_BIN="$SF_TMP/fake-pmset"
 
 # `on` must shell out to: sudo pmset -a sleep 0 disksleep 0 standby 0 powernap 0.
-# Stub sudo to record argv instead of mutating the real machine.
+# In production the sudo'd binary is HARDCODED; only under CTA_TEST_MODE do we
+# honor the PMSET_SUDO/PMSET_BIN stubs so we can record argv without root.
 cat > "$SF_TMP/fake-sudo" <<EOF
 #!/bin/bash
 echo "\$@" > "$SF_TMP/sudo-args"
 EOF
 chmod +x "$SF_TMP/fake-sudo"
-export PMSET_SUDO="$SF_TMP/fake-sudo"
-_config_sleep_fix on >/dev/null 2>&1
+CTA_TEST_MODE=1 PMSET_SUDO="$SF_TMP/fake-sudo" PMSET_BIN="$SF_TMP/fake-pmset" \
+  _config_sleep_fix on >/dev/null 2>&1
 SF_ARGS=$(cat "$SF_TMP/sudo-args" 2>/dev/null || true)
 [[ "$SF_ARGS" == *"sleep 0"* && "$SF_ARGS" == *"standby 0"* && "$SF_ARGS" == *"powernap 0"* ]] \
   && ok "_config_sleep_fix on: sudo pmset disables sleep+standby+powernap" \
   || ng "_config_sleep_fix on: wrong pmset args ('$SF_ARGS')"
-unset PMSET_SUDO
+
+# Security: outside CTA_TEST_MODE the sudo'd binary must be hardcoded, NOT chosen
+# by an env var (else `PMSET_BIN=/tmp/evil cta config sleep-fix on` = root exec).
+grep -q 'CTA_TEST_MODE' "$SCRIPT_DIR/cli/cta" \
+  && ok "_config_sleep_fix: sudo binary gated behind CTA_TEST_MODE (no env-chosen root exec)" \
+  || ng "_config_sleep_fix: missing CTA_TEST_MODE guard on the privileged binary"
 
 # Bad arg → usage error, non-zero.
 _config_sleep_fix banana >/dev/null 2>&1 \

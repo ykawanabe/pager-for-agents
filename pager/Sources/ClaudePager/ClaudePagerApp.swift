@@ -33,10 +33,13 @@ struct ClaudePagerApp: App {
     // Default OFF: caffeinate (`-i`, idle-sleep assertion) does NOT keep the
     // poller alive through standby/powernap on Apple Silicon — those freeze
     // the process ~15 of every ~16 min regardless, so the real silence fix is
-    // `sudo pmset -a powernap 0 standby 0`, not caffeinate. Leaving it on by
-    // default just held the Mac awake (battery drain) and leaked orphan
-    // caffeinates on power-state churn for no reliability gain. Users who
-    // still want it can flip it on in Settings; `onlyOnAC=true` then bounds
+    // `sudo pmset -a powernap 0 standby 0` (see `cta config sleep-fix`), not
+    // caffeinate. On by default just held the Mac awake (battery drain) and
+    // leaked orphan caffeinates on power-state churn for no reliability gain.
+    // NOTE: @AppStorage uses this default ONLY when the key is absent, so this
+    // affects fresh installs — existing users keep whatever they last chose (we
+    // deliberately don't override an explicit preference with a silent migration).
+    // Users who want it can flip it on in Settings; `onlyOnAC=true` then bounds
     // battery drain to when the Mac is plugged in.
     @AppStorage("caffeinateEnabled") private var caffeinateEnabled = false
     @AppStorage("caffeinateOnlyOnAC") private var caffeinateOnlyOnAC = true

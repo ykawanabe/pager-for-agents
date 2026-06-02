@@ -94,8 +94,8 @@ macOS constraint, not a bug in this project):
   24/7 reachability, run the agent on a never-sleep desktop Mac (a Mac mini set
   to never sleep) or move the poller to an always-on Linux host.
 
-Revert with `cta config sleep-fix off` (restores macOS sleep defaults — the bot
-can go silent on idle again).
+Revert with `cta config sleep-fix off` (sets macOS default sleep policy —
+overwrites any custom pmset values; the bot can go silent on idle again).
 
 ## Mid-turn messages and `/stop`
 
