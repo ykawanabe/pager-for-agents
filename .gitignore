@@ -20,6 +20,15 @@ pager/*.xcodeproj/
 .env
 .env.local
 .env.*.local
+# Telethon/MTProto session strings are LIVE credentials — never commit.
+*.session
+*.session-journal
+
+# Local-only helpers / internal research that must not ship in the public repo.
+# (Untracked today; listed so `git add -A` can't sweep them in.) Force with -f
+# if you ever decide to publish one.
+/research/
+/generate_session_qr.py
 
 # Runtime logs and backups
 *.log
