@@ -807,6 +807,11 @@ function initDaemonRegistry(): void {
     // overridable via PAGER_INTERRUPT_DEBOUNCE_MS for e2e tests (fast scenarios).
     autoSteerEnabled: () => interruptOnMessage,
     interruptDebounceMs: Number(process.env.PAGER_INTERRUPT_DEBOUNCE_MS ?? "1500"),
+    // Post-interrupt escalation: claude v2.1.150 frequently ACKs an interrupt
+    // but never emits a result (the 2026-05-25 "General stopped responding"
+    // wedge). Without this, the only recovery was the 5-min inFlight watchdog →
+    // 5 min of silence. 12s SIGKILLs + respawns + flushes the steer instead.
+    interruptEscalateMs: Number(process.env.PAGER_INTERRUPT_ESCALATE_MS ?? "12000"),
     onText: postTelegramTextFromDaemon,
     onFlush: onDaemonFlush,
     onTurnStart: onDaemonTurnStart,

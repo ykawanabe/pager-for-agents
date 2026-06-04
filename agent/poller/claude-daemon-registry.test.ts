@@ -683,6 +683,57 @@ describe("ClaudeDaemonRegistry auto-steer (mid-turn interrupt)", () => {
     expect(interruptCount).toBe(1);     // one interrupt for the whole burst
   });
 
+  test("interrupt that produces NO result still recovers fast (real-claude wedge)", async () => {
+    // Reproduces the 2026-05-25 General-not-responding incident: real claude
+    // v2.1.150 ACKs the interrupt control_request (control_response:success) but
+    // frequently emits NO result → the turn wedges. Before the post-interrupt
+    // escalation, the ONLY recovery was the 5-min inFlight watchdog → 5 min of
+    // silence. The short escalation (interruptEscalateMs) must SIGKILL → respawn
+    // → flush the steered message instead.
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      interruptDebounceMs: 80,
+      interruptEscalateMs: 150,             // short post-interrupt deadline
+      inFlightTimeoutMs: 60_000,            // long: must NOT be the recovery path
+      autoSteerEnabled: () => true,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result", INTERRUPT_NO_RESULT: "1" } }),
+      onText: (_t, s) => texts.push(s),
+    });
+    reg.enqueue("topic-42", "start");
+    await waitFor(() => texts.length >= 1, 5000);          // inFlight (hung turn)
+    expect(reg.getStatus("topic-42")).toBe("inFlight");
+    const firstSpawn = reg.spawnedCount;
+
+    reg.enqueue("topic-42", "steer me");                   // mid-turn → interrupt (no result) → escalate
+    // Escalation SIGKILLs the wedged daemon → crash → respawn → flush "steer me".
+    await waitFor(() => texts.some((t) => t.includes("steer me")), 5000);
+    expect(reg.spawnedCount).toBeGreaterThan(firstSpawn);  // respawned, not stuck
+  });
+
+  test("stopTurn recovers when the graceful interrupt wedges (no result)", async () => {
+    const texts: string[] = [];
+    reg = new ClaudeDaemonRegistry({
+      claudeBin: FIXTURE,
+      debounceMs: 50,
+      interruptEscalateMs: 150,
+      inFlightTimeoutMs: 60_000,
+      autoSteerEnabled: () => true,
+      daemonOptsFor: () => ({ cwd: "/tmp", env: { FAKE_CLAUDE_MODE: "hang-no-result", INTERRUPT_NO_RESULT: "1" } }),
+      onText: (_t, s) => texts.push(s),
+    });
+    reg.enqueue("topic-42", "start");
+    await waitFor(() => texts.length >= 1, 5000);
+    expect(reg.getStatus("topic-42")).toBe("inFlight");
+
+    await reg.stopTurn("topic-42");                        // graceful interrupt → wedges (no result)
+    // Without escalation this stays inFlight for 60s; with it, SIGKILL → crash →
+    // idle (queue empty → lazy, next message respawns). The daemon is gone.
+    await waitFor(() => reg.getStatus("topic-42") === "idle", 5000);
+    expect(reg.daemonCount).toBe(0);
+  });
+
   test("autoSteerEnabled=false keeps the legacy hold-until-turn-end behavior", async () => {
     const texts: string[] = [];
     reg = new ClaudeDaemonRegistry({

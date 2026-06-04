@@ -81,6 +81,15 @@ while IFS= read -r line; do
   # can drive a hung turn to turn-end via interrupt() instead of SIGTERM.
   if [[ "$line" == *'"type":"control_request"'* && "$line" == *'"subtype":"interrupt"'* ]]; then
     printf '{"type":"control_response","response":{"subtype":"success","request_id":"fake"}}\n'
+    # INTERRUPT_NO_RESULT=1 reproduces the real claude v2.1.150 behavior observed
+    # 2026-05-25: the control_request is ACKed (control_response:success) but NO
+    # result event ever follows — the turn wedges. Verified live that this is
+    # frequent (3/3 trials at 200/800/2500ms). Without this knob the fixture is
+    # too cooperative and masks the wedge; with it, tests exercise the short
+    # post-interrupt escalation (SIGKILL → respawn → flush) that bounds the stall.
+    if [[ "${INTERRUPT_NO_RESULT:-}" == "1" ]]; then
+      continue
+    fi
     printf '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Interrupted by user","total_cost_usd":0.0,"session_id":"fake-session-uuid","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
     continue
   fi

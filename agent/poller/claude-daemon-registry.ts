@@ -76,6 +76,17 @@ export interface RegistryOptions {
   onCrashLoop?: (threadId: string, crashCount: number) => void;
   /** Optional: consecutive-crash count that trips onCrashLoop. Default 3. */
   crashLoopThreshold?: number;
+  /** Optional: post-interrupt escalation deadline. After we send an interrupt
+   *  (auto-steer or /stop) we expect claude to emit a result → turn-end. But
+   *  claude v2.1.150 frequently ACKs the interrupt (control_response:success)
+   *  and then emits NO result — the turn wedges (verified live 2026-05-25, the
+   *  "General stopped responding" incident). Relying on inFlightTimeoutMs (5min)
+   *  to recover means 5 minutes of silence. So once an interrupt is sent we
+   *  re-arm the watchdog with THIS much shorter deadline; if no turn-end arrives
+   *  the wedged daemon is SIGKILLed → crash → respawn → queue flush. Trailing
+   *  text from the aborting turn does NOT extend it (unlike the normal
+   *  watchdog), so a steer recovers promptly. Default 12s. */
+  interruptEscalateMs?: number;
 }
 
 type DaemonState = "idle" | "pending" | "inFlight" | "released" | "crashed";
@@ -103,6 +114,13 @@ interface DaemonHandle {
   /** Interrupt-debounce timer for mid-turn auto-steer. Cleared on
    *  turn-end / crash / release / reset / stop; reset on each mid-turn message. */
   interruptTimer: ReturnType<typeof setTimeout> | null;
+  /** True from the moment an interrupt is sent until the next turn-end/crash.
+   *  While set, armInFlightWatchdog uses the short interruptEscalateMs deadline
+   *  and trailing text blocks do NOT extend it — so a wedged interrupt (claude
+   *  ACKs but emits no result) is SIGKILLed within seconds instead of waiting
+   *  out the 5-min inFlight watchdog. Cleared on turn-end / crash / release /
+   *  reset. */
+  postInterrupt: boolean;
   /** Wall-clock ms of the last activity on this topic (enqueue or turn-end).
    *  Drives the idle sweep (idleCandidates): a topic quiet longer than the
    *  configured threshold becomes eligible for evict (small session) or
@@ -180,6 +198,7 @@ export class ClaudeDaemonRegistry {
         releasedAt: null,
         inFlightTimer: null,
         interruptTimer: null,
+        postInterrupt: false,
         lastActivityAt: Date.now(),
         stopping: false,
         turnEndResolver: null,
@@ -230,6 +249,7 @@ export class ClaudeDaemonRegistry {
     // from arming a debounce timer mid-teardown.
     handle.state = "released";
     handle.releasedAt = Date.now();
+    handle.postInterrupt = false;
     if (handle.debounceTimer) {
       clearTimeout(handle.debounceTimer);
       handle.debounceTimer = null;
@@ -336,6 +356,15 @@ export class ClaudeDaemonRegistry {
     if (handle.daemon) {
       try {
         await handle.daemon.interrupt();
+        // Arm the short post-interrupt escalation: if claude ACKs but emits no
+        // result (the v2.1.150 wedge), the daemon is SIGKILLed → crash → respawn
+        // within interruptEscalateMs instead of pinning the topic inFlight until
+        // the 5-min watchdog. turn-end clears it on the happy (responsive) path.
+        const h = this.handles.get(threadId);
+        if (h && h.state === "inFlight") {
+          h.postInterrupt = true;
+          this.armInFlightWatchdog(threadId, h);
+        }
         return true;
       } catch {
         // fall through to the kill fallback below
@@ -345,6 +374,7 @@ export class ClaudeDaemonRegistry {
     // Fallback: SIGTERM + lazy respawn (the pre-graceful behavior). Only here
     // do we clear the watchdog — the SIGTERM-driven close guarantees recovery.
     this.clearInFlightTimer(handle);
+    handle.postInterrupt = false;
     handle.stopping = true;
     if (handle.daemon) {
       await handle.daemon.stop("SIGTERM");
@@ -486,7 +516,17 @@ export class ClaudeDaemonRegistry {
       handle.interruptTimer = null;
       const h = this.handles.get(threadId);
       if (!h || h.state !== "inFlight" || !h.daemon) return;   // race: turn already ended
-      void h.daemon.interrupt().catch(() => {
+      void h.daemon.interrupt().then(() => {
+        // Interrupt sent. claude may ACK but emit no result (v2.1.150 wedge) —
+        // arm the short escalation so a non-responding interrupt is SIGKILLed +
+        // respawned within seconds and the steered queue flushes, rather than
+        // waiting out the 5-min inFlight watchdog. Re-check state: turn may have
+        // ended between the await points.
+        const h2 = this.handles.get(threadId);
+        if (!h2 || h2.state !== "inFlight") return;
+        h2.postInterrupt = true;
+        this.armInFlightWatchdog(threadId, h2);
+      }).catch(() => {
         // stdin closed mid-flight → the crash/respawn path will flush the queue.
       });
     }, this.opts.interruptDebounceMs ?? 1500);
@@ -508,7 +548,12 @@ export class ClaudeDaemonRegistry {
    *  resume). Reset on every text block so an active turn is never killed. */
   private armInFlightWatchdog(threadId: string, handle: DaemonHandle): void {
     this.clearInFlightTimer(handle);
-    const timeoutMs = this.opts.inFlightTimeoutMs ?? 5 * 60_000;
+    // After an interrupt, recover on the short escalation deadline instead of
+    // the 5-min inactivity watchdog — claude often ACKs the interrupt but never
+    // emits a result, so the turn would otherwise sit wedged for 5 minutes.
+    const timeoutMs = handle.postInterrupt
+      ? (this.opts.interruptEscalateMs ?? 12_000)
+      : (this.opts.inFlightTimeoutMs ?? 5 * 60_000);
     handle.inFlightTimer = setTimeout(() => {
       const h = this.handles.get(threadId);
       if (!h || h.state !== "inFlight") return;
@@ -599,9 +644,12 @@ export class ClaudeDaemonRegistry {
 
     daemon.on("text", (text: string) => {
       // Activity → reset the inactivity watchdog so a long-but-active turn is
-      // never killed (only true silence trips it).
+      // never killed (only true silence trips it). EXCEPTION: after an interrupt
+      // (postInterrupt), trailing text from the aborting turn must NOT push the
+      // escalation deadline back — we asked the turn to stop, so a steer should
+      // recover promptly even if claude keeps dribbling out the old answer.
       const h = this.handles.get(threadId);
-      if (h && h.state === "inFlight") this.armInFlightWatchdog(threadId, h);
+      if (h && h.state === "inFlight" && !h.postInterrupt) this.armInFlightWatchdog(threadId, h);
       this.opts.onText(threadId, text);
     });
 
@@ -610,6 +658,7 @@ export class ClaudeDaemonRegistry {
       const h = this.handles.get(threadId);
       if (!h) return;
       this.clearInFlightTimer(h);
+      h.postInterrupt = false; // turn ended → drop the escalation mode
       if (h.state === "released") return; // user yanked the daemon mid-turn
       // Healthy turn — reset crash backoff + the consecutive-crash counter.
       h.backoffMs = 0;
@@ -633,6 +682,7 @@ export class ClaudeDaemonRegistry {
       const h = this.handles.get(threadId);
       if (!h) return;
       this.clearInFlightTimer(h);
+      h.postInterrupt = false;
       if (h.interruptTimer) { clearTimeout(h.interruptTimer); h.interruptTimer = null; }
       // Drop any runTurnAndWait resolver: the turn it awaited died with the
       // daemon. Leaving it set lets a LATER real turn's turn-end fire this

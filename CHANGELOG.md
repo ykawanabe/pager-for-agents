@@ -57,6 +57,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   chat_id pinned in their MCP env, and ensures the wildcard mount exists.
 
 ### Fixed
+- **A steered/`/stop`'d topic could go silent for up to 5 minutes.** claude v2.1.150 frequently acknowledges an in-band interrupt but then emits no `result` event, so the turn wedged — and the only recovery was the 5-minute inactivity watchdog. A short post-interrupt escalation (~12s, `PAGER_INTERRUPT_ESCALATE_MS`) now SIGKILLs + respawns the wedged daemon and flushes your steered message, so a non-responding interrupt recovers in seconds instead of minutes. (The graceful path is unchanged when claude *does* respond.)
 - `topic-wrapper.sh` reads `paired.json` and prefers its `chat_id` over
   `.env`'s `MAIN_CHAT_ID`. After re-pairing, the stale env value used to
   leave claude's MCP outbound pointing at the dead chat — replies vanished.
