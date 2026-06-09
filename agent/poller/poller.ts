@@ -539,36 +539,86 @@ IMPORTANT — Telegram pairing / access is handled by claude-telegram-agent, NOT
  * MCP config path. Called by the registry on every spawn (including
  * crash respawns) so config stays in sync with mount changes.
  */
-// ─── per-topic --effort level ────────────────────────────────────────────────
-// claude's real --effort levels PLUS "auto" — a bot-level sentinel meaning
-// "don't pass --effort at all, let claude use its own settings.json effortLevel
-// default." "auto" is NEVER passed to claude (claude rejects --effort auto); it
-// is mapped to `undefined` at daemon spawn via effortArg() → buildArgv omits the
-// flag. Kept in the valid set so /effort auto and PAGER_EFFORT=auto are accepted
-// and displayed.
-const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "auto"]);
+// ─── per-topic --effort level (single source of truth: EFFORT_SPECS) ─────────
+// Every effort value the bot accepts is ONE ROW in EFFORT_SPECS below. The
+// validator, the --effort arg mapping, the optional system-prompt directive, and
+// the user-facing usage/help/menu strings all DERIVE from it — so adding a level
+// (a real claude tier or a bot sentinel) is a one-line edit here, nothing else,
+// and the help text can't drift out of sync.
+//   arg=null    → sentinel: omit --effort entirely (claude uses its own
+//                 settings.json default). "auto" is this.
+//   arg=<tier>  → spawn `--effort <tier>`. A sentinel like "ultracode" maps to a
+//                 real tier (xhigh) and carries its own directive.
+//   directive   → appended to the daemon system prompt while this level is active.
+//   blurb       → short "name = meaning" hint for /effort usage (sentinels only).
+
+/** Appended to the daemon's system prompt for topics on /effort ultracode.
+ *  Increases the DEPTH of the work, not the length of the Telegram reply (the
+ *  base prompt's brevity rule still governs output). claude has no native
+ *  ultracode in headless mode, so this is how the bot expresses it. */
+const ULTRACODE_DIRECTIVE = [
+  "Ultracode mode is ON for this topic. Optimize for the most exhaustive, correct answer — not the fastest or cheapest. Token cost is not a constraint on your reasoning.",
+  "Verify against the actual code/data before answering rather than from memory; on substantive tasks decompose the problem and adversarially check your own work.",
+  "If a Workflow / multi-agent orchestration tool is available to you, use it to fan out and verify on substantive tasks; otherwise do that depth of reasoning yourself. Stay solo for trivial or conversational turns.",
+  "This raises the depth of your work, NOT the length of your message — keep the final Telegram reply as concise as always (short answer, deep thought).",
+].join(" ");
+
+interface EffortSpec {
+  /** The `--effort` arg, or null to omit the flag (sentinel → claude's default). */
+  readonly arg: string | null;
+  /** Appended to the daemon system prompt while this level is active. */
+  readonly directive?: string;
+  /** Short "meaning" hint for /effort usage — only the non-obvious sentinels. */
+  readonly blurb?: string;
+}
+
+/** THE source of truth for accepted effort levels. Add a row → fully supported. */
+const EFFORT_SPECS: Record<string, EffortSpec> = {
+  low:       { arg: "low" },
+  medium:    { arg: "medium" },
+  high:      { arg: "high" },
+  xhigh:     { arg: "xhigh" },
+  max:       { arg: "max" },
+  auto:      { arg: null,    blurb: "let claude use its own default" },
+  ultracode: { arg: "xhigh", directive: ULTRACODE_DIRECTIVE, blurb: "xhigh + go exhaustive" },
+};
+
+const isValidEffort = (e: string): boolean =>
+  Object.prototype.hasOwnProperty.call(EFFORT_SPECS, e);
+/** "low|medium|…|ultracode" — derived so usage/help/menu can't drift. */
+const EFFORT_NAMES = Object.keys(EFFORT_SPECS).join("|");
+/** "auto = …; ultracode = …" — sentinel blurbs, for /effort usage. */
+const EFFORT_BLURBS = Object.entries(EFFORT_SPECS)
+  .filter(([, s]) => s.blurb)
+  .map(([n, s]) => `${n} = ${s.blurb}`)
+  .join("; ");
+
 // Bot-wide default. Overridable via PAGER_EFFORT in ~/.pager/.env. Deliberately
 // independent of the user's GLOBAL settings.json effortLevel (which also drives
 // their desktop claude) — the bot defaults to "high" for snappier phone replies.
 const DEFAULT_EFFORT =
-  process.env.PAGER_EFFORT && VALID_EFFORTS.has(process.env.PAGER_EFFORT)
+  process.env.PAGER_EFFORT && isValidEffort(process.env.PAGER_EFFORT)
     ? process.env.PAGER_EFFORT
     : "high";
 function effortDir(): string { return join(STATE_DIR, "effort"); }
 /** Per-topic effort override (set via /effort), else the bot default. Returns
- *  the RAW stored value — including the "auto" sentinel — for display. Callers
- *  building the daemon argv must pass it through effortArg(). */
+ *  the RAW stored value (incl. sentinels) for display; daemon argv goes through
+ *  effortArg(). */
 function resolveEffort(key: number | "dm"): string {
   try {
     const v = readFileSync(join(effortDir(), String(key)), "utf8").trim();
-    if (VALID_EFFORTS.has(v)) return v;
+    if (isValidEffort(v)) return v;
   } catch { /* no override → default */ }
   return DEFAULT_EFFORT;
 }
-/** Map a resolved effort to the actual --effort argument: "auto" → undefined
- *  (omit the flag so claude uses its own default), every real level → itself. */
+/** The actual --effort arg for a resolved level (null sentinel / unknown →
+ *  undefined so buildArgv omits the flag). */
 function effortArg(eff: string): string | undefined {
-  return eff === "auto" ? undefined : eff;
+  return EFFORT_SPECS[eff]?.arg ?? undefined;
+}
+/** The system-prompt directive for a resolved level, if any (e.g. ultracode). */
+function effortDirective(eff: string): string | undefined {
+  return EFFORT_SPECS[eff]?.directive;
 }
 
 // ─── per-topic --model ───────────────────────────────────────────────────────
@@ -614,7 +664,11 @@ function buildDaemonOpts(threadIdStr: string): Omit<ClaudeDaemonOptions, "claude
     resumeExisting: jsonlExists,
     // P4: no poller --mcp-config; claude inherits the user's own MCPs only.
     settingsPath: existsSync(hooksPath) ? hooksPath : undefined,
-    appendSystemPrompt: process.env.BOT_APPEND_SYSTEM_PROMPT ?? DAEMON_APPEND_SYSTEM_PROMPT,
+    appendSystemPrompt: (() => {
+      const base = process.env.BOT_APPEND_SYSTEM_PROMPT ?? DAEMON_APPEND_SYSTEM_PROMPT;
+      const dir = effortDirective(resolveEffort(key));
+      return dir ? `${base}\n\n${dir}` : base;
+    })(),
     effort: effortArg(resolveEffort(key)),
     model: resolveModel(key),
   };
@@ -629,11 +683,11 @@ async function handleEffort(ev: InboundMessageEvent, args: string): Promise<void
   const level = args.trim().toLowerCase().split(/\s+/)[0];
 
   if (!level) {
-    await reply(dest, `effort for this topic: ${resolveEffort(key)} (default ${DEFAULT_EFFORT})\nUsage: /effort <low|medium|high|xhigh|max|auto>  (auto = let claude use its own default)`);
+    await reply(dest, `effort for this topic: ${resolveEffort(key)} (default ${DEFAULT_EFFORT})\nUsage: /effort <${EFFORT_NAMES}>  (${EFFORT_BLURBS})`);
     return;
   }
-  if (!VALID_EFFORTS.has(level)) {
-    await reply(dest, `"${level}" is not valid. Choose: low, medium, high, xhigh, max, auto.`);
+  if (!isValidEffort(level)) {
+    await reply(dest, `"${level}" is not valid. Choose: ${EFFORT_NAMES.replace(/\|/g, ", ")}.`);
     return;
   }
   try {
@@ -1903,7 +1957,7 @@ async function handleHelp(ev: InboundMessageEvent): Promise<void> {
       "  /cost           — token usage + estimated cost for this session",
       "  /usage          — Anthropic 5h/7d subscription usage",
       "  /clear          — reset the conversation (new session UUID)",
-      "  /effort <level> — set reasoning effort for this topic (low|medium|high|xhigh|max|auto)",
+      `  /effort <level> — set reasoning effort for this topic (${EFFORT_NAMES})`,
       "  /model <name>   — set model for this topic (opus|sonnet|haiku|full-id)",
       "  /context        — approx context-window usage for this topic",
       "  /restart        — restart claude on this topic (keep session)",
@@ -2301,7 +2355,7 @@ const BOT_COMMAND_MENU = [
   { command: "usage",   description: "Anthropic 5h / 7d subscription usage" },
   { command: "status",  description: "Bot and daemon health" },
   { command: "context", description: "Approx context-window usage for this topic" },
-  { command: "effort",  description: "Set reasoning effort (low|medium|high|xhigh|max|auto)" },
+  { command: "effort",  description: `Set reasoning effort (${EFFORT_NAMES})` },
   { command: "model",   description: "Set model (opus|sonnet|haiku|full-id)" },
   { command: "do",      description: "Delegate a task — I act, asking before risky steps" },
 ];
