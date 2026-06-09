@@ -163,7 +163,7 @@ rm -f "$BIN_DIR/restart_claude.sh" 2>/dev/null || true
 # ~/.local/share).
 AGENT_DIR="$INSTALL_DIR/agent"
 if [[ -d "$REPO_DIR/agent" ]]; then
-  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/poller/heartbeat-checks" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
+  mkdir -p "$AGENT_DIR/lib" "$AGENT_DIR/poller" "$AGENT_DIR/poller/heartbeat-checks" "$AGENT_DIR/poller/agentic" "$AGENT_DIR/mount-store" "$AGENT_DIR/channels/telegram"
   cp "$REPO_DIR/agent/lib/paths.ts" "$AGENT_DIR/lib/"
   cp "$REPO_DIR/agent/poller/poller.ts" \
      "$REPO_DIR/agent/poller/package.json" \
@@ -189,6 +189,16 @@ if [[ -d "$REPO_DIR/agent" ]]; then
      "$REPO_DIR/agent/poller/heartbeat-checks/quiet-hours.ts" \
      "$REPO_DIR/agent/poller/heartbeat-checks/scheduler.ts" \
      "$AGENT_DIR/poller/heartbeat-checks/"
+  # Agentic 秘書 mode: autonomy policy + approval store + gate hook + runner +
+  # cards. Production .ts only (.test.ts stay in the repo). gate-hook.ts runs as
+  # a claude PreToolUse hook; the others are imported by the poller — without
+  # these copies the installed poller crashes on startup ("Cannot find module").
+  cp "$REPO_DIR/agent/poller/agentic/autonomy-policy.ts" \
+     "$REPO_DIR/agent/poller/agentic/approval-store.ts" \
+     "$REPO_DIR/agent/poller/agentic/gate-hook.ts" \
+     "$REPO_DIR/agent/poller/agentic/agentic-runner.ts" \
+     "$REPO_DIR/agent/poller/agentic/cards.ts" \
+     "$AGENT_DIR/poller/agentic/"
   # Chat-channel modules (ChatTransport migration). Platform-agnostic core
   # contract (types.ts) + Telegram wire adapter. poller.ts imports the adapter
   # via ../channels/telegram/adapter; without these copies the installed poller

@@ -55,6 +55,15 @@ import { shouldFire as digestShouldFire } from "./heartbeat-checks/scheduler";
 import { runHeartbeat } from "./heartbeat-checks/heartbeat-runner";
 import { appendFireLog } from "./heartbeat-checks/heartbeat-log";
 import { heartbeatSessionFile } from "../lib/paths";
+// Agentic 秘書 mode — gated executor + approval round-trip. The engine (policy,
+// approval store, gate hook, runner) lives under ./agentic; the poller wires the
+// Telegram surface (cards, buttons, /do, proactive routing) here.
+import { runAgentic, defaultHookScriptPath } from "./agentic/agentic-runner";
+import {
+  listRequests, readRequest, writeDecision, markSent, cleanup as cleanupApproval,
+  type ApprovalRequest,
+} from "./agentic/approval-store";
+import { renderApprovalCard, approvalButtonRows, parseApprovalCallback, applyEdit } from "./agentic/cards";
 // Telegram outbound wire (Bot API egress), extracted in P1 of the ChatTransport
 // migration. `reply` is the adapter's `sendText` (same signature, 58 call sites
 // unchanged). The poller keeps the *policy* — ack on/off + glyph, typing
@@ -501,7 +510,9 @@ Just write your reply as plain text — the bot reads your final text and posts 
 
 When you need the user to choose between a small fixed set of options (Yes/No, A/B/C, two paths forward), end your reply with a marker line in exactly this format: [[buttons]]["Option A","Option B"] — a JSON array of up to 8 short labels (each ≤50 chars). The bot renders them as tap buttons and the tapped label comes back as the user's next message. Put the question in normal text above the marker. Do NOT use AskUserQuestion — it opens a local modal that the user cannot see or answer.
 
-Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness.
+Telegram renders replies as plain text, so do NOT use Markdown syntax (no **bold**, no headers, no - bullets, no backtick code fences) — those characters appear literally. Prefer 1-3 short paragraphs over walls of text. Write code or commands on plain lines without fences. Users are typically on phones; readability beats completeness. This brevity rule governs OUTPUT length ONLY — never the depth of your thinking.
+
+Think deeply before you answer. Reason hard and thoroughly through the problem internally — chase the real cause, weigh the trade-offs, verify against the actual code or data rather than memory. Reason in English by default, even when the user writes in another language. Depth of reasoning is never what you cut; what you keep short is only the FINAL reply, distilled BLUF-first into 1-3 tight paragraphs in the user's language. Short answer, deep thought — never a shallow one.
 
 You also have access to ~/.pager/shared-context.md — a cross-session memory file shared with every other Pager-bot claude session on this host. Read it when the user references prior context, or near the start of substantive conversations. Append durable notes there (user preferences, ongoing concerns, decisions, recurring patterns) so future sessions across other topics/projects benefit. Keep entries short and avoid duplication.
 
@@ -1193,6 +1204,41 @@ export async function onButtonPress(ev: ButtonPressEvent): Promise<void> {
     const original = cb.message.text ?? "";
     void editMessageText(cb.message.chat.id, cb.message.message_id, `${original}\n\n↳ linked to ${dir}`);
     await reply(dest, `Linked this topic to ${dir}. Send your message again and I'll start the session.`);
+    return;
+  }
+
+  // Agentic approval tap: `apv:<id>:allow|deny|edit`. Writes the decision file the
+  // gate hook is blocking on; Edit captures the next message as corrected params.
+  if (data.startsWith("apv:")) {
+    if (!isPairedUser) { await answerCallback(cb.id, "Only the paired user can approve.", true); return; }
+    const parsed = parseApprovalCallback(data);
+    if (!parsed) { await answerCallback(cb.id); return; }
+    const { id, verb } = parsed;
+    const req = readRequest(APPROVALS_DIR, id);
+    const stamp = (suffix: string) => {
+      if (cb.message) void editMessageText(cb.message.chat.id, cb.message.message_id, `${cb.message.text ?? ""}\n\n${suffix}`);
+    };
+    if (!req || Date.now() > req.expiresAt) {
+      await answerCallback(cb.id, "That request expired.", true);
+      stamp("⌛ Expired");
+      return;
+    }
+    if (verb === "allow") {
+      writeDecision(APPROVALS_DIR, id, { decision: "allow", at: new Date().toISOString() });
+      await answerCallback(cb.id, "Approved");
+      stamp("✅ Approved");
+      return;
+    }
+    if (verb === "deny") {
+      writeDecision(APPROVALS_DIR, id, { decision: "deny", at: new Date().toISOString(), reason: "rejected by user" });
+      await answerCallback(cb.id, "Rejected");
+      stamp("🚫 Rejected");
+      return;
+    }
+    // verb === "edit": stash the pending edit; the next plain message supplies params.
+    pendingAgenticEdit = { id, threadId: req.threadId, tool: req.tool, args: req.args as Record<string, unknown>, expiresAt: req.expiresAt };
+    await answerCallback(cb.id, "Send the corrected command/params as your next message.");
+    stamp("✏️ Editing — reply with the corrected version.");
     return;
   }
 
@@ -1968,6 +2014,7 @@ async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
     case "/list":  await handleList(ev); return true;
     case "/effort": await handleEffort(ev, args); return true;
     case "/model": await handleModel(ev, args); return true;
+    case "/do":    await handleDo(ev, args); return true;
     case "/help":  await handleHelp(ev); return true;
     default: {
       // TUI command framework: translated → run handler, hidden → reply,
@@ -2138,6 +2185,24 @@ function recordTopicNameFromEvent(
 // field comes from the normalized event (text/address/routingKey/from/messageRef),
 // so a second platform routes through the identical code.
 async function onInboundMessage(ev: InboundMessageEvent): Promise<void> {
+  // Agentic Edit capture: if the user tapped Edit on an approval card, their next
+  // plain (non-command) message in that topic is the corrected params. Consume it
+  // as the gate decision and stop — don't route it to the daemon. Only the paired
+  // user can drive an edit (mirrors tryHandleCommand's gate).
+  if (pendingAgenticEdit && ev.text && !ev.text.startsWith("/")
+      && (!pairedCache || ev.from.id === String(pairedCache.user_id))) {
+    const pe = pendingAgenticEdit;
+    if (Date.now() > pe.expiresAt) {
+      pendingAgenticEdit = null; // stale → fall through to normal handling
+    } else if (String(threadIdOf(ev)) === pe.threadId) {
+      const updatedArgs = applyEdit(pe.tool, pe.args, ev.text.trim());
+      writeDecision(APPROVALS_DIR, pe.id, { decision: "edit", at: new Date().toISOString(), updatedArgs });
+      pendingAgenticEdit = null;
+      await reply(ev.address, `✏️ Using your edit: ${ev.text.trim().slice(0, 180)}`);
+      return;
+    }
+  }
+
   // Commands run first. Pre-pair /pair messages bypass MAIN_CHAT_ID gating
   // (that's the whole point — we don't know the chat yet). Post-pair commands
   // are gated by paired user_id inside tryHandleCommand.
@@ -2238,6 +2303,7 @@ const BOT_COMMAND_MENU = [
   { command: "context", description: "Approx context-window usage for this topic" },
   { command: "effort",  description: "Set reasoning effort (low|medium|high|xhigh|max|auto)" },
   { command: "model",   description: "Set model (opus|sonnet|haiku|full-id)" },
+  { command: "do",      description: "Delegate a task — I act, asking before risky steps" },
 ];
 
 /** Publish the "/" command menu once at boot. Best-effort — a failure just
@@ -2256,6 +2322,135 @@ async function registerBotCommands(): Promise<void> {
 // Detached: fires never block the housekeep tick. The next tick re-enters
 // digestDispatch and finds the in-flight mount via digestInFlight, skipping
 // without a re-spawn.
+// ─── Agentic 秘書 mode ────────────────────────────────────────────────────────
+// A SEPARATE ephemeral executor (mirrors the heartbeat runner) spawns a
+// tool-enabled `claude` gated by a PreToolUse hook: reversible work runs
+// silently, irreversible/outward work pauses for a Telegram Approve/Edit/Reject.
+// The poller services the approval round-trip on the housekeep tick and on
+// button taps. Nothing here touches the interactive daemon's state machine.
+const APPROVALS_DIR = join(STATE_DIR, "approvals");
+const AGENTIC_SESSIONS_DIR = join(STATE_DIR, "agentic-sessions");
+const AGENTIC_LOG_DIR = join(STATE_DIR, "agentic-log");
+const AGENTIC_SETTINGS_FILE = join(STATE_DIR, "agentic-settings.json");
+/** Topics with an agentic run in flight (one task per topic at a time). */
+const agenticInFlight = new Set<string>();
+/** Approval requests already rendered to Telegram this process (sync double-send guard). */
+const approvalsSent = new Set<string>();
+/** When the user taps Edit, the next plain message in that topic supplies corrected params. */
+let pendingAgenticEdit:
+  | { id: string; threadId: string; tool: string; args: Record<string, unknown>; expiresAt: number }
+  | null = null;
+
+/** Write the static --settings file that wires the gate hook on PreToolUse for
+ *  ALL tools (matcher "*", verified to fire for every tool type). Idempotent. */
+function ensureAgenticSettings(): void {
+  const hookPath = defaultHookScriptPath();
+  const settings = {
+    hooks: {
+      PreToolUse: [
+        { matcher: "*", hooks: [{ type: "command", command: `bun ${JSON.stringify(hookPath)}`, timeout: 300 }] },
+      ],
+    },
+  };
+  const json = JSON.stringify(settings, null, 2);
+  try {
+    if (existsSync(AGENTIC_SETTINGS_FILE) && readFileSync(AGENTIC_SETTINGS_FILE, "utf8") === json) return;
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(AGENTIC_SETTINGS_FILE, json, { mode: 0o600 });
+  } catch (e) {
+    process.stderr.write(`poller: agentic settings write failed: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+/** Housekeep tick: render a recommendation-packet card for each pending approval
+ *  request the gate hook has written, and reap expired ones. Mirrors digestDispatch. */
+function approvalDispatch(): void {
+  let reqs: ApprovalRequest[];
+  try { reqs = listRequests(APPROVALS_DIR); } catch { return; }
+  const now = Date.now();
+  for (const req of reqs) {
+    if (now > req.expiresAt) { approvalsSent.delete(req.id); cleanupApproval(APPROVALS_DIR, req.id); continue; }
+    if (req.status === "sent" || approvalsSent.has(req.id)) continue;
+    approvalsSent.add(req.id); // sync guard so the next 5s tick can't double-send
+    const threadIdNum = req.threadId === "dm" ? undefined : Number(req.threadId);
+    void sendInlineKeyboard(req.chatId, renderApprovalCard(req), approvalButtonRows(req.id), threadIdNum)
+      .then((res) => { if (res) markSent(APPROVALS_DIR, req.id); else approvalsSent.delete(req.id); })
+      .catch(() => { approvalsSent.delete(req.id); });
+  }
+}
+
+/** Spawn the gated agentic executor for `task` in `threadId`'s mount, streaming
+ *  progress back to the chat. Detached — never blocks the caller. */
+async function launchAgentic(threadId: string, chatId: number, task: string, dest: ChatAddress): Promise<void> {
+  if (agenticInFlight.has(threadId)) {
+    await reply(dest, "I'm still working on a task in this topic — let me finish this one first.");
+    return;
+  }
+  const key = threadId === "dm" ? "dm" : Number(threadId);
+  const mount = mountsCache.get(tgKey(key)) ?? mountsCache.get(tgKey("*"));
+  const mountPath = mount?.path ?? process.env.CLAUDE_CWD ?? process.cwd();
+
+  ensureAgenticSettings();
+  try {
+    mkdirSync(APPROVALS_DIR, { recursive: true, mode: 0o700 });
+    mkdirSync(AGENTIC_SESSIONS_DIR, { recursive: true, mode: 0o700 });
+    mkdirSync(AGENTIC_LOG_DIR, { recursive: true, mode: 0o700 });
+  } catch { /* best effort */ }
+
+  // Per-topic session UUID for --resume continuity (first run --session-id creates it).
+  const sessionFile = join(AGENTIC_SESSIONS_DIR, threadId);
+  let sessionUuid: string;
+  let resumeExisting: boolean;
+  try {
+    sessionUuid = readFileSync(sessionFile, "utf8").trim();
+    if (!sessionUuid) throw new Error("empty");
+    resumeExisting = true;
+  } catch {
+    sessionUuid = randomUUID();
+    resumeExisting = false;
+    try { writeFileSync(sessionFile, sessionUuid + "\n", { mode: 0o600 }); } catch { /* continue */ }
+  }
+
+  agenticInFlight.add(threadId);
+  await reply(dest, "🤖 On it — I'll handle the safe steps myself and ask before anything risky.");
+  process.stdout.write(`[${new Date().toISOString()}] agentic dispatch: thread=${threadId} mount=${mountPath} task="${task.slice(0, 80)}"\n`);
+
+  void (async () => {
+    try {
+      const result = await runAgentic({
+        mountPath,
+        threadId,
+        chatId,
+        task,
+        approvalsDir: APPROVALS_DIR,
+        settingsPath: AGENTIC_SETTINGS_FILE,
+        sessionUuid,
+        resumeExisting,
+        logFile: join(AGENTIC_LOG_DIR, `${threadId}.jsonl`),
+        onText: (t) => { void reply(dest, t); },
+      });
+      process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
+      if (result.status === "error") await reply(dest, `⚠️ Agentic run failed: ${result.errorMessage ?? "unknown error"}`);
+      else if (result.status === "timeout") await reply(dest, "⏱ Agentic run hit its time budget and stopped.");
+      // "done": the final summary already streamed via onText.
+    } catch (e) {
+      await reply(dest, `⚠️ Agentic run crashed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      agenticInFlight.delete(threadId);
+    }
+  })();
+}
+
+async function handleDo(ev: InboundMessageEvent, args: string): Promise<void> {
+  const dest = ev.address;
+  const task = args.trim();
+  if (!task) {
+    await reply(dest, "Usage: /do <task> — e.g. `/do triage the failing test and propose a fix`. I'll act on the reversible steps and ask before anything risky (push, merge, delete, send).");
+    return;
+  }
+  await launchAgentic(String(threadIdOf(ev)), dest.chatId, task, dest);
+}
+
 function digestDispatch(): void {
   // No paired chat → no place to deliver. Skip silently. (Tests construct
   // mountsCache directly so they don't hit this gate unless they want to.)
@@ -2372,23 +2567,44 @@ function digestDispatch(): void {
         //  - everything else (no-heartbeat-md, error, timeout, empty
         //    without sendOnEmpty): no ping. operator inspects via
         //    `cta digest log` / `cta digest doctor`.
-        const shouldSend = result.status === "sent"
-          || (result.status === "empty" && mount.digest?.sendOnEmpty === true);
-        if (shouldSend) {
-          const body = result.status === "sent" && result.digestText
-            ? result.digestText
-            : "Nothing actionable today.";
-          // Tag the message so it's distinguishable from interactive
-          // replies in Pager Watch and Telegram search.
-          const text = `📋 Daily digest\n\n${body}`;
-          const address: ChatAddress = {
-            channel: "telegram",
-            chatId,
-            threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
-          };
-          try { await reply(address, text); }
+        const address: ChatAddress = {
+          channel: "telegram",
+          chatId,
+          threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
+        };
+
+        // Proactive watch-and-act (option 2): if this mount has agentic enabled
+        // and the read-only check found something, hand the findings to the gated
+        // executor (auto-do reversible, ask before risky) instead of just
+        // reporting. Same engine as /do — the digest is the trigger here.
+        if (mount.agentic?.enabled === true && result.status === "sent" && result.digestText) {
+          const proactiveTask = [
+            "Proactive check for this project. Here's what today's read-only scan surfaced:",
+            "",
+            result.digestText,
+            "",
+            "Handle what you can safely on your own — reversible, in-project actions, just do them.",
+            "For anything risky or outward (push, merge, delete, send a message, spend), ask me first.",
+            "If nothing actually needs doing, say so in one short line.",
+          ].join("\n");
+          try { await launchAgentic(threadIdStr, chatId, proactiveTask, address); }
           catch (e) {
-            process.stderr.write(`poller: digest reply failed: ${e instanceof Error ? e.message : String(e)}\n`);
+            process.stderr.write(`poller: proactive agentic launch failed: ${e instanceof Error ? e.message : String(e)}\n`);
+          }
+        } else {
+          const shouldSend = result.status === "sent"
+            || (result.status === "empty" && mount.digest?.sendOnEmpty === true);
+          if (shouldSend) {
+            const body = result.status === "sent" && result.digestText
+              ? result.digestText
+              : "Nothing actionable today.";
+            // Tag the message so it's distinguishable from interactive
+            // replies in Pager Watch and Telegram search.
+            const text = `📋 Daily digest\n\n${body}`;
+            try { await reply(address, text); }
+            catch (e) {
+              process.stderr.write(`poller: digest reply failed: ${e instanceof Error ? e.message : String(e)}\n`);
+            }
           }
         }
       } catch (e) {
@@ -2491,6 +2707,9 @@ export async function main(): Promise<void> {
         // H2 daily digest scheduler — pure-logic shouldFire() per mount,
         // detached runHeartbeat on fire=true. Never blocks the tick.
         digestDispatch();
+        // Agentic approval cards — render pending requests the gate hook wrote,
+        // reap expired ones. Detached sends; never blocks the tick.
+        approvalDispatch();
         // Re-probe file access at most once a minute (FDA is granted rarely;
         // no need to readdir the canary every 5s tick).
         if (Date.now() - lastFileAccessProbe > 60_000) {

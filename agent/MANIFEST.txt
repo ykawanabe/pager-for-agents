@@ -42,6 +42,15 @@ poller/heartbeat-checks/heartbeat-log.ts	agent	644
 poller/heartbeat-checks/quiet-hours.ts	agent	644
 poller/heartbeat-checks/scheduler.ts	agent	644
 
+# Agentic 秘書 mode (gated executor + Approve/Edit/Reject round-trip). Production
+# .ts only; .test.ts stay in the repo. gate-hook.ts is spawned by claude as a
+# PreToolUse hook.
+poller/agentic/autonomy-policy.ts	agent	644
+poller/agentic/approval-store.ts	agent	644
+poller/agentic/gate-hook.ts	agent	644
+poller/agentic/agentic-runner.ts	agent	644
+poller/agentic/cards.ts	agent	644
+
 # Chat-channel adapters (ChatTransport migration). Platform-agnostic core
 # contract + per-platform wire adapters.
 channels/types.ts	agent	644

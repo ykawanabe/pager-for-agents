@@ -132,6 +132,17 @@ export interface DigestConfig {
   sendOnEmpty?: boolean;
 }
 
+/**
+ * Per-mount agentic 秘書 mode (proactive watch-and-act). Absent → off.
+ * When enabled alongside `digest`, the daily check's findings are handed to the
+ * gated agentic executor (auto-do reversible, ask before risky) instead of just
+ * being reported read-only. Additive v3 field — preserved by the forward-compat
+ * carrier on read, written verbatim on write (no schema-version bump).
+ */
+export interface AgenticConfig {
+  enabled: boolean;
+}
+
 export interface Mount {
   channel: Channel;
   thread_id: ThreadId;
@@ -142,6 +153,8 @@ export interface Mount {
   created_at: string;
   /** v3: per-mount digest config. Absent → disabled. */
   digest?: DigestConfig;
+  /** v3: per-mount agentic (proactive) config. Absent → disabled. */
+  agentic?: AgenticConfig;
   /**
    * Forward-compat carrier: any unknown per-mount field read from disk is
    * preserved here and written back verbatim. A future v4 field added by a
