@@ -2484,6 +2484,12 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
         onText: (t) => { void reply(dest, t); },
       });
       process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
+      // Self-heal: a --resume that hit a dead session (e.g. the mount's cwd
+      // changed) → drop the session pointer so the next run recreates it fresh.
+      if (result.status === "error" && resumeExisting
+          && (result.errorMessage ?? "").includes("No conversation found")) {
+        try { unlinkSync(join(AGENTIC_SESSIONS_DIR, threadId)); } catch { /* gone */ }
+      }
       if (result.status === "error") await reply(dest, `⚠️ Agentic run failed: ${result.errorMessage ?? "unknown error"}`);
       else if (result.status === "timeout") await reply(dest, "⏱ Agentic run hit its time budget and stopped.");
       // "done": the final summary already streamed via onText.
@@ -2570,12 +2576,12 @@ function digestDispatch(): void {
     } catch {
       sessionUuid = randomUUID();
       resumeExisting = false;
-      try {
-        mkdirSync(join(STATE_DIR, "heartbeat-sessions"), { recursive: true, mode: 0o700 });
-        writeFileSync(sessionFile, sessionUuid + "\n", { mode: 0o600 });
-      } catch (e) {
-        process.stderr.write(`poller: heartbeat-session write failed (continuing): ${e instanceof Error ? e.message : String(e)}\n`);
-      }
+      // Do NOT persist the UUID yet. runHeartbeat can short-circuit
+      // (no-heartbeat-md) BEFORE spawning claude — persisting here left a session
+      // file for a session claude never created, so the NEXT fire --resumed a
+      // non-existent session and errored "No conversation found with session ID".
+      // We write it only after the run confirms claude created it (post-run block
+      // below). 2026-06-10.
     }
 
     const startedAt = new Date().toISOString();
@@ -2611,6 +2617,23 @@ function digestDispatch(): void {
           });
         } catch (e) {
           process.stderr.write(`poller: digest log append failed: ${e instanceof Error ? e.message : String(e)}\n`);
+        }
+
+        // Persist the heartbeat session UUID only once claude actually
+        // created/used it (status sent/empty), so a pre-spawn short-circuit never
+        // leaves a dangling --resume target; and self-heal a stale pointer if a
+        // --resume hit a session that no longer exists.
+        try {
+          if ((result.status === "sent" || result.status === "empty") && !resumeExisting) {
+            mkdirSync(join(STATE_DIR, "heartbeat-sessions"), { recursive: true, mode: 0o700 });
+            writeFileSync(sessionFile, sessionUuid + "\n", { mode: 0o600 });
+          } else if (result.status === "error" && resumeExisting
+                     && (result.errorMessage ?? "").includes("No conversation found")) {
+            try { unlinkSync(sessionFile); } catch { /* already gone */ }
+            process.stdout.write(`[${new Date().toISOString()}] heartbeat: cleared stale session for ${threadIdStr} (recreate next fire)\n`);
+          }
+        } catch (e) {
+          process.stderr.write(`poller: heartbeat-session persist failed (continuing): ${e instanceof Error ? e.message : String(e)}\n`);
         }
 
         // Decide whether to deliver. Three branches:
