@@ -2461,7 +2461,7 @@ function approvalDispatch(): void {
 
 /** Spawn the gated agentic executor for `task` in `threadId`'s mount, streaming
  *  progress back to the chat. Detached — never blocks the caller. */
-async function launchAgentic(threadId: string, chatId: number, task: string, dest: ChatAddress, runOpts?: { systemPrompt?: string; model?: string; effort?: string; sessionKey?: string }): Promise<void> {
+async function launchAgentic(threadId: string, chatId: number, task: string, dest: ChatAddress, runOpts?: { systemPrompt?: string; model?: string; effort?: string; sessionKey?: string; notifyOnlyIf?: string; taskName?: string }): Promise<void> {
   if (agenticInFlight.has(threadId)) {
     await reply(dest, "I'm still working on a task in this topic — let me finish this one first.");
     return;
@@ -2497,7 +2497,14 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
   }
 
   agenticInFlight.add(threadId);
-  await reply(dest, "🤖 On it — I'll handle the safe steps myself and ask before anything risky.");
+  // Conditional-notify tasks must produce ZERO messages on a quiet day — so
+  // suppress the ack AND buffer the stream, delivering only if the final text
+  // carries the marker. Normal runs ack + stream live as before.
+  const notifyOnlyIf = runOpts?.notifyOnlyIf;
+  const taskName = runOpts?.taskName;
+  if (!notifyOnlyIf) {
+    await reply(dest, "🤖 On it — I'll handle the safe steps myself and ask before anything risky.");
+  }
   // Pin model/effort at dispatch time so a settings reload mid-run can't make
   // the result log misattribute the run. Per-task overrides win over globals.
   const model = runOpts?.model ?? agenticModel;
@@ -2505,10 +2512,8 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
   process.stdout.write(`[${new Date().toISOString()}] agentic dispatch: thread=${threadId} mount=${mountPath} model=${model ?? "default"} effort=${effort ?? "default"} task="${task.slice(0, 80)}"\n`);
 
   void (async () => {
-    // Track whether the run ever streamed text: a "done" run with zero output
-    // would otherwise leave only the "🤖 On it" ack — silence indistinguishable
-    // from a failed delivery. Guarantee a terse closing line instead.
     let streamedAny = false;
+    const buf: string[] = [];
     try {
       const result = await runAgentic({
         mountPath,
@@ -2523,7 +2528,8 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
         sessionUuid,
         resumeExisting,
         logFile: join(AGENTIC_LOG_DIR, `${sessionKey}.jsonl`),
-        onText: (t) => { streamedAny = true; void reply(dest, t); },
+        // Conditional → buffer (decide at end). Normal → stream live.
+        onText: (t) => { streamedAny = true; if (notifyOnlyIf) buf.push(t); else void reply(dest, t); },
       });
       process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} model=${model ?? "default"} effort=${effort ?? "default"} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
       // Self-heal: a --resume that hit a dead session (e.g. the mount's cwd
@@ -2532,12 +2538,25 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
           && (result.errorMessage ?? "").includes("No conversation found")) {
         try { unlinkSync(join(AGENTIC_SESSIONS_DIR, sessionKey)); } catch { /* gone */ }
       }
-      if (result.status === "error") await reply(dest, `⚠️ Agentic run failed: ${result.errorMessage ?? "unknown error"}`);
-      else if (result.status === "timeout") await reply(dest, "⏱ Agentic run hit its time budget and stopped.");
-      else if (!streamedAny) await reply(dest, "✅ Check-in done — nothing to report.");
-      // "done" with streamed text: the final summary already went out via onText.
+      let suppressed = false;
+      if (result.status === "error") {
+        await reply(dest, `⚠️ Agentic run failed: ${result.errorMessage ?? "unknown error"}`);
+      } else if (result.status === "timeout") {
+        await reply(dest, "⏱ Agentic run hit its time budget and stopped.");
+      } else if (notifyOnlyIf) {
+        // Deliver the buffered briefing only if it carries the marker; a quiet
+        // day stays silent (no ack was sent either).
+        const text = buf.join("");
+        if (text.includes(notifyOnlyIf)) await reply(dest, text);
+        else { suppressed = true; process.stdout.write(`[${new Date().toISOString()}] task notify suppressed: ${taskName ?? threadId} (no "${notifyOnlyIf}")\n`); }
+      } else if (!streamedAny) {
+        await reply(dest, "✅ Check-in done — nothing to report.");
+      }
+      // "done" with streamed text (non-conditional): already went out via onText.
+      if (taskName) recordTaskRun(taskName, result.status, suppressed);
     } catch (e) {
       await reply(dest, `⚠️ Agentic run crashed: ${e instanceof Error ? e.message : String(e)}`);
+      if (taskName) recordTaskRun(taskName, "crashed", false);
     } finally {
       agenticInFlight.delete(threadId);
     }
@@ -2573,7 +2592,8 @@ async function handleTask(ev: InboundMessageEvent, args: string): Promise<void> 
     const lines = tasksCache.map((t) => {
       const days = Array.isArray(t.days) ? t.days.join(",") : t.days;
       const src = t.checklist ? (t.checklist.split("/").pop() ?? "checklist") : "inline";
-      return `${t.enabled ? "🟢" : "⚪️"} ${t.name} — ${t.time} ${days} → ${String(t.topic)} (${src})`;
+      const last = formatLastRun(t.name);
+      return `${t.enabled ? "🟢" : "⚪️"} ${t.name} — ${t.time} ${days} → ${String(t.topic)} (${src})${last ? `\n   last: ${last}` : ""}`;
     });
     await reply(dest, ["Scheduled tasks:", ...lines, "", "Manage: /task run|on|off|rm <name>"].join("\n"));
     return;
@@ -2634,6 +2654,33 @@ function taskKey(name: string): string { return `task:${name}`; }
  *  tasks on one topic don't share --resume context; the topic-level
  *  agenticInFlight guard still serializes them at run time. */
 function taskSessionKey(name: string): string { return `task-${name}`; }
+
+// Last-run record per task: $STATE_DIR/task-runs/<name>.json = { at, status,
+// suppressed }. Cosmetic history for `cta task list` / the app — best-effort.
+const TASK_RUNS_DIR = join(STATE_DIR, "task-runs");
+function recordTaskRun(name: string, status: string, suppressed: boolean): void {
+  try {
+    mkdirSync(TASK_RUNS_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(join(TASK_RUNS_DIR, `${name}.json`),
+      `${JSON.stringify({ at: new Date().toISOString(), status, suppressed })}\n`, { mode: 0o600 });
+  } catch { /* history is cosmetic — never block a run on it */ }
+}
+
+/** Human one-liner for a task's last run (status icon + relative time), or ""
+ *  when it has never fired. Read by /task list. */
+function formatLastRun(name: string): string {
+  let rec: { at?: string; status?: string; suppressed?: boolean };
+  try { rec = JSON.parse(readFileSync(join(TASK_RUNS_DIR, `${name}.json`), "utf8")); }
+  catch { return ""; }
+  if (!rec.at) return "";
+  const icon = rec.status === "done" ? (rec.suppressed ? "🔕" : "✅")
+    : rec.status === "timeout" ? "⏱"
+    : "⚠️";
+  const ageMs = Date.now() - new Date(rec.at).getTime();
+  const mins = Math.round(ageMs / 60_000);
+  const ago = mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.round(mins / 60)}h ago` : `${Math.round(mins / 1440)}d ago`;
+  return `${icon} ${ago}${rec.suppressed ? " (quiet)" : ""}`;
+}
 
 // tasks.json hot-reload cache (mirrors refreshMountsIfChanged: mtime-gated,
 // parse failure keeps the last good cache).
@@ -2790,6 +2837,8 @@ function taskDispatch(): void {
       model: task.model,
       effort: task.effort,
       sessionKey: taskSessionKey(task.name),
+      notifyOnlyIf: typeof task.notifyOnlyIf === "string" ? task.notifyOnlyIf : undefined,
+      taskName: task.name,
     });
   }
 }
@@ -2833,11 +2882,14 @@ function processTaskRunFlags(): void {
         continue;
       }
       process.stdout.write(`[${new Date().toISOString()}] task run-now: task=${task.name} topic=${resolved.threadIdStr}\n`);
+      // Manual run-now ALWAYS delivers (the user asked for it) — no notifyOnlyIf
+      // suppression — but still records the run.
       void launchAgentic(resolved.threadIdStr, chatId, prompt, dest, {
         systemPrompt: DIGEST_ONLY_SYSTEM_PROMPT,
         model: task.model,
         effort: task.effort,
         sessionKey: taskSessionKey(task.name),
+        taskName: task.name,
       });
     }
   } finally {

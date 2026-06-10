@@ -935,6 +935,7 @@ private struct TasksTab: View {
     @State private var status: String? = nil
     @State private var showAddSheet = false
     @State private var refreshTimer: Timer? = nil
+    @State private var lastRuns: [String: String] = [:]
 
     fileprivate static let modelPresets: [(label: String, tag: String)] = [
         ("Default", ""), ("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku"),
@@ -1020,9 +1021,9 @@ private struct TasksTab: View {
         }
         .formStyle(.grouped)
         .sheet(isPresented: $showAddSheet) {
-            AddTaskSheet(mounts: realMounts, isGroup: isGroup) { name, time, days, checklist, prompt, topic, model, effort in
+            AddTaskSheet(mounts: realMounts, isGroup: isGroup) { name, time, days, checklist, prompt, topic, model, effort, notifyOnlyIf in
                 add(name: name, time: time, days: days, checklist: checklist, prompt: prompt,
-                    topic: topic, model: model, effort: effort)
+                    topic: topic, model: model, effort: effort, notifyOnlyIf: notifyOnlyIf)
             }
         }
         .onAppear {
@@ -1044,12 +1045,21 @@ private struct TasksTab: View {
                 set: { on in setEnabled(t.name, on) }
             )) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(t.name).font(.body)
+                    HStack(spacing: 4) {
+                        Text(t.name).font(.body)
+                        if t.notifyOnlyIf != nil {
+                            Image(systemName: "bell.badge").font(.caption2).foregroundStyle(.secondary)
+                                .help("Only notifies on a noteworthy day (notify-only-if)")
+                        }
+                    }
                     Text("\(t.time) · \(t.days.label) · \(topicLabel(t)) · \(sourceLabel(t))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if let last = lastRuns[t.name] {
+                        Text("last: \(last)").font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
             }
             Spacer()
@@ -1088,9 +1098,12 @@ private struct TasksTab: View {
                 let tz = CTAClient.digestTimezone() ?? ""
                 let m = CTAClient.agenticModel() ?? ""
                 let e = CTAClient.agenticEffort() ?? ""
+                var runs: [String: String] = [:]
+                for t in list { if let lr = CTAClient.taskLastRun(t.name) { runs[t.name] = lr } }
                 DispatchQueue.main.async {
                     tasks = list; mounts = ms; isGroup = group
                     timezone = tz; model = m; effort = e
+                    lastRuns = runs
                     error = nil
                 }
             } catch let e {
@@ -1100,12 +1113,12 @@ private struct TasksTab: View {
     }
 
     private func add(name: String, time: String, days: String, checklist: String?, prompt: String?,
-                     topic: String, model: String?, effort: String?) {
+                     topic: String, model: String?, effort: String?, notifyOnlyIf: String?) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try CTAClient.taskAdd(name: name, time: time, days: days,
                                           checklist: checklist, prompt: prompt, topic: topic,
-                                          model: model, effort: effort)
+                                          model: model, effort: effort, notifyOnlyIf: notifyOnlyIf)
                 DispatchQueue.main.async { reload() }
             } catch let e {
                 DispatchQueue.main.async { error = "Add failed: \(e.localizedDescription)" }
@@ -1185,7 +1198,7 @@ private struct AddTaskSheet: View {
     let isGroup: Bool
     let onAdd: (_ name: String, _ time: String, _ days: String,
                 _ checklist: String?, _ prompt: String?, _ topic: String,
-                _ model: String?, _ effort: String?) -> Void
+                _ model: String?, _ effort: String?, _ notifyOnlyIf: String?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var name: String = ""
@@ -1198,9 +1211,17 @@ private struct AddTaskSheet: View {
     @State private var topicSelection: String = "dm"
     @State private var modelChoice: String = ""       // "" = default (global)
     @State private var effortChoice: String = ""      // "" = default (global)
+    @State private var monthlyDay: Int = 1            // for daysChoice == "monthly"
+    @State private var everyN: Int = 3                // for daysChoice == "every"
+    @State private var notifyOnlyIf: String = ""      // "" = always notify
 
     private var effectiveDays: String {
-        daysChoice == "custom" ? customDays.trimmingCharacters(in: .whitespaces) : daysChoice
+        switch daysChoice {
+        case "custom": return customDays.trimmingCharacters(in: .whitespaces)
+        case "monthly": return "monthly:\(monthlyDay)"
+        case "every": return "every:\(everyN)"
+        default: return daysChoice
+        }
     }
     private var isValid: Bool {
         let nameOk = name.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]*$", options: .regularExpression) != nil
@@ -1224,11 +1245,17 @@ private struct AddTaskSheet: View {
                     Picker("Days", selection: $daysChoice) {
                         Text("Daily").tag("daily")
                         Text("Weekdays").tag("weekdays")
+                        Text("Monthly").tag("monthly")
+                        Text("Every N days").tag("every")
                         Text("Custom…").tag("custom")
                     }
                     if daysChoice == "custom" {
                         TextField("mon,wed,fri", text: $customDays)
                             .textFieldStyle(.roundedBorder)
+                    } else if daysChoice == "monthly" {
+                        Stepper("On day \(monthlyDay) of the month", value: $monthlyDay, in: 1...31)
+                    } else if daysChoice == "every" {
+                        Stepper("Every \(everyN) day\(everyN == 1 ? "" : "s")", value: $everyN, in: 1...365)
                     }
                     Picker("Run", selection: $sourceKind) {
                         Text("Checklist file").tag("checklist")
@@ -1258,10 +1285,15 @@ private struct AddTaskSheet: View {
                     Picker("Effort", selection: $effortChoice) {
                         ForEach(TasksTab.effortPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
                     }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Notify only if (optional)").font(.subheadline).foregroundStyle(.secondary)
+                        TextField("e.g. 🚨 — deliver only when the result contains this", text: $notifyOnlyIf)
+                            .textFieldStyle(.roundedBorder)
+                    }
                 } header: {
                     Text("New task")
                 } footer: {
-                    Text("The task fires an agentic run with the checklist/prompt as its ENTIRE job — keep it read-only + drafts so unattended runs never stall on approvals.")
+                    Text("The task fires an agentic run with the checklist/prompt as its ENTIRE job — keep it read-only + drafts so unattended runs never stall on approvals. \"Notify only if\" stays silent unless the result contains that marker (tell the checklist to emit it on a noteworthy day).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1279,7 +1311,8 @@ private struct AddTaskSheet: View {
                     let prompt = sourceKind == "prompt" ? promptText : nil
                     onAdd(name, TasksTab.hhmm(from: fireTime), effectiveDays, checklist, prompt,
                           topicSelection, modelChoice.isEmpty ? nil : modelChoice,
-                          effortChoice.isEmpty ? nil : effortChoice)
+                          effortChoice.isEmpty ? nil : effortChoice,
+                          notifyOnlyIf.isEmpty ? nil : notifyOnlyIf)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)

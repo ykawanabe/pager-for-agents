@@ -24,7 +24,7 @@
  */
 
 import { alreadyFiredToday, type HeartbeatState } from "./heartbeat-state";
-import { digestTimeReached, isInQuietHours, todayInTz, weekdayInTz, type QuietWindow } from "./quiet-hours";
+import { dayOfMonthInTz, digestTimeReached, isInQuietHours, todayInTz, weekdayInTz, type QuietWindow } from "./quiet-hours";
 
 export interface ShouldFireInput {
   /** Persisted scheduler state (output of readState). */
@@ -65,15 +65,63 @@ export type SkipReason =
 
 // ─── Scheduled tasks (proactive task scheduling) ─────────────────────────────
 
-/** Day spec for a scheduled task: every day, Mon-Fri, or an explicit list of
- *  lowercase short weekdays ("mon".."sun"). */
-export type TaskDays = "daily" | "weekdays" | readonly string[];
+/** Day spec for a scheduled task. Either an explicit weekday list, or one of
+ *  the string forms: "daily", "weekdays", "monthly:<1-31>", "every:<N days>". */
+export type TaskDays = string | readonly string[];
 
-/** Does `weekday` (lowercase short, from weekdayInTz) satisfy the spec? */
+/** Weekday-only matcher (daily / weekdays / explicit list). Kept separate so
+ *  monthly:/every: strings never reach `Array/String.includes(weekday)` — a
+ *  string like "monthly:15" would false-match .includes("mon"). */
 export function dayMatches(days: TaskDays, weekday: string): boolean {
   if (days === "daily") return true;
   if (days === "weekdays") return weekday !== "sat" && weekday !== "sun";
-  return days.includes(weekday);
+  if (Array.isArray(days)) return days.includes(weekday);
+  return false; // monthly:/every: string → not a weekday match
+}
+
+/** Unified "is the task scheduled to fire on this calendar date?" predicate.
+ *  Weekday specs + monthly:<day> are stateless; every:<N> needs
+ *  daysSinceLastFire (null = never fired ⇒ fire now). */
+export function taskScheduledOn(
+  days: TaskDays,
+  ctx: { weekday: string; dayOfMonth: number; daysSinceLastFire: number | null },
+): boolean {
+  if (typeof days === "string") {
+    const monthly = /^monthly:(\d{1,2})$/.exec(days);
+    if (monthly) return ctx.dayOfMonth === parseInt(monthly[1], 10);
+    const every = /^every:(\d{1,3})$/.exec(days);
+    if (every) {
+      const n = parseInt(every[1], 10);
+      return ctx.daysSinceLastFire === null || ctx.daysSinceLastFire >= n;
+    }
+  }
+  return dayMatches(days, ctx.weekday);
+}
+
+/** Whole-day difference a−b for two YYYY-MM-DD strings (both computed in the
+ *  same tz, so UTC-midnight math is exact). */
+function ymdDiffDays(a: string, b: string): number {
+  const [ay, am, ad] = a.split("-").map(Number);
+  const [by, bm, bd] = b.split("-").map(Number);
+  return Math.round((Date.UTC(ay, am - 1, ad) - Date.UTC(by, bm - 1, bd)) / 86_400_000);
+}
+
+/** Most recent fire strictly before `beforeYmd` for this task key, or null. */
+function lastFiredBefore(state: HeartbeatState, taskKey: string, beforeYmd: string): string | null {
+  const prefix = `${taskKey}:`;
+  let max: string | null = null;
+  for (const k of Object.keys(state.firedToday)) {
+    if (!k.startsWith(prefix)) continue;
+    const ymd = k.slice(prefix.length);
+    if (ymd < beforeYmd && (max === null || ymd > max)) max = ymd;
+  }
+  return max;
+}
+
+/** daysSinceLastFire context for taskScheduledOn at `todayYmd`. */
+function daysSinceLastFire(state: HeartbeatState, taskKey: string, todayYmd: string): number | null {
+  const last = lastFiredBefore(state, taskKey, todayYmd);
+  return last === null ? null : ymdDiffDays(todayYmd, last);
 }
 
 export interface ShouldFireTaskInput {
@@ -110,7 +158,12 @@ export function shouldFireTask(input: ShouldFireTaskInput): ShouldFireTaskDecisi
   if (alreadyFiredToday(input.state, input.taskKey, ymd)) {
     return { fire: false, reason: "already-fired" };
   }
-  if (!dayMatches(input.days, weekdayInTz(input.now, input.timezone))) {
+  const scheduled = taskScheduledOn(input.days, {
+    weekday: weekdayInTz(input.now, input.timezone),
+    dayOfMonth: dayOfMonthInTz(input.now, input.timezone),
+    daysSinceLastFire: daysSinceLastFire(input.state, input.taskKey, ymd),
+  });
+  if (!scheduled) {
     return { fire: false, reason: "day-mismatch" };
   }
   if (!digestTimeReached(input.now, input.time, input.timezone)) {
@@ -141,11 +194,20 @@ export interface MissedTaskFireInput {
  *  the correctly-skipped Sunday). Same older-key guard against first-day
  *  false alarms. */
 export function detectMissedTaskFire(input: MissedTaskFireInput): string | null {
+  // every:<N> is a relative cadence — there is no fixed "missed day" to alert
+  // about (a skipped day just shifts the next fire). Only fixed-date schedules
+  // (daily/weekdays/list/monthly) have a missable day.
+  if (typeof input.days === "string" && input.days.startsWith("every:")) return null;
   const todayYmd = todayInTz(input.now, input.timezone);
   const yesterday = new Date(input.now.getTime() - 86_400_000);
   const yYmd = todayInTz(yesterday, input.timezone);
   if (yYmd === todayYmd) return null; // degenerate tz math — bail safe
-  if (!dayMatches(input.days, weekdayInTz(yesterday, input.timezone))) return null;
+  const scheduledYesterday = taskScheduledOn(input.days, {
+    weekday: weekdayInTz(yesterday, input.timezone),
+    dayOfMonth: dayOfMonthInTz(yesterday, input.timezone),
+    daysSinceLastFire: null, // only consulted by every:, which returned above
+  });
+  if (!scheduledYesterday) return null;
   if (alreadyFiredToday(input.state, input.taskKey, yYmd)) return null;
   const prefix = `${input.taskKey}:`;
   const hasOlderFire = Object.keys(input.state.firedToday).some(

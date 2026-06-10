@@ -34,6 +34,16 @@ describe("parseDays", () => {
   test("explicit list, case-insensitive", () => {
     expect(parseDays("Mon,wed,FRI")).toEqual(["mon", "wed", "fri"]);
   });
+  test("monthly:<day> normalizes and bounds-checks", () => {
+    expect(parseDays("monthly:15")).toBe("monthly:15");
+    expect(parseDays("Monthly:01")).toBe("monthly:1");
+    expect(() => parseDays("monthly:0")).toThrow();
+    expect(() => parseDays("monthly:32")).toThrow();
+  });
+  test("every:<N> normalizes and bounds-checks", () => {
+    expect(parseDays("every:3")).toBe("every:3");
+    expect(() => parseDays("every:0")).toThrow();
+  });
   test("rejects unknown days", () => {
     expect(() => parseDays("mon,funday")).toThrow();
   });

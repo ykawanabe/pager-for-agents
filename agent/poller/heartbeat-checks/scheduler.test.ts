@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  dayMatches, detectMissedFire, detectMissedTaskFire, shouldFire, shouldFireTask,
+  dayMatches, detectMissedFire, detectMissedTaskFire, shouldFire, shouldFireTask, taskScheduledOn,
   type ShouldFireInput, type ShouldFireTaskInput,
 } from "./scheduler";
 import { markFiredToday, type HeartbeatState } from "./heartbeat-state";
@@ -41,6 +41,58 @@ describe("dayMatches", () => {
   test("explicit list", () => {
     expect(dayMatches(["mon", "wed"], "wed")).toBe(true);
     expect(dayMatches(["mon", "wed"], "tue")).toBe(false);
+  });
+});
+
+describe("taskScheduledOn — monthly + every specs", () => {
+  const ctx = (o: Partial<{ weekday: string; dayOfMonth: number; daysSinceLastFire: number | null }> = {}) =>
+    ({ weekday: "mon", dayOfMonth: 15, daysSinceLastFire: null, ...o });
+  test("monthly:15 fires only on the 15th", () => {
+    expect(taskScheduledOn("monthly:15", ctx({ dayOfMonth: 15 }))).toBe(true);
+    expect(taskScheduledOn("monthly:15", ctx({ dayOfMonth: 14 }))).toBe(false);
+  });
+  test("monthly never false-matches a weekday substring", () => {
+    // "monthly:15".includes("mon") would be true — the bug we guard against.
+    expect(taskScheduledOn("monthly:1", ctx({ dayOfMonth: 2, weekday: "mon" }))).toBe(false);
+  });
+  test("every:3 fires when >=3 days since last, or never fired", () => {
+    expect(taskScheduledOn("every:3", ctx({ daysSinceLastFire: null }))).toBe(true);
+    expect(taskScheduledOn("every:3", ctx({ daysSinceLastFire: 3 }))).toBe(true);
+    expect(taskScheduledOn("every:3", ctx({ daysSinceLastFire: 2 }))).toBe(false);
+  });
+  test("weekday specs still work through taskScheduledOn", () => {
+    expect(taskScheduledOn("weekdays", ctx({ weekday: "sat" }))).toBe(false);
+    expect(taskScheduledOn(["mon", "wed"], ctx({ weekday: "wed" }))).toBe(true);
+  });
+});
+
+describe("shouldFireTask — monthly/every integration", () => {
+  const base = {
+    quietHours: null, timezone: TZ, isInFlight: () => false, isMidTurn: () => false,
+  } as const;
+  test("monthly:15 fires on the 15th past time (09:30 JST)", () => {
+    const r = shouldFireTask({ ...base, state: EMPTY, taskKey: "task:m", time: "09:00", days: "monthly:15", now: utc(2026, 6, 15, 0, 30) });
+    expect(r.fire).toBe(true);
+  });
+  test("monthly:15 day-mismatch on the 16th", () => {
+    const r = shouldFireTask({ ...base, state: EMPTY, taskKey: "task:m", time: "09:00", days: "monthly:15", now: utc(2026, 6, 16, 0, 30) });
+    expect(r.fire).toBe(false);
+    if (!r.fire) expect(r.reason).toBe("day-mismatch");
+  });
+  test("every:3 defers when only 1 day since last fire", () => {
+    const state = markFiredToday(EMPTY, "task:e", "2026-06-14");
+    const r = shouldFireTask({ ...base, state, taskKey: "task:e", time: "09:00", days: "every:3", now: utc(2026, 6, 15, 0, 30) });
+    expect(r.fire).toBe(false);
+    if (!r.fire) expect(r.reason).toBe("day-mismatch");
+  });
+  test("every:3 fires when 3 days since last fire", () => {
+    const state = markFiredToday(EMPTY, "task:e", "2026-06-12");
+    const r = shouldFireTask({ ...base, state, taskKey: "task:e", time: "09:00", days: "every:3", now: utc(2026, 6, 15, 0, 30) });
+    expect(r.fire).toBe(true);
+  });
+  test("detectMissedTaskFire null for every: specs (relative cadence)", () => {
+    const state = markFiredToday(EMPTY, "task:e", "2026-06-10");
+    expect(detectMissedTaskFire({ state, taskKey: "task:e", days: "every:3", timezone: TZ, now: utc(2026, 6, 16, 0, 30) })).toBe(null);
   });
 });
 

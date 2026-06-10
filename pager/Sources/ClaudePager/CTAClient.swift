@@ -285,10 +285,11 @@ enum CTAClient {
         let topic: MountJSON.ThreadIdValue
         let model: String?
         let effort: String?
+        let notifyOnlyIf: String?
         let enabled: Bool
 
-        /// "daily"/"weekdays" or an explicit weekday list — same
-        /// string-or-other tolerant decode shape as ThreadIdValue.
+        /// "daily"/"weekdays"/"monthly:<N>"/"every:<N>" or an explicit weekday
+        /// list — same string-or-other tolerant decode shape as ThreadIdValue.
         enum DaysValue: Decodable, Equatable {
             case preset(String)
             case list([String])
@@ -299,12 +300,31 @@ enum CTAClient {
             }
             var label: String {
                 switch self {
-                case .preset(let s): return s == "weekdays" ? "Weekdays" : "Daily"
+                case .preset(let s):
+                    if s == "weekdays" { return "Weekdays" }
+                    if s.hasPrefix("monthly:") { return "Monthly (day \(s.dropFirst(8)))" }
+                    if s.hasPrefix("every:") { return "Every \(s.dropFirst(6))d" }
+                    return "Daily"
                 case .list(let l):
                     return l.map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: ", ")
                 }
             }
         }
+    }
+
+    /// Last-run summary for a task (icon + relative age), read from
+    /// $STATE_DIR/task-runs/<name>.json. nil when never run.
+    static func taskLastRun(_ name: String) -> String? {
+        struct Rec: Decodable { let at: String; let status: String?; let suppressed: Bool? }
+        let path = "\(stateDir)/task-runs/\(name).json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let r = try? JSONDecoder().decode(Rec.self, from: data),
+              let at = ISO8601DateFormatter().date(from: r.at) else { return nil }
+        let icon = r.status == "done" ? (r.suppressed == true ? "🔕" : "✅")
+                 : r.status == "timeout" ? "⏱" : "⚠️"
+        let secs = Date().timeIntervalSince(at)
+        let ago = secs < 3600 ? "\(Int(secs/60))m" : secs < 86400 ? "\(Int(secs/3600))h" : "\(Int(secs/86400))d"
+        return "\(icon) \(ago) ago"
     }
 
     private struct TasksListJSON: Decodable {
@@ -321,12 +341,13 @@ enum CTAClient {
     @discardableResult
     static func taskAdd(name: String, time: String, days: String, checklist: String?,
                         prompt: String?, topic: String, model: String? = nil,
-                        effort: String? = nil) throws -> String {
+                        effort: String? = nil, notifyOnlyIf: String? = nil) throws -> String {
         var args = ["task", "add", name, "--time", time, "--days", days, "--topic", topic]
         if let c = checklist, !c.isEmpty { args += ["--checklist", c] }
         if let p = prompt, !p.isEmpty { args += ["--prompt", p] }
         if let m = model, !m.isEmpty { args += ["--model", m] }
         if let e = effort, !e.isEmpty { args += ["--effort", e] }
+        if let n = notifyOnlyIf, !n.isEmpty { args += ["--notify-only-if", n] }
         let data = try run(args: args)
         return String(data: data, encoding: .utf8) ?? ""
     }

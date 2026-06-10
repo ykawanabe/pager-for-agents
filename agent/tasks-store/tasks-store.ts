@@ -71,6 +71,11 @@ export interface ScheduledTask {
   /** Per-task model/effort override; absent → global agenticModel/agenticEffort. */
   model?: string;
   effort?: string;
+  /** Conditional delivery: when set, the run's final summary is delivered to
+   *  Telegram ONLY if it contains this substring (the task's checklist tells
+   *  the agent to include it on a noteworthy day). Absent → always deliver,
+   *  streamed live. Kills "nothing changed" daily noise. */
+  notifyOnlyIf?: string;
   enabled: boolean;
   created_at: string;
   // Forward-compat carrier — unknown fields round-trip untouched.
@@ -110,10 +115,22 @@ export function parseDays(raw: string): TaskDaysSpec {
   const s = raw.trim().toLowerCase();
   if (s === "" || s === "daily") return "daily";
   if (s === "weekdays") return "weekdays";
+  const monthly = /^monthly:(\d{1,2})$/.exec(s);
+  if (monthly) {
+    const d = parseInt(monthly[1], 10);
+    if (d < 1 || d > 31) throw new Error(`invalid days ${JSON.stringify(raw)} — monthly day must be 1-31`);
+    return `monthly:${d}`;
+  }
+  const every = /^every:(\d{1,3})$/.exec(s);
+  if (every) {
+    const n = parseInt(every[1], 10);
+    if (n < 1) throw new Error(`invalid days ${JSON.stringify(raw)} — every:<N> needs N>=1`);
+    return `every:${n}`;
+  }
   const days = s.split(",").map((d) => d.trim()).filter(Boolean);
   for (const d of days) {
     if (!WEEKDAYS.has(d)) {
-      throw new Error(`invalid days ${JSON.stringify(raw)} — expected daily | weekdays | comma list of mon..sun`);
+      throw new Error(`invalid days ${JSON.stringify(raw)} — expected daily | weekdays | mon..sun list | monthly:<1-31> | every:<N>`);
     }
   }
   if (days.length === 0) throw new Error(`invalid days ${JSON.stringify(raw)}`);
@@ -220,6 +237,7 @@ export async function addTask(args: {
   topic: TaskTopic;
   model?: string;
   effort?: string;
+  notifyOnlyIf?: string;
 }): Promise<ScheduledTask> {
   if (!!args.checklist === !!args.prompt) {
     throw new Error("add: exactly one of --checklist or --prompt is required");
@@ -238,6 +256,7 @@ export async function addTask(args: {
       topic: args.topic,
       ...(args.model ? { model: args.model } : {}),
       ...(args.effort ? { effort: args.effort } : {}),
+      ...(args.notifyOnlyIf ? { notifyOnlyIf: args.notifyOnlyIf } : {}),
       enabled: true,
       created_at: new Date().toISOString(),
     };
@@ -304,9 +323,9 @@ async function main(): Promise<void> {
     }
     case "add": {
       // Args: <name> --time HH:MM [--days spec] (--checklist path | --prompt text)
-      //       [--topic dm|<id>] [--model m] [--effort e]
+      //       [--topic dm|<id>] [--model m] [--effort e] [--notify-only-if str]
       try {
-        let args = rest.filter((a) => true);
+        let args = rest.slice();
         const name = parseTaskName(args[0] ?? "");
         args = args.slice(1);
         const [time, a1] = takeFlag(args, "--time");
@@ -315,7 +334,8 @@ async function main(): Promise<void> {
         const [prompt, a4] = takeFlag(a3, "--prompt");
         const [topic, a5] = takeFlag(a4, "--topic");
         const [model, a6] = takeFlag(a5, "--model");
-        const [effort, leftover] = takeFlag(a6, "--effort");
+        const [effort, a7] = takeFlag(a6, "--effort");
+        const [notifyOnlyIf, leftover] = takeFlag(a7, "--notify-only-if");
         if (leftover.length > 0) bail(`add: unrecognized args: ${leftover.join(" ")}`);
         if (!time) bail("add: --time HH:MM is required");
         const task = await addTask({
@@ -327,6 +347,7 @@ async function main(): Promise<void> {
           topic: parseTopic(topic ?? "dm"),
           model,
           effort,
+          notifyOnlyIf,
         });
         process.stdout.write(`${JSON.stringify(task)}\n`);
       } catch (e) {

@@ -58,6 +58,13 @@ export function weekdayInTz(now: Date, tz: string): string {
   }
 }
 
+/** Day-of-month (1-31) for `now` in the given IANA tz. Used by monthly task
+ *  schedules. Derived from todayInTz so the tz + UTC-fallback semantics stay
+ *  identical and the day can't disagree with the ymd across a boundary. */
+export function dayOfMonthInTz(now: Date, tz: string): number {
+  return parseInt(todayInTz(now, tz).slice(8, 10), 10);
+}
+
 /** Extract minute-of-day (0-1439) for `now` in the given IANA tz. */
 export function minuteOfDayInTz(now: Date, tz: string): number {
   try {

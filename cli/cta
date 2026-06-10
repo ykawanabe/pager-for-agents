@@ -1417,18 +1417,32 @@ cmd_task() {
       if [[ "${1:-}" == "--json" ]]; then
         bun run "$store" list
       else
-        bun run "$store" list | python3 -c '
-import json, sys
+        bun run "$store" list | TASK_RUNS_DIR="$STATE_DIR/task-runs" python3 -c '
+import json, sys, os, datetime
 tasks = json.load(sys.stdin).get("tasks", [])
+runs = os.environ.get("TASK_RUNS_DIR", "")
 if not tasks:
     print("(no scheduled tasks — add one: cta task add <name> --time HH:MM --checklist <md>)")
+def last_run(name):
+    try:
+        with open(os.path.join(runs, name + ".json")) as f:
+            r = json.load(f)
+        at = datetime.datetime.fromisoformat(r["at"].replace("Z", "+00:00"))
+        secs = (datetime.datetime.now(datetime.timezone.utc) - at).total_seconds()
+        ago = ("%dm" % (secs//60)) if secs < 3600 else ("%dh" % (secs//3600)) if secs < 86400 else ("%dd" % (secs//86400))
+        icon = {"done": "OK", "timeout": "TIMEOUT"}.get(r.get("status"), r.get("status","?").upper())
+        if r.get("status") == "done" and r.get("suppressed"): icon = "QUIET"
+        return "  last:%s %s ago" % (icon, ago)
+    except Exception:
+        return ""
 for t in tasks:
     days = t.get("days", "daily")
     if isinstance(days, list):
         days = ",".join(days)
     what = t.get("checklist") or (t.get("prompt") or "")[:48]
     state = "on " if t.get("enabled", True) else "OFF"
-    print("[%s] %-24s %s  %-9s topic=%-5s %s" % (state, t.get("name","?"), t.get("time","?"), days, t.get("topic"), what))
+    notify = " notify-if=%s" % t["notifyOnlyIf"] if t.get("notifyOnlyIf") else ""
+    print("[%s] %-22s %s  %-11s topic=%-5s %s%s%s" % (state, t.get("name","?"), t.get("time","?"), days, t.get("topic"), what, notify, last_run(t.get("name",""))))
 '
       fi
       ;;
@@ -1440,6 +1454,9 @@ for t in tasks:
         return 1
       fi
       bun run "$store" add "$name" "$@"
+      ;;
+    template)
+      _task_template "$@"
       ;;
     rm|remove)
       bun run "$store" remove "${1:-}"
@@ -1474,10 +1491,62 @@ for t in tasks:
       fi
       ;;
     *)
-      echo "Usage: cta task <list [--json] | add <name> … | rm <name> | on <name> | off <name> | run <name>>" >&2
+      echo "Usage: cta task <list [--json] | add <name> … | template <kind> … | rm <name> | on <name> | off <name> | run <name>>" >&2
       return 1
       ;;
   esac
+}
+
+# `cta task template <kind> <name> <target> [--time HH:MM] [--topic dm] [--days spec]`
+# Scaffolds a ready-to-edit checklist .md in $STATE_DIR/task-checklists/ and
+# registers the task in one shot. Kinds: watch-url, watch-x. Watch templates
+# default to notify-only-if=🚨 so quiet days stay silent.
+_task_template() {
+  local kind="${1:-}" name="${2:-}" target="${3:-}"
+  shift 3 2>/dev/null || true
+  if [[ -z "$kind" || -z "$name" || -z "$target" ]]; then
+    echo "Usage: cta task template <watch-url|watch-x> <name> <url-or-handle> [--time HH:MM] [--topic dm|<id>] [--days spec]" >&2
+    return 1
+  fi
+  local time="08:00" topic="dm" days="daily"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --time) time="${2:-}"; shift 2 ;;
+      --topic) topic="${2:-}"; shift 2 ;;
+      --days) days="${2:-}"; shift 2 ;;
+      *) echo "template: unknown arg $1" >&2; return 1 ;;
+    esac
+  done
+  local dir="$STATE_DIR/task-checklists"
+  mkdir -p "$dir"; chmod 700 "$dir" 2>/dev/null || true
+  local md="$dir/$name.md"
+  if [[ -e "$md" ]]; then echo "checklist already exists: $md (remove it or pick another name)" >&2; return 1; fi
+  local url="$target" label="$target"
+  case "$kind" in
+    watch-x) url="https://x.com/${target#@}"; label="@${target#@}" ;;
+    watch-url) : ;;
+    *) echo "template: unknown kind '$kind' (watch-url | watch-x)" >&2; return 1 ;;
+  esac
+  cat > "$md" <<EOF
+# Watch: $label ($name)
+
+Monitor $label for updates. Self-contained — work only from this file. Be terse.
+
+## ⚠️ UNATTENDED — never block on approval
+- No shell metacharacters (no pipe / redirect / \$() / parens / 2>&1). One simple command per Bash call. Today's date = \`date +%F\`.
+- Browser is READ-ONLY: \`browser_navigate\` + \`browser_snapshot\` (+ \`browser_wait_for\`) only. No click / type / login.
+- If a step would need approval, write "(skipped)" and move on.
+
+## What to do
+1. Read $url. WebFetch first; if it 402s / needs JS (e.g. x.com), use playwright \`browser_navigate\` → $url → \`browser_snapshot\`.
+2. Compare against what you recorded last time in \`$dir/${name}-log.md\` (Read it first; create it on the first run).
+3. Record the result with the Write/Edit tool:
+   - **No change** → append "\$(date +%F) no change" to that log. Stay quiet (this task only notifies on 🚨).
+   - **Change detected** → append the detail to the log AND put **🚨** in your Telegram summary with what changed + the source URL.
+EOF
+  echo "wrote checklist: $md"
+  bun run "$(_tasks_store_path)" add "$name" --time "$time" --days "$days" --checklist "$md" --topic "$topic" --notify-only-if "🚨" \
+    && echo "registered task '$name' (notify-only-if=🚨; edit $md to tune)"
 }
 
 _watch_render_path() {
@@ -2394,7 +2463,8 @@ Usage:
   cta config agentic-model <m>    Pin the agentic runner's model (opus|sonnet|haiku|id; 'off' = claude default)
   cta config agentic-effort <e>   Pin the agentic runner's reasoning effort (low|medium|high|xhigh|max; 'off' = default)
   cta task list [--json]          List scheduled tasks (proactive agentic runs, each with own time/days/topic)
-  cta task add <name> --time HH:MM [--days d] (--checklist <md> | --prompt <t>) [--topic dm|<id>] [--model m] [--effort e]
+  cta task add <name> --time HH:MM [--days daily|weekdays|mon,wed|monthly:15|every:3] (--checklist <md> | --prompt <t>) [--topic dm|<id>] [--model m] [--effort e] [--notify-only-if <str>]
+  cta task template <watch-url|watch-x> <name> <url-or-@handle> [--time HH:MM] [--topic dm] [--days spec]   Scaffold a watch checklist + task
   cta task rm|on|off <name>       Remove / enable / disable a scheduled task
   cta task run <name>             Fire a task NOW (touch-flag; doesn't consume today's scheduled fire)
   cta digest <thread> [on|off|init]
