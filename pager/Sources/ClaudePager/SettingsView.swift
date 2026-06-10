@@ -360,6 +360,7 @@ private struct PagerTab: View {
 
 private struct TelegramTab: View {
     @ObservedObject var config: TelegramConfig
+    @State private var authorizedUsers: [String] = []
 
     var body: some View {
         Form {
@@ -402,18 +403,40 @@ private struct TelegramTab: View {
 
             Section {
                 LabeledContent("Authorized user") {
-                    Text("Set when you /pair")
-                        .foregroundStyle(.secondary)
+                    if authorizedUsers.isEmpty {
+                        Text("Not set — pair from Telegram")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(authorizedUsers.joined(separator: ", "))
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                    }
                 }
             } header: {
                 Text("Access")
             } footer: {
-                Text("The bot only responds to the account you paired with (see the Pairing tab). To hand control to another account, unpair and pair again from that account.")
+                Text("The Telegram user ID(s) allowed to talk to the bot (the allowlist in access.json — set automatically when you /pair). To hand control to another account, unpair and pair again from that account.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+        .onAppear { loadAllowFrom() }
+    }
+
+    /// Read the allowlist straight from access.json (same canonical path the
+    /// model writes). Display-only — mutations stay with /pair.
+    private func loadAllowFrom() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let path = NSHomeDirectory() + "/.claude/channels/telegram/access.json"
+            var users: [String] = []
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let raw = json["allowFrom"] as? [Any] {
+                users = raw.map { String(describing: $0) }
+            }
+            DispatchQueue.main.async { authorizedUsers = users }
+        }
     }
 }
 
@@ -435,15 +458,18 @@ private struct PairingTab: View {
         Form {
             Section {
                 if let p = paired {
-                    LabeledContent("Chat ID") { Text(String(p.chatId)).monospacedDigit() }
-                    LabeledContent("User ID") { Text(String(p.userId)).monospacedDigit() }
+                    LabeledContent("Chat") {
+                        VStack(alignment: .trailing, spacing: 1) {
+                            Text(p.chatId < 0 ? "Group chat" : "Direct chat")
+                            Text(String(p.chatId))
+                                .monospacedDigit()
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    LabeledContent("User ID") { Text(String(p.userId)).monospacedDigit().textSelection(.enabled) }
                     LabeledContent("Paired at") { Text(p.pairedAt).foregroundStyle(.secondary).font(.caption) }
-                    Button("Unpair (clears mounts)", role: .destructive) {
-                        runAsync { _ = try CTAClient.unpair(keepMounts: false); reload() }
-                    }
-                    Button("Unpair (keep mounts)") {
-                        runAsync { _ = try CTAClient.unpair(keepMounts: true); reload() }
-                    }
                 } else {
                     LabeledContent("Status") {
                         Label("Not paired", systemImage: "exclamationmark.triangle")
@@ -453,7 +479,7 @@ private struct PairingTab: View {
             } header: {
                 Text("Current pairing")
             } footer: {
-                Text("Switching chats: from the paired user account, send `/pair` (no code needed) in the chat you want to claim. The bot moves there instantly.")
+                Text("Negative chat IDs are normal — Telegram uses them for group chats. Switching chats: from the paired user account, send `/pair` (no code needed) in the chat you want to claim. The bot moves there instantly.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -489,6 +515,26 @@ private struct PairingTab: View {
                 Text("First-time pairing: run nothing here — just add the bot to a chat and it'll tell you to send `/pair YOUR-CODE` back. The code persists until consumed by a successful pair.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if paired != nil {
+                Section {
+                    HStack {
+                        Button("Unpair (keep projects)") {
+                            runAsync { _ = try CTAClient.unpair(keepMounts: true); reload() }
+                        }
+                        Spacer()
+                        Button("Unpair & clear projects", role: .destructive) {
+                            runAsync { _ = try CTAClient.unpair(keepMounts: false); reload() }
+                        }
+                    }
+                } header: {
+                    Text("Unpair")
+                } footer: {
+                    Text("Releases the chat so another account can claim the bot. \"Clear projects\" also removes every topic ↔ folder binding.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if let s = status {
@@ -546,31 +592,12 @@ private struct MountsTab: View {
     @State private var knownTopics: [(threadId: Int, name: String)] = []
     @State private var isGroup: Bool = false
     @State private var loadError: String? = nil
-    @State private var newThreadId: String = ""
-    @State private var newPath: String = ""
-    @State private var newLabel: String = ""
     @State private var refreshTimer: Timer? = nil
     @State private var actionError: String? = nil
     @State private var showHelp: Bool = false
-
-    /// Picker selection. The custom sentinel (MountsPresentation.customSentinel)
-    /// swaps the dropdown for a free-text field — covers topics the bot hasn't
-    /// observed yet (Telegram can't enumerate topics created before it joined).
-    @State private var threadSelection: String = ""
-
-    /// Picker options, derived purely from cached @State (no disk I/O at render).
-    private var threadOptions: [MountsPresentation.ThreadOption] {
-        MountsPresentation.threadOptions(
-            mountedIds: Set(mounts.map { $0.threadId.stringValue }),
-            knownTopics: knownTopics,
-            isGroup: isGroup
-        )
-    }
-    private var effectiveNewThreadId: String {
-        threadSelection == MountsPresentation.customSentinel || threadSelection.isEmpty
-            ? newThreadId.trimmingCharacters(in: .whitespaces)
-            : threadSelection
-    }
+    /// "Add a project" lives in its own sheet (a cramped inline form didn't
+    /// fit this tab) — this gates it.
+    @State private var showAddSheet: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -639,58 +666,32 @@ private struct MountsTab: View {
                 }
 
                 Section {
-                    // Stacked vertical layout so each input gets the full row
-                    // width (LabeledContent's split squeezes the path + button).
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Topic").font(.subheadline).foregroundStyle(.secondary)
-                        Picker("", selection: $threadSelection) {
-                            ForEach(threadOptions) { opt in
-                                Text(opt.label).tag(opt.value)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                        if threadSelection == MountsPresentation.customSentinel {
-                            TextField("topic id (e.g. 42), dm, or *", text: $newThreadId)
-                                .textFieldStyle(.roundedBorder)
-                        }
-                    }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Folder").font(.subheadline).foregroundStyle(.secondary)
-                        HStack(spacing: 6) {
-                            TextField("~/projects/foo", text: $newPath)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.system(.body, design: .monospaced))
-                            Button("Choose…") { pickFolder() }
-                        }
-                    }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Label (optional)").font(.subheadline).foregroundStyle(.secondary)
-                        TextField("e.g. iron-flow", text: $newLabel)
-                            .textFieldStyle(.roundedBorder)
-                    }
                     HStack {
                         Spacer()
-                        Button("Add") { add() }
-                            .keyboardShortcut(.defaultAction)
-                            .disabled(effectiveNewThreadId.isEmpty
-                                      || newPath.trimmingCharacters(in: .whitespaces).isEmpty)
+                        Button {
+                            showAddSheet = true
+                        } label: {
+                            Label("Add Project…", systemImage: "plus")
+                        }
                     }
-                } header: {
-                    Text("Add a project")
                 } footer: {
                     if let e = actionError {
                         Label(e, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.red)
-                    } else {
-                        Text("If the topic you want isn't listed, send one message in it and it'll show up here.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                     }
                 }
             }
             .formStyle(.grouped)
+        }
+        .sheet(isPresented: $showAddSheet) {
+            AddProjectSheet(
+                mountedIds: Set(mounts.map { $0.threadId.stringValue }),
+                knownTopics: knownTopics,
+                isGroup: isGroup
+            ) { thread, path, label in
+                add(thread: thread, path: path, label: label)
+            }
         }
         .onAppear {
             reload()
@@ -727,12 +728,6 @@ private struct MountsTab: View {
                     knownTopics = topics
                     isGroup = group
                     loadError = nil
-                    // Selection stability: keep a valid pick across the reload,
-                    // default an empty selection to the first option.
-                    let opts = threadOptions
-                    threadSelection = threadSelection.isEmpty
-                        ? (opts.first?.value ?? "")
-                        : MountsPresentation.survivingSelection(current: threadSelection, in: opts)
                 }
             } catch {
                 DispatchQueue.main.async { loadError = String(describing: error) }
@@ -740,19 +735,14 @@ private struct MountsTab: View {
         }
     }
 
-    private func add() {
-        let thread = effectiveNewThreadId
-        let path = (newPath as NSString).expandingTildeInPath
-        let label = newLabel.trimmingCharacters(in: .whitespaces)
+    private func add(thread: String, path rawPath: String, label rawLabel: String) {
+        let path = (rawPath as NSString).expandingTildeInPath
+        let label = rawLabel.trimmingCharacters(in: .whitespaces)
         actionError = nil
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try CTAClient.addMount(thread: thread, path: path, label: label.isEmpty ? nil : label)
-                DispatchQueue.main.async {
-                    newThreadId = ""; newPath = ""; newLabel = ""
-                    threadSelection = ""
-                    reload()
-                }
+                DispatchQueue.main.async { reload() }
             } catch {
                 DispatchQueue.main.async {
                     actionError = String(describing: error)
@@ -771,6 +761,93 @@ private struct MountsTab: View {
                 DispatchQueue.main.async { actionError = String(describing: error) }
             }
         }
+    }
+}
+
+/// "Add a project" as its own sheet — the inline form didn't fit the Projects
+/// tab. Owns the picker/custom-id/folder/label state; hands the validated
+/// values back via onAdd and dismisses.
+private struct AddProjectSheet: View {
+    let mountedIds: Set<String>
+    let knownTopics: [(threadId: Int, name: String)]
+    let isGroup: Bool
+    let onAdd: (_ thread: String, _ path: String, _ label: String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var threadSelection: String = ""
+    @State private var customThreadId: String = ""
+    @State private var newPath: String = ""
+    @State private var newLabel: String = ""
+
+    private var threadOptions: [MountsPresentation.ThreadOption] {
+        MountsPresentation.threadOptions(
+            mountedIds: mountedIds, knownTopics: knownTopics, isGroup: isGroup)
+    }
+    private var effectiveThreadId: String {
+        threadSelection == MountsPresentation.customSentinel || threadSelection.isEmpty
+            ? customThreadId.trimmingCharacters(in: .whitespaces)
+            : threadSelection
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Topic").font(.subheadline).foregroundStyle(.secondary)
+                        Picker("", selection: $threadSelection) {
+                            ForEach(threadOptions) { opt in
+                                Text(opt.label).tag(opt.value)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        if threadSelection == MountsPresentation.customSentinel {
+                            TextField("topic id (e.g. 42), dm, or *", text: $customThreadId)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Folder").font(.subheadline).foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            TextField("~/projects/foo", text: $newPath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.body, design: .monospaced))
+                            Button("Choose…") { pickFolder() }
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Label (optional)").font(.subheadline).foregroundStyle(.secondary)
+                        TextField("e.g. iron-flow", text: $newLabel)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                } header: {
+                    Text("Add a project")
+                } footer: {
+                    Text("Maps a Telegram topic to the Mac folder it works in. If the topic you want isn't listed, send one message in it and it'll show up here.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+
+            Divider()
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Add") {
+                    onAdd(effectiveThreadId, newPath, newLabel)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(effectiveThreadId.isEmpty
+                          || newPath.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(12)
+        }
+        .frame(width: 440, height: 380)
+        .onAppear { threadSelection = threadOptions.first?.value ?? "" }
     }
 
     private func pickFolder() {
