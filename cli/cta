@@ -446,6 +446,7 @@ cmd_config() {
     digest-time) _config_digest_time "${1:-}" ;;
     quiet-hours) _config_quiet_hours "${1:-}" "${2:-}" ;;
     timezone) _config_timezone "${1:-}" ;;
+    agentic-model) _config_agentic_model "${1:-}" ;;
     "")
       echo "Usage: cta config <ack|caffeinate|sleep-fix|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
       return 1
@@ -947,6 +948,29 @@ _config_timezone() {
   fi
   _settings_merge "timezone" "\"$val\""
   echo "timezone: $val (live — applies within ~25s, no restart)"
+}
+
+# Model for the agentic runner (daily secretary fire + /do). Unset → claude's
+# default (Opus tier, ~$1.1-1.4 per secretary run); pin e.g. `sonnet` to cut
+# cost. Accepts the same names `claude --model` accepts (opus|sonnet|haiku|a
+# full model id). Live-reloaded by the poller like digest-time.
+_config_agentic_model() {
+  local val="${1:-}"
+  if [[ -z "$val" ]]; then
+    _settings_read "agenticModel" "(claude default)"
+    return 0
+  fi
+  if [[ "$val" == "off" || "$val" == "none" || "$val" == "default" ]]; then
+    _settings_merge "agenticModel" "__DELETE__"
+    echo "agentic-model: cleared (claude default applies)"
+    return 0
+  fi
+  if [[ ! "$val" =~ ^[A-Za-z][A-Za-z0-9._-]*$ ]]; then
+    echo "Invalid model: $val (expected opus|sonnet|haiku or a full model id)" >&2
+    return 1
+  fi
+  _settings_merge "agenticModel" "\"$val\""
+  echo "agentic-model: $val (live — applies to the NEXT agentic run, no restart)"
 }
 
 # ─── H2 daily-digest per-mount toggle (mount-store v3) ──────────────────────
@@ -2252,6 +2276,7 @@ Usage:
   cta config digest-time <HH:MM>  Set when the H2 daily digest fires (local time in your tz)
   cta config quiet-hours <start> <end>  Set quiet window (digest defers inside; HH:MM, wraps midnight if start>end)
   cta config timezone <IANA>      Set the tz used by digest-time + quiet-hours (e.g. Asia/Tokyo)
+  cta config agentic-model <m>    Pin the agentic runner's model (opus|sonnet|haiku|id; 'off' = claude default)
   cta digest <thread> [on|off|init]
                                   Show or toggle per-mount H2 daily digest. \`init\`
                                   scaffolds HEARTBEAT.md in the mount dir

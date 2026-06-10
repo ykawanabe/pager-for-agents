@@ -271,6 +271,12 @@ let digestTimezone = ((): string => {
   }
 })();
 let digestQuietHours: { start: string; end: string } | null = null;
+// Agentic-runner model — live-reloaded from settings.json (`agenticModel`).
+// Unset → no --model flag → claude's default (Opus tier). The proactive
+// secretary is the expensive daily path (~$1.1-1.4/run on the default), so the
+// operator can pin a cheaper model via `cta config agentic-model sonnet`.
+// Applies to BOTH the daily secretary fire and /do (same launchAgentic path).
+let agenticModel: string | undefined = undefined;
 // H2 daily-digest scheduler state. Loaded from disk on poller boot (the
 // `firedToday` map survives restarts so we never fire twice on the same
 // local-tz day, even if the poller relaunches mid-day). Mutated in
@@ -341,6 +347,7 @@ function refreshSettingsIfChanged(): void {
         digestTime?: string;
         timezone?: string;
         quietHours?: { start?: string; end?: string };
+        agenticModel?: string;
       };
       if (parsed.version !== 1) throw new Error("settings.json: unknown version");
       const n = Number(parsed.idle_evict_minutes ?? 0);
@@ -368,6 +375,13 @@ function refreshSettingsIfChanged(): void {
       if (qhChanged) {
         digestQuietHours = nextQh;
         process.stdout.write(`[${new Date().toISOString()}] settings reloaded: quietHours=${JSON.stringify(digestQuietHours)}\n`);
+      }
+      const nextModel = typeof parsed.agenticModel === "string" && parsed.agenticModel.trim() !== ""
+        ? parsed.agenticModel.trim()
+        : undefined;
+      if (nextModel !== agenticModel) {
+        agenticModel = nextModel;
+        process.stdout.write(`[${new Date().toISOString()}] settings reloaded: agenticModel=${agenticModel ?? "(claude default)"}\n`);
       }
     }
     settingsMtimeMs = mtimeMs;
@@ -2467,23 +2481,31 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
 
   agenticInFlight.add(threadId);
   await reply(dest, "🤖 On it — I'll handle the safe steps myself and ask before anything risky.");
-  process.stdout.write(`[${new Date().toISOString()}] agentic dispatch: thread=${threadId} mount=${mountPath} task="${task.slice(0, 80)}"\n`);
+  // Pin the model at dispatch time so a settings reload mid-run can't make the
+  // result log misattribute which model produced this run.
+  const model = agenticModel;
+  process.stdout.write(`[${new Date().toISOString()}] agentic dispatch: thread=${threadId} mount=${mountPath} model=${model ?? "default"} task="${task.slice(0, 80)}"\n`);
 
   void (async () => {
+    // Track whether the run ever streamed text: a "done" run with zero output
+    // would otherwise leave only the "🤖 On it" ack — silence indistinguishable
+    // from a failed delivery. Guarantee a terse closing line instead.
+    let streamedAny = false;
     try {
       const result = await runAgentic({
         mountPath,
         threadId,
         chatId,
         task,
+        model,
         approvalsDir: APPROVALS_DIR,
         settingsPath: AGENTIC_SETTINGS_FILE,
         sessionUuid,
         resumeExisting,
         logFile: join(AGENTIC_LOG_DIR, `${threadId}.jsonl`),
-        onText: (t) => { void reply(dest, t); },
+        onText: (t) => { streamedAny = true; void reply(dest, t); },
       });
-      process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
+      process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} model=${model ?? "default"} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
       // Self-heal: a --resume that hit a dead session (e.g. the mount's cwd
       // changed) → drop the session pointer so the next run recreates it fresh.
       if (result.status === "error" && resumeExisting
@@ -2492,7 +2514,8 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
       }
       if (result.status === "error") await reply(dest, `⚠️ Agentic run failed: ${result.errorMessage ?? "unknown error"}`);
       else if (result.status === "timeout") await reply(dest, "⏱ Agentic run hit its time budget and stopped.");
-      // "done": the final summary already streamed via onText.
+      else if (!streamedAny) await reply(dest, "✅ Check-in done — nothing to report.");
+      // "done" with streamed text: the final summary already went out via onText.
     } catch (e) {
       await reply(dest, `⚠️ Agentic run crashed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
