@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { shouldFire, type ShouldFireInput } from "./scheduler";
+import { detectMissedFire, shouldFire, type ShouldFireInput } from "./scheduler";
 import { markFiredToday, type HeartbeatState } from "./heartbeat-state";
 
 const TZ = "Asia/Tokyo";
@@ -23,6 +23,41 @@ function input(overrides: Partial<ShouldFireInput> = {}): ShouldFireInput {
     ...overrides,
   };
 }
+
+describe("detectMissedFire — silently-skipped day alert", () => {
+  // 09:30 JST 2026-06-03; yesterday in JST = 2026-06-02
+  const NOW = utc(2026, 6, 3, 0, 30);
+  const miss = (state: HeartbeatState) =>
+    detectMissedFire({ state, threadId: "dm", timezone: TZ, now: NOW });
+
+  test("yesterday missed + older fire exists → returns yesterday's ymd", () => {
+    const state = markFiredToday(EMPTY, "dm", "2026-06-01"); // fired the 1st, NOT the 2nd
+    expect(miss(state)).toBe("2026-06-02");
+  });
+
+  test("yesterday fired → null", () => {
+    let state = markFiredToday(EMPTY, "dm", "2026-06-01");
+    state = markFiredToday(state, "dm", "2026-06-02");
+    expect(miss(state)).toBe(null);
+  });
+
+  test("no older fire (first day after enabling) → null, no false alarm", () => {
+    expect(miss(EMPTY)).toBe(null);
+  });
+
+  test("older fire on a DIFFERENT thread doesn't count → null", () => {
+    const state = markFiredToday(EMPTY, "4915", "2026-06-01");
+    expect(miss(state)).toBe(null);
+  });
+
+  test("marking the returned ymd makes the alert one-shot", () => {
+    const state = markFiredToday(EMPTY, "dm", "2026-06-01");
+    const ymd = miss(state);
+    expect(ymd).toBe("2026-06-02");
+    const marked = markFiredToday(state, "dm", ymd as string);
+    expect(miss(marked)).toBe(null);
+  });
+});
 
 describe("shouldFire — happy path", () => {
   test("fires when past digest time, not yet fired today, no quiet hours, idle", () => {

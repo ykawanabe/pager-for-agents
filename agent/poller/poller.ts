@@ -51,7 +51,7 @@ import {
   readState as readHeartbeatState,
   writeState as writeHeartbeatState,
 } from "./heartbeat-checks/heartbeat-state";
-import { shouldFire as digestShouldFire } from "./heartbeat-checks/scheduler";
+import { detectMissedFire, shouldFire as digestShouldFire } from "./heartbeat-checks/scheduler";
 import { runHeartbeat } from "./heartbeat-checks/heartbeat-runner";
 import { appendFireLog } from "./heartbeat-checks/heartbeat-log";
 import { heartbeatSessionFile } from "../lib/paths";
@@ -2572,6 +2572,21 @@ function digestDispatch(): void {
 
     const threadIdStr = String(mount.thread_id);
     if (digestInFlight.has(threadIdStr)) continue;
+
+    // Missed-fire alert: if the host slept past digestTime into the next
+    // calendar day, that day was silently skipped — surface it once so
+    // silence is never mistaken for success. Marking the missed ymd as
+    // fired is what makes the alert one-shot.
+    const missedYmd = detectMissedFire({ state: heartbeatState, threadId: threadIdStr, timezone: digestTimezone, now });
+    if (missedYmd) {
+      heartbeatState = markFiredToday(heartbeatState, threadIdStr, missedYmd);
+      try { writeHeartbeatState(heartbeatState); } catch { /* same best-effort as the fire path */ }
+      process.stdout.write(`[${new Date().toISOString()}] digest missed-fire: thread=${threadIdStr} ymd=${missedYmd}\n`);
+      void reply(
+        { channel: "telegram", chatId, threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined },
+        `⚠️ ${missedYmd} の briefing は発火しませんでした(おそらく ${digestTime} 時点で Mac がスリープ)。今日の分は通常どおり走ります。`,
+      );
+    }
 
     const decision = digestShouldFire({
       state: heartbeatState,

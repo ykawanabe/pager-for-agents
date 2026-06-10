@@ -63,6 +63,38 @@ export type SkipReason =
   | "in-flight"
   | "user-busy";
 
+export interface MissedFireInput {
+  /** Persisted scheduler state (output of readState). */
+  readonly state: HeartbeatState;
+  readonly threadId: string;
+  readonly timezone: string;
+  readonly now: Date;
+}
+
+/**
+ * Detect a silently-skipped day. If the host slept past digestTime clear into
+ * the NEXT calendar day (in the digest tz), that day's `firedToday` key was
+ * never written and the digest was skipped with zero signal — silence
+ * indistinguishable from success. Returns yesterday's ymd when it was missed,
+ * else null. Caller marks the returned ymd (markFiredToday) so the alert
+ * fires exactly once.
+ *
+ * Guard against false alarms: only report a miss when some OLDER key exists
+ * for this thread — proof the digest was enabled and firing before. The first
+ * day after enabling has no older key and is never reported.
+ */
+export function detectMissedFire(input: MissedFireInput): string | null {
+  const todayYmd = todayInTz(input.now, input.timezone);
+  const yesterdayYmd = todayInTz(new Date(input.now.getTime() - 86_400_000), input.timezone);
+  if (yesterdayYmd === todayYmd) return null; // degenerate tz math — bail safe
+  if (alreadyFiredToday(input.state, input.threadId, yesterdayYmd)) return null;
+  const prefix = `${input.threadId}:`;
+  const hasOlderFire = Object.keys(input.state.firedToday).some(
+    (k) => k.startsWith(prefix) && k.slice(prefix.length) < yesterdayYmd,
+  );
+  return hasOlderFire ? yesterdayYmd : null;
+}
+
 export function shouldFire(input: ShouldFireInput): ShouldFireDecision {
   const ymd = todayInTz(input.now, input.timezone);
 
