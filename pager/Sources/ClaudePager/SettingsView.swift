@@ -1020,8 +1020,9 @@ private struct TasksTab: View {
         }
         .formStyle(.grouped)
         .sheet(isPresented: $showAddSheet) {
-            AddTaskSheet(mounts: realMounts, isGroup: isGroup) { name, time, days, checklist, prompt, topic in
-                add(name: name, time: time, days: days, checklist: checklist, prompt: prompt, topic: topic)
+            AddTaskSheet(mounts: realMounts, isGroup: isGroup) { name, time, days, checklist, prompt, topic, model, effort in
+                add(name: name, time: time, days: days, checklist: checklist, prompt: prompt,
+                    topic: topic, model: model, effort: effort)
             }
         }
         .onAppear {
@@ -1098,11 +1099,13 @@ private struct TasksTab: View {
         }
     }
 
-    private func add(name: String, time: String, days: String, checklist: String?, prompt: String?, topic: String) {
+    private func add(name: String, time: String, days: String, checklist: String?, prompt: String?,
+                     topic: String, model: String?, effort: String?) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try CTAClient.taskAdd(name: name, time: time, days: days,
-                                          checklist: checklist, prompt: prompt, topic: topic)
+                                          checklist: checklist, prompt: prompt, topic: topic,
+                                          model: model, effort: effort)
                 DispatchQueue.main.async { reload() }
             } catch let e {
                 DispatchQueue.main.async { error = "Add failed: \(e.localizedDescription)" }
@@ -1181,7 +1184,8 @@ private struct AddTaskSheet: View {
     let mounts: [CTAClient.MountJSON]
     let isGroup: Bool
     let onAdd: (_ name: String, _ time: String, _ days: String,
-                _ checklist: String?, _ prompt: String?, _ topic: String) -> Void
+                _ checklist: String?, _ prompt: String?, _ topic: String,
+                _ model: String?, _ effort: String?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var name: String = ""
@@ -1192,6 +1196,8 @@ private struct AddTaskSheet: View {
     @State private var checklistPath: String = ""
     @State private var promptText: String = ""
     @State private var topicSelection: String = "dm"
+    @State private var modelChoice: String = ""       // "" = default (global)
+    @State private var effortChoice: String = ""      // "" = default (global)
 
     private var effectiveDays: String {
         daysChoice == "custom" ? customDays.trimmingCharacters(in: .whitespaces) : daysChoice
@@ -1246,6 +1252,12 @@ private struct AddTaskSheet: View {
                             Text(topicLabel(m)).tag(m.threadId.stringValue)
                         }
                     }
+                    Picker("Model", selection: $modelChoice) {
+                        ForEach(TasksTab.modelPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
+                    }
+                    Picker("Effort", selection: $effortChoice) {
+                        ForEach(TasksTab.effortPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
+                    }
                 } header: {
                     Text("New task")
                 } footer: {
@@ -1265,7 +1277,9 @@ private struct AddTaskSheet: View {
                     let checklist = sourceKind == "checklist"
                         ? (checklistPath as NSString).expandingTildeInPath : nil
                     let prompt = sourceKind == "prompt" ? promptText : nil
-                    onAdd(name, TasksTab.hhmm(from: fireTime), effectiveDays, checklist, prompt, topicSelection)
+                    onAdd(name, TasksTab.hhmm(from: fireTime), effectiveDays, checklist, prompt,
+                          topicSelection, modelChoice.isEmpty ? nil : modelChoice,
+                          effortChoice.isEmpty ? nil : effortChoice)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)

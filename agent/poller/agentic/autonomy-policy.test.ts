@@ -85,6 +85,22 @@ describe("bash — notion-cli (Notion CLI): read silent, write ask", () => {
   test("notion-cli block append → ask", () => expect(classify(bash("notion-cli block append BLOCKID")).tier).toBe("ask"));
 });
 
+describe("mcp — playwright browser: reads silent, interactions ask", () => {
+  for (const t of ["mcp__playwright__browser_navigate", "mcp__playwright__browser_snapshot",
+                   "mcp__playwright__browser_take_screenshot", "mcp__playwright__browser_wait_for"]) {
+    test(`${t} → silent`, () => expect(classify(call(t)).tier).toBe("silent"));
+  }
+  for (const t of ["mcp__playwright__browser_click", "mcp__playwright__browser_type",
+                   "mcp__playwright__browser_fill_form", "mcp__playwright__browser_evaluate",
+                   "mcp__playwright__browser_run_code_unsafe", "mcp__playwright__browser_file_upload"]) {
+    test(`${t} → ask`, () => {
+      const c = classify(call(t));
+      expect(c.tier).toBe("ask");
+      expect(c.reversibility).toBe("outward");
+    });
+  }
+});
+
 describe("bash — env builtins → silent", () => {
   test("export → silent", () => expect(classify(bash("export FOO=bar")).tier).toBe("silent"));
   test("cd → silent", () => expect(classify(bash("cd /tmp")).tier).toBe("silent"));

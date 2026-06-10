@@ -320,10 +320,13 @@ enum CTAClient {
 
     @discardableResult
     static func taskAdd(name: String, time: String, days: String, checklist: String?,
-                        prompt: String?, topic: String) throws -> String {
+                        prompt: String?, topic: String, model: String? = nil,
+                        effort: String? = nil) throws -> String {
         var args = ["task", "add", name, "--time", time, "--days", days, "--topic", topic]
         if let c = checklist, !c.isEmpty { args += ["--checklist", c] }
         if let p = prompt, !p.isEmpty { args += ["--prompt", p] }
+        if let m = model, !m.isEmpty { args += ["--model", m] }
+        if let e = effort, !e.isEmpty { args += ["--effort", e] }
         let data = try run(args: args)
         return String(data: data, encoding: .utf8) ?? ""
     }
