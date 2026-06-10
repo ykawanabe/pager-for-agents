@@ -2813,6 +2813,7 @@ function processTaskRunFlags(): void {
     if (!chatIdStr) return;
     const chatId = Number(chatIdStr);
     for (const name of names) {
+      if (name.startsWith(".")) continue; // skip .DS_Store etc. (Finder-touched dirs)
       try { unlinkSync(join(TASK_RUN_DIR, name)); } catch { continue; }
       const task = tasksCache.find((t) => t.name === name);
       if (!task) {

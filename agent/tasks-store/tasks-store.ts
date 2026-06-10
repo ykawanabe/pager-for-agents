@@ -20,7 +20,7 @@
  *     "tasks": [
  *       {
  *         "name": "morning-briefing",
- *         "time": "06:57",
+ *         "time": "07:30",
  *         "days": "daily",                       // "daily" | "weekdays" | ["mon","wed",...]
  *         "checklist": "/abs/path/HEARTBEAT.md", // exactly one of checklist | prompt
  *         "topic": "dm",                          // "dm" or a numeric topic id
@@ -177,7 +177,16 @@ export function readTasks(): TasksFile {
     if (parsed.version !== 1 || !Array.isArray(parsed.tasks)) {
       throw new Error("tasks.json: unrecognized schema");
     }
-    return { version: 1, tasks: parsed.tasks as ScheduledTask[] };
+    // Defense-in-depth: name validation runs on the add path, but the poller
+    // builds filesystem paths + state keys from task.name on every read. A
+    // hand-edited / corrupted file must never let a name with '/' or ':' reach
+    // path construction — drop (and warn about) any row that fails the name
+    // rule rather than trusting the file.
+    const tasks = (parsed.tasks as ScheduledTask[]).filter((t) => {
+      try { parseTaskName(String(t?.name ?? "")); return true; }
+      catch { process.stderr.write(`tasks-store: dropping task with invalid name ${JSON.stringify(t?.name)}\n`); return false; }
+    });
+    return { version: 1, tasks };
   } catch (e) {
     throw new Error(`tasks.json: ${e instanceof Error ? e.message : String(e)}`);
   }

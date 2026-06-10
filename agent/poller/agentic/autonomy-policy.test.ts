@@ -85,19 +85,30 @@ describe("bash — notion-cli (Notion CLI): read silent, write ask", () => {
   test("notion-cli block append → ask", () => expect(classify(bash("notion-cli block append BLOCKID")).tier).toBe("ask"));
 });
 
-describe("mcp — playwright browser: reads silent, interactions ask", () => {
-  for (const t of ["mcp__playwright__browser_navigate", "mcp__playwright__browser_snapshot",
-                   "mcp__playwright__browser_take_screenshot", "mcp__playwright__browser_wait_for"]) {
+describe("mcp — playwright browser: narrow silent read set, args inspected", () => {
+  for (const t of ["mcp__playwright__browser_snapshot", "mcp__playwright__browser_wait_for",
+                   "mcp__playwright__browser_console_messages", "mcp__playwright__browser_resize",
+                   "mcp__playwright__browser_navigate_back"]) {
     test(`${t} → silent`, () => expect(classify(call(t)).tier).toBe("silent"));
   }
-  for (const t of ["mcp__playwright__browser_click", "mcp__playwright__browser_type",
-                   "mcp__playwright__browser_fill_form", "mcp__playwright__browser_evaluate",
-                   "mcp__playwright__browser_run_code_unsafe", "mcp__playwright__browser_file_upload"]) {
-    test(`${t} → ask`, () => {
-      const c = classify(call(t));
-      expect(c.tier).toBe("ask");
-      expect(c.reversibility).toBe("outward");
-    });
+  test("navigate https://x.com → silent", () =>
+    expect(classify(call("mcp__playwright__browser_navigate", { url: "https://x.com/sunsun_popup" })).tier).toBe("silent"));
+  for (const url of ["file:///etc/passwd", "http://localhost:8080", "http://127.0.0.1/admin",
+                     "http://192.168.1.1", "http://169.254.169.254/latest/meta-data", "x.com"]) {
+    test(`navigate ${url} → ask`, () =>
+      expect(classify(call("mcp__playwright__browser_navigate", { url })).tier).toBe("ask"));
+  }
+  test("take_screenshot (no filename) → silent", () =>
+    expect(classify(call("mcp__playwright__browser_take_screenshot")).tier).toBe("silent"));
+  test("take_screenshot filename outside mount → ask", () =>
+    expect(classify(call("mcp__playwright__browser_take_screenshot", { filename: "/etc/evil.png" })).tier).toBe("ask"));
+  test("take_screenshot filename inside mount → silent", () =>
+    expect(classify(call("mcp__playwright__browser_take_screenshot", { filename: `${MOUNT}/shot.png` })).tier).toBe("silent"));
+  for (const t of ["mcp__playwright__browser_tabs", "mcp__playwright__browser_click",
+                   "mcp__playwright__browser_type", "mcp__playwright__browser_fill_form",
+                   "mcp__playwright__browser_evaluate", "mcp__playwright__browser_run_code_unsafe",
+                   "mcp__playwright__browser_file_upload", "mcp__playwright__browser_hover"]) {
+    test(`${t} → ask`, () => expect(classify(call(t)).tier).toBe("ask"));
   }
 });
 

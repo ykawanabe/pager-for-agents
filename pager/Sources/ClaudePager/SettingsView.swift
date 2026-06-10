@@ -1236,7 +1236,7 @@ private struct AddTaskSheet: View {
                     }
                     if sourceKind == "checklist" {
                         HStack(spacing: 6) {
-                            TextField("~/claude-home/HEARTBEAT.md", text: $checklistPath)
+                            TextField("~/myproject/HEARTBEAT.md", text: $checklistPath)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(.body, design: .monospaced))
                             Button("Choose…") { pickChecklist() }

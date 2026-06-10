@@ -16,7 +16,7 @@ describe("parseTaskName", () => {
 describe("parseTime", () => {
   test("normalizes to zero-padded HH:MM", () => {
     expect(parseTime("9:05")).toBe("09:05");
-    expect(parseTime("06:57")).toBe("06:57");
+    expect(parseTime("07:30")).toBe("07:30");
   });
   test("rejects malformed/out-of-range", () => {
     for (const bad of ["", "24:00", "9", "9:5", "09:60", "garbage"]) {
