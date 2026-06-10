@@ -2449,7 +2449,7 @@ function approvalDispatch(): void {
 
 /** Spawn the gated agentic executor for `task` in `threadId`'s mount, streaming
  *  progress back to the chat. Detached — never blocks the caller. */
-async function launchAgentic(threadId: string, chatId: number, task: string, dest: ChatAddress): Promise<void> {
+async function launchAgentic(threadId: string, chatId: number, task: string, dest: ChatAddress, runOpts?: { systemPrompt?: string }): Promise<void> {
   if (agenticInFlight.has(threadId)) {
     await reply(dest, "I'm still working on a task in this topic — let me finish this one first.");
     return;
@@ -2498,6 +2498,7 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
         chatId,
         task,
         model,
+        systemPrompt: runOpts?.systemPrompt,
         approvalsDir: APPROVALS_DIR,
         settingsPath: AGENTIC_SETTINGS_FILE,
         sessionUuid,
@@ -2553,6 +2554,37 @@ function buildSecretaryTask(mountPath: string): string {
     checklist,
     "Then report back in ONE short Telegram message: what you handled, what's waiting for me (drafts to review, decisions to make), and anything urgent. If nothing genuinely needs attention, say so in one line.",
   ].join("\n");
+}
+
+/** Digest-only system prompt for the UNATTENDED scheduled fire. Replaces the
+ *  open-ended secretary SYSTEM_PROMPT (agentic-runner.ts) whose "delegated
+ *  task" framing made the agent explore (git/PRs/--help probes with shell
+ *  metachars) — each probe gate-ASKed and stalled the run with nobody awake
+ *  to approve. Keeps the gate contract; cuts the exploration license. */
+const DIGEST_ONLY_SYSTEM_PROMPT = [
+  "You are running an UNATTENDED scheduled briefing. Nobody is watching; an approval request would stall until it times out.",
+  "A safety gate fronts every tool call: read-only / in-project actions run automatically; anything it can't prove safe pauses for approval. Therefore make ONLY plainly-safe calls: no shell metacharacters (no pipes, redirects, $(), parens, 2>&1), one simple command per Bash call, and prefer dedicated tools (Read, WebFetch, MCP) over shell.",
+  "Execute the checklist you are given EXACTLY — it is the entire job. Do NOT explore beyond it: no git/PR/CI checks, no --help probes, no extra investigation.",
+  "If a step would need approval, skip it, note '(skipped)' for that section, and continue. Never wait on the gate.",
+  "Telegram renders your text as plain text — no markdown. Your streamed text IS the delivered briefing; always end with the briefing message itself.",
+].join("\n");
+
+/** Task for the scheduled fire when the mount has a HEARTBEAT.md: the checklist
+ *  verbatim, with none of buildSecretaryTask's open-ended framing. Falls back
+ *  to the generic secretary task when HEARTBEAT.md is absent. */
+function buildDigestOnlyTask(mountPath: string): { task: string; digestOnly: boolean } {
+  let md = "";
+  try { md = readFileSync(join(mountPath, "HEARTBEAT.md"), "utf8").trim(); } catch { /* absent */ }
+  if (!md) return { task: buildSecretaryTask(mountPath), digestOnly: false };
+  return {
+    task: [
+      "Scheduled briefing run (I didn't prompt you just now — this is the daily fire).",
+      "The checklist below is the ENTIRE job. Follow it exactly; do not do anything else.",
+      "",
+      md,
+    ].join("\n"),
+    digestOnly: true,
+  };
 }
 
 function digestDispatch(): void {
@@ -2633,8 +2665,14 @@ function digestDispatch(): void {
         chatId,
         threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
       };
-      process.stdout.write(`[${new Date().toISOString()}] secretary heartbeat dispatch: thread=${threadIdStr} mount=${mount.path}\n`);
-      void launchAgentic(threadIdStr, chatId, buildSecretaryTask(mount.path), secAddress);
+      // Scheduled fire uses the digest-only task + system prompt when the mount
+      // has a HEARTBEAT.md (checklist-exact, no exploration — unattended runs
+      // must never stall on an approval card). /do keeps the full secretary
+      // framing; only this proactive caller is narrowed.
+      const { task: secTask, digestOnly } = buildDigestOnlyTask(mount.path);
+      process.stdout.write(`[${new Date().toISOString()}] secretary heartbeat dispatch: thread=${threadIdStr} mount=${mount.path} digestOnly=${digestOnly}\n`);
+      void launchAgentic(threadIdStr, chatId, secTask, secAddress,
+        digestOnly ? { systemPrompt: DIGEST_ONLY_SYSTEM_PROMPT } : undefined);
       continue;
     }
 

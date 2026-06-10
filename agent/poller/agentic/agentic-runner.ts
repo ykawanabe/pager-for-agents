@@ -49,6 +49,9 @@ export interface AgenticRunOpts {
   // Overridable / test seams
   readonly claudeBin?: string;       // default "claude"
   readonly model?: string;           // default: omit (claude default)
+  /** Replace the default secretary SYSTEM_PROMPT (e.g. the digest-only variant
+   *  that suppresses open-ended exploration on unattended scheduled runs). */
+  readonly systemPrompt?: string;
   /** Overall runner budget. SIGTERM at sigTermMs, SIGKILL at sigKillMs. Must exceed
    *  approvalExpiryMs so a legit approval wait isn't killed. Defaults 8min / 9min. */
   readonly sigTermMs?: number;
@@ -117,6 +120,7 @@ export function buildClaudeArgv(opts: {
   settingsPath: string;
   mcpConfigPath?: string;
   model?: string;
+  systemPrompt?: string;
 }): string[] {
   const args = [
     "-p",
@@ -124,7 +128,7 @@ export function buildClaudeArgv(opts: {
     "--verbose",
     "--dangerously-skip-permissions",         // the PreToolUse gate is the real boundary
     "--settings", opts.settingsPath,
-    "--append-system-prompt", SYSTEM_PROMPT,
+    "--append-system-prompt", opts.systemPrompt ?? SYSTEM_PROMPT,
   ];
   if (opts.model) args.push("--model", opts.model);
   if (opts.mcpConfigPath) args.push("--mcp-config", opts.mcpConfigPath);
@@ -212,6 +216,7 @@ export async function runAgentic(opts: AgenticRunOpts): Promise<AgenticResult> {
       settingsPath: opts.settingsPath,
       mcpConfigPath: opts.mcpConfigPath,
       model: opts.model,
+      systemPrompt: opts.systemPrompt,
     }),
   ];
   const env: Record<string, string> = {
