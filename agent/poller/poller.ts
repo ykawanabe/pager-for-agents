@@ -2525,6 +2525,7 @@ function buildSecretaryTask(mountPath: string): string {
   return [
     "Daily secretary check-in — proactive, on your own initiative (I didn't prompt you just now).",
     "Go through what's on my plate and PREPARE what you can: read my inbox, calendar, and this project's open PRs / CI as relevant; triage, summarize, file, and SAVE EMAIL DRAFTS for replies I'll likely need (do NOT send them).",
+    "For Gmail and Calendar use the `gog` CLI (e.g. `gog gmail list`, `gog gmail draft …`, `gog calendar list`) — in this background context the claude.ai Gmail/Calendar MCP connectors can stall, so prefer the CLI and don't wait on a hanging connector.",
     "Do the safe, reversible things yourself without asking. For anything irreversible or outward — sending a message/email, git push, gh merge, deleting, spending — ASK me first; never do it unprompted.",
     checklist,
     "Then report back in ONE short Telegram message: what you handled, what's waiting for me (drafts to review, decisions to make), and anything urgent. If nothing genuinely needs attention, say so in one line.",
