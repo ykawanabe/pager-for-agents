@@ -277,6 +277,11 @@ let digestQuietHours: { start: string; end: string } | null = null;
 // operator can pin a cheaper model via `cta config agentic-model sonnet`.
 // Applies to BOTH the daily secretary fire and /do (same launchAgentic path).
 let agenticModel: string | undefined = undefined;
+// Reasoning-effort for the agentic runner (`--effort low|medium|high|xhigh|max`).
+// Unset → claude's default, which inherits the user's settings.json effortLevel
+// (currently xhigh) — pin lower via `cta config agentic-effort medium` to cut
+// scheduled-run cost without changing interactive sessions.
+let agenticEffort: string | undefined = undefined;
 // H2 daily-digest scheduler state. Loaded from disk on poller boot (the
 // `firedToday` map survives restarts so we never fire twice on the same
 // local-tz day, even if the poller relaunches mid-day). Mutated in
@@ -348,6 +353,7 @@ function refreshSettingsIfChanged(): void {
         timezone?: string;
         quietHours?: { start?: string; end?: string };
         agenticModel?: string;
+        agenticEffort?: string;
       };
       if (parsed.version !== 1) throw new Error("settings.json: unknown version");
       const n = Number(parsed.idle_evict_minutes ?? 0);
@@ -382,6 +388,13 @@ function refreshSettingsIfChanged(): void {
       if (nextModel !== agenticModel) {
         agenticModel = nextModel;
         process.stdout.write(`[${new Date().toISOString()}] settings reloaded: agenticModel=${agenticModel ?? "(claude default)"}\n`);
+      }
+      const nextEffort = typeof parsed.agenticEffort === "string" && parsed.agenticEffort.trim() !== ""
+        ? parsed.agenticEffort.trim()
+        : undefined;
+      if (nextEffort !== agenticEffort) {
+        agenticEffort = nextEffort;
+        process.stdout.write(`[${new Date().toISOString()}] settings reloaded: agenticEffort=${agenticEffort ?? "(claude default)"}\n`);
       }
     }
     settingsMtimeMs = mtimeMs;
@@ -2484,7 +2497,8 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
   // Pin the model at dispatch time so a settings reload mid-run can't make the
   // result log misattribute which model produced this run.
   const model = agenticModel;
-  process.stdout.write(`[${new Date().toISOString()}] agentic dispatch: thread=${threadId} mount=${mountPath} model=${model ?? "default"} task="${task.slice(0, 80)}"\n`);
+  const effort = agenticEffort;
+  process.stdout.write(`[${new Date().toISOString()}] agentic dispatch: thread=${threadId} mount=${mountPath} model=${model ?? "default"} effort=${effort ?? "default"} task="${task.slice(0, 80)}"\n`);
 
   void (async () => {
     // Track whether the run ever streamed text: a "done" run with zero output
@@ -2498,6 +2512,7 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
         chatId,
         task,
         model,
+        effort,
         systemPrompt: runOpts?.systemPrompt,
         approvalsDir: APPROVALS_DIR,
         settingsPath: AGENTIC_SETTINGS_FILE,
@@ -2506,7 +2521,7 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
         logFile: join(AGENTIC_LOG_DIR, `${threadId}.jsonl`),
         onText: (t) => { streamedAny = true; void reply(dest, t); },
       });
-      process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} model=${model ?? "default"} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
+      process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} model=${model ?? "default"} effort=${effort ?? "default"} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
       // Self-heal: a --resume that hit a dead session (e.g. the mount's cwd
       // changed) → drop the session pointer so the next run recreates it fresh.
       if (result.status === "error" && resumeExisting

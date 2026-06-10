@@ -49,6 +49,10 @@ export interface AgenticRunOpts {
   // Overridable / test seams
   readonly claudeBin?: string;       // default "claude"
   readonly model?: string;           // default: omit (claude default)
+  /** Reasoning-effort level passed as `--effort` (low|medium|high|xhigh|max).
+   *  Omit → claude's default (which may inherit the user's settings.json
+   *  effortLevel — pin explicitly to control cost on scheduled runs). */
+  readonly effort?: string;
   /** Replace the default secretary SYSTEM_PROMPT (e.g. the digest-only variant
    *  that suppresses open-ended exploration on unattended scheduled runs). */
   readonly systemPrompt?: string;
@@ -120,6 +124,7 @@ export function buildClaudeArgv(opts: {
   settingsPath: string;
   mcpConfigPath?: string;
   model?: string;
+  effort?: string;
   systemPrompt?: string;
 }): string[] {
   const args = [
@@ -131,6 +136,7 @@ export function buildClaudeArgv(opts: {
     "--append-system-prompt", opts.systemPrompt ?? SYSTEM_PROMPT,
   ];
   if (opts.model) args.push("--model", opts.model);
+  if (opts.effort) args.push("--effort", opts.effort);
   if (opts.mcpConfigPath) args.push("--mcp-config", opts.mcpConfigPath);
   args.push(opts.resumeExisting ? "--resume" : "--session-id", opts.sessionUuid);
   args.push(opts.task);                        // positional prompt, last
@@ -216,6 +222,7 @@ export async function runAgentic(opts: AgenticRunOpts): Promise<AgenticResult> {
       settingsPath: opts.settingsPath,
       mcpConfigPath: opts.mcpConfigPath,
       model: opts.model,
+      effort: opts.effort,
       systemPrompt: opts.systemPrompt,
     }),
   ];

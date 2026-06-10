@@ -447,6 +447,7 @@ cmd_config() {
     quiet-hours) _config_quiet_hours "${1:-}" "${2:-}" ;;
     timezone) _config_timezone "${1:-}" ;;
     agentic-model) _config_agentic_model "${1:-}" ;;
+    agentic-effort) _config_agentic_effort "${1:-}" ;;
     "")
       echo "Usage: cta config <ack|caffeinate|sleep-fix|idle-evict|interrupt-steer|digest-time|quiet-hours|timezone> <value>" >&2
       return 1
@@ -971,6 +972,28 @@ _config_agentic_model() {
   fi
   _settings_merge "agenticModel" "\"$val\""
   echo "agentic-model: $val (live — applies to the NEXT agentic run, no restart)"
+}
+
+# Reasoning-effort for the agentic runner (claude --effort). Unset → claude's
+# default, which inherits the user settings.json effortLevel — pin it here to
+# control scheduled-run cost independently of interactive sessions.
+_config_agentic_effort() {
+  local val="${1:-}"
+  if [[ -z "$val" ]]; then
+    _settings_read "agenticEffort" "(claude default)"
+    return 0
+  fi
+  if [[ "$val" == "off" || "$val" == "none" || "$val" == "default" ]]; then
+    _settings_merge "agenticEffort" "__DELETE__"
+    echo "agentic-effort: cleared (claude default applies)"
+    return 0
+  fi
+  case "$val" in
+    low|medium|high|xhigh|max) ;;
+    *) echo "Invalid effort: $val (expected low|medium|high|xhigh|max)" >&2; return 1 ;;
+  esac
+  _settings_merge "agenticEffort" "\"$val\""
+  echo "agentic-effort: $val (live — applies to the NEXT agentic run, no restart)"
 }
 
 # ─── H2 daily-digest per-mount toggle (mount-store v3) ──────────────────────
@@ -2277,6 +2300,7 @@ Usage:
   cta config quiet-hours <start> <end>  Set quiet window (digest defers inside; HH:MM, wraps midnight if start>end)
   cta config timezone <IANA>      Set the tz used by digest-time + quiet-hours (e.g. Asia/Tokyo)
   cta config agentic-model <m>    Pin the agentic runner's model (opus|sonnet|haiku|id; 'off' = claude default)
+  cta config agentic-effort <e>   Pin the agentic runner's reasoning effort (low|medium|high|xhigh|max; 'off' = default)
   cta digest <thread> [on|off|init]
                                   Show or toggle per-mount H2 daily digest. \`init\`
                                   scaffolds HEARTBEAT.md in the mount dir
