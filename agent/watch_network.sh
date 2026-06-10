@@ -97,6 +97,14 @@ main_loop() {
   local WATCHDOG_STARTED_AT
   WATCHDOG_STARTED_AT=$(date +%s)
 
+  # Clean shutdown: `cta stop` (launchctl unload) sends SIGTERM. Trap it and
+  # exit 0 so the watchdog terminates cleanly. Paired with KeepAlive set to
+  # {SuccessfulExit: false} in com.claude-watchdog.plist, a clean exit keeps the
+  # job DOWN; a crash (non-zero exit) still relaunches it. Without this trap the
+  # old unconditional KeepAlive respawned the watchdog after every intentional
+  # stop — the immortal-watchdog bug that re-kicked the poller back to life.
+  trap 'exit 0' TERM INT
+
   while true; do
     local net_up=0 tg_up=0
     ping -c 1 -W 2 "$NET_TARGET" > /dev/null 2>&1 && net_up=1

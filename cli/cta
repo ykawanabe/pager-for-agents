@@ -396,6 +396,17 @@ cmd_stop() {
   # drop ~half of inbound messages. Targeted by command-line match against the
   # plugin path so we never kill an unrelated `bun server.ts` the user runs.
   _kill_plugin_bun
+
+  # Release any sleep assertion this agent holds. `cta config caffeinate on` (or
+  # Pager's CaffeinateController) spawns `caffeinate -i` tracked in
+  # $CAFFEINATE_PID_FILE; without this teardown a stopped agent kept the Mac
+  # awake forever (the immortal-caffeinate bug). _caffeinate_stop kills the
+  # tracked pid + clears the pidfile; the pkill is a stale-pidfile safety net,
+  # scoped to a bare `caffeinate -i` so an unrelated `caffeinate -t/-d` (e.g.
+  # Claude Code's own `caffeinate -i -t 300`) is left alone.
+  _caffeinate_stop >/dev/null 2>&1 || true
+  pkill -f '(^|/)caffeinate -i$' 2>/dev/null || true
+
   echo "Stopped agent (launchd: $PLIST_LABEL + $WATCHDOG_LABEL + plugin MCP)."
 }
 

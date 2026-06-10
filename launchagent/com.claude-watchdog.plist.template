@@ -16,13 +16,18 @@
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- Always keep the watchdog alive. Unlike the poller (which stays down
-         after a clean `cta stop`), the watchdog is pure supervision with no
-         conversational state, so an unconditional KeepAlive is correct: if it
-         dies for any reason, relaunch it. A clean `cta stop` boots it out
-         explicitly so this never fights an intentional shutdown. -->
+    <!-- Respawn the watchdog only on a CRASH (non-zero exit), NOT after a clean
+         shutdown. watch_network.sh traps SIGTERM and exits 0, so `cta stop`
+         (launchctl unload → SIGTERM) leaves the watchdog DOWN instead of being
+         immortally respawned. A genuine crash (non-zero exit) still relaunches
+         it. This fixes the immortal-watchdog bug where an unconditional
+         KeepAlive re-kicked the poller back to life after every intentional
+         stop, and the orphaned caffeinate kept the Mac awake. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>EnvironmentVariables</key>
     <dict>
