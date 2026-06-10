@@ -852,6 +852,20 @@ private struct DigestSection: View {
     @State private var mounts: [CTAClient.MountJSON] = []
     @State private var loading = false
     @State private var error: String? = nil
+    // Scheduling state — mirrors $STATE_DIR/settings.json (read direct, write
+    // through cta; the poller live-reloads within ~25s, no restart needed).
+    @State private var fireTime: Date = DigestSection.date(fromHHMM: "09:00") ?? Date()
+    @State private var timezone: String = ""
+    @State private var model: String = ""   // "" = claude default
+    @State private var effort: String = ""  // "" = claude default
+
+    private let modelPresets: [(label: String, tag: String)] = [
+        ("Default", ""), ("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku"),
+    ]
+    private let effortPresets: [(label: String, tag: String)] = [
+        ("Default", ""), ("Low", "low"), ("Medium", "medium"),
+        ("High", "high"), ("XHigh", "xhigh"), ("Max", "max"),
+    ]
 
     var body: some View {
         Section {
@@ -860,6 +874,39 @@ private struct DigestSection: View {
                     .foregroundStyle(.red)
                     .font(.caption)
             }
+
+            DatePicker("Fire time", selection: Binding(
+                get: { fireTime },
+                set: { d in fireTime = d; applyFireTime(d) }
+            ), displayedComponents: .hourAndMinute)
+
+            HStack {
+                Text("Timezone")
+                Spacer()
+                TextField("Asia/Tokyo", text: $timezone)
+                    .frame(maxWidth: 160)
+                    .multilineTextAlignment(.trailing)
+                    .onSubmit { applyTimezone() }
+            }
+
+            Picker("Briefing model", selection: Binding(
+                get: { model },
+                set: { v in model = v; applyModel(v) }
+            )) {
+                ForEach(modelPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
+                // Reflect a full model id pinned via `cta config agentic-model`
+                if !model.isEmpty && !modelPresets.contains(where: { $0.tag == model }) {
+                    Text(model).tag(model)
+                }
+            }
+
+            Picker("Briefing effort", selection: Binding(
+                get: { effort },
+                set: { v in effort = v; applyEffort(v) }
+            )) {
+                ForEach(effortPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
+            }
+
             if mounts.isEmpty && !loading {
                 Text("No mounts yet. Mount a topic first (cta mount <thread> <path>).")
                     .foregroundStyle(.secondary)
@@ -869,7 +916,7 @@ private struct DigestSection: View {
                     digestRow(mount: mount)
                 }
             }
-            Text("Daily fire time, quiet hours, and timezone live in your terminal: cta config digest-time / quiet-hours / timezone. Edit HEARTBEAT.md inside each project to control what shows up.")
+            Text("Quiet hours live in your terminal: cta config quiet-hours. Edit HEARTBEAT.md inside each project to control what shows up. Model/effort apply to the agentic briefing only — Default inherits claude's own settings.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } header: {
@@ -879,7 +926,7 @@ private struct DigestSection: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .onAppear { reload() }
+        .onAppear { reload(); reloadScheduling() }
     }
 
     private var filteredMounts: [CTAClient.MountJSON] {
@@ -945,5 +992,65 @@ private struct DigestSection: View {
                 }
             }
         }
+    }
+
+    // MARK: - Scheduling (digest-time / timezone / agentic model + effort)
+
+    private func reloadScheduling() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let t = CTAClient.digestTime()
+            let tz = CTAClient.digestTimezone() ?? ""
+            let m = CTAClient.agenticModel() ?? ""
+            let e = CTAClient.agenticEffort() ?? ""
+            DispatchQueue.main.async {
+                if let d = Self.date(fromHHMM: t) { fireTime = d }
+                timezone = tz
+                model = m
+                effort = e
+            }
+        }
+    }
+
+    private func applyFireTime(_ d: Date) {
+        let hhmm = Self.hhmm(from: d)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { _ = try CTAClient.setDigestTime(hhmm) }
+            catch let e { DispatchQueue.main.async { error = "Fire time: \(e.localizedDescription)" } }
+        }
+    }
+
+    private func applyTimezone() {
+        let tz = timezone.trimmingCharacters(in: .whitespaces)
+        guard !tz.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { _ = try CTAClient.setTimezone(tz) }
+            catch let e { DispatchQueue.main.async { error = "Timezone: \(e.localizedDescription)" } }
+        }
+    }
+
+    private func applyModel(_ v: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { _ = try CTAClient.setAgenticModel(v.isEmpty ? nil : v) }
+            catch let e { DispatchQueue.main.async { error = "Model: \(e.localizedDescription)" } }
+        }
+    }
+
+    private func applyEffort(_ v: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { _ = try CTAClient.setAgenticEffort(v.isEmpty ? nil : v) }
+            catch let e { DispatchQueue.main.async { error = "Effort: \(e.localizedDescription)" } }
+        }
+    }
+
+    private static func date(fromHHMM s: String) -> Date? {
+        let parts = s.split(separator: ":")
+        guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]),
+              (0...23).contains(h), (0...59).contains(m) else { return nil }
+        return Calendar.current.date(bySettingHour: h, minute: m, second: 0, of: Date())
+    }
+
+    private static func hhmm(from d: Date) -> String {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+        return String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
     }
 }

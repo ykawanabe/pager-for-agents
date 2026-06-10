@@ -234,6 +234,41 @@ enum CTAClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    /// Set the daily-digest fire time — `cta config digest-time <HH:MM>`.
+    /// cta writes settings.json; the poller live-reloads within ~25s.
+    /// Same mutate-through-cta idiom as setIdleEvict.
+    @discardableResult
+    static func setDigestTime(_ hhmm: String) throws -> String {
+        let data = try run(args: ["config", "digest-time", hhmm])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Set the IANA timezone used by digest-time + quiet-hours —
+    /// `cta config timezone <IANA>` (e.g. Asia/Tokyo).
+    @discardableResult
+    static func setTimezone(_ tz: String) throws -> String {
+        let data = try run(args: ["config", "timezone", tz])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Pin the agentic runner's model — `cta config agentic-model <m>`.
+    /// nil clears the pin (claude's default model applies). Applies to the
+    /// NEXT agentic run; no restart needed.
+    @discardableResult
+    static func setAgenticModel(_ model: String?) throws -> String {
+        let data = try run(args: ["config", "agentic-model", model ?? "off"])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Pin the agentic runner's reasoning effort — `cta config agentic-effort
+    /// <low|medium|high|xhigh|max>`. nil clears the pin (claude's default,
+    /// which inherits the user settings.json effortLevel).
+    @discardableResult
+    static func setAgenticEffort(_ effort: String?) throws -> String {
+        let data = try run(args: ["config", "agentic-effort", effort ?? "off"])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     /// Toggle the H2 daily-digest for a single mount. Shells to
     /// `cta digest <thread> on|off`. cta mutates mounts.json's `digest`
     /// field (v3 schema) via mount-store's set-digest verb; the poller
@@ -454,11 +489,40 @@ enum CTAClient {
     struct SettingsJSON: Decodable, Equatable {
         let idleEvictMinutes: Int?
         let interruptOnMessage: Bool?
+        let digestTime: String?
+        let timezone: String?
+        let agenticModel: String?
+        let agenticEffort: String?
         enum CodingKeys: String, CodingKey {
             case idleEvictMinutes = "idle_evict_minutes"
             case interruptOnMessage = "interrupt_on_message"
+            case digestTime
+            case timezone
+            case agenticModel
+            case agenticEffort
         }
     }
+
+    /// Decode $STATE_DIR/settings.json, or nil when missing/unreadable.
+    /// Shared by the scheduling readers below — same direct-read idiom as
+    /// idleEvictMinutes() (reads are cheap; writes go through cta).
+    private static func readSettings() -> SettingsJSON? {
+        let path = "\(stateDir)/settings.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        return try? JSONDecoder().decode(SettingsJSON.self, from: data)
+    }
+
+    /// Daily-digest fire time, "09:00" when unset (the poller's default).
+    static func digestTime() -> String { readSettings()?.digestTime ?? "09:00" }
+
+    /// Configured IANA timezone, nil when unset (poller falls back to system tz).
+    static func digestTimezone() -> String? { readSettings()?.timezone }
+
+    /// Pinned agentic model, nil when unset (claude default applies).
+    static func agenticModel() -> String? { readSettings()?.agenticModel }
+
+    /// Pinned agentic reasoning effort, nil when unset (claude default applies).
+    static func agenticEffort() -> String? { readSettings()?.agenticEffort }
 
     /// Current idle-eviction threshold in minutes (0 = disabled / unset /
     /// unreadable). Reads $STATE_DIR/settings.json directly.
