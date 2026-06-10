@@ -2511,6 +2511,26 @@ async function handleDo(ev: InboundMessageEvent, args: string): Promise<void> {
   await launchAgentic(String(threadIdOf(ev)), dest.chatId, task, dest);
 }
 
+/** The open-ended "secretary" task the proactive heartbeat runs through the gated
+ *  executor (vs the narrow read-only open-prs digest). It reads inbox/calendar/
+ *  PRs and PREPARES what it can (drafts, summaries, filing) — the NOTIFY/silent
+ *  tier auto-does those — and only ASKS before sending/pushing/deleting. An
+ *  optional HEARTBEAT.md in the mount is the user's checklist; absent → defaults. */
+function buildSecretaryTask(mountPath: string): string {
+  let checklist = "";
+  try {
+    const md = readFileSync(join(mountPath, "HEARTBEAT.md"), "utf8").trim();
+    if (md) checklist = `\nMy checklist for you (HEARTBEAT.md):\n${md}\n`;
+  } catch { /* no checklist → defaults below */ }
+  return [
+    "Daily secretary check-in — proactive, on your own initiative (I didn't prompt you just now).",
+    "Go through what's on my plate and PREPARE what you can: read my inbox, calendar, and this project's open PRs / CI as relevant; triage, summarize, file, and SAVE EMAIL DRAFTS for replies I'll likely need (do NOT send them).",
+    "Do the safe, reversible things yourself without asking. For anything irreversible or outward — sending a message/email, git push, gh merge, deleting, spending — ASK me first; never do it unprompted.",
+    checklist,
+    "Then report back in ONE short Telegram message: what you handled, what's waiting for me (drafts to review, decisions to make), and anything urgent. If nothing genuinely needs attention, say so in one line.",
+  ].join("\n");
+}
+
 function digestDispatch(): void {
   // No paired chat → no place to deliver. Skip silently. (Tests construct
   // mountsCache directly so they don't hit this gate unless they want to.)
@@ -2560,6 +2580,24 @@ function digestDispatch(): void {
       process.stderr.write(`poller: heartbeat-state persist failed (continuing): ${e instanceof Error ? e.message : String(e)}\n`);
     }
     digestInFlight.add(threadIdStr);
+
+    // Open-ended secretary heartbeat: for an agentic-enabled mount, run the gated
+    // EXECUTOR directly with a "be my secretary" task (read inbox/calendar/PRs,
+    // prepare/draft what's safe, ask before sending) instead of the narrow
+    // read-only open-prs digest. The gate + NOTIFY classifier do safe-vs-ask. We
+    // branch BEFORE the digest's heartbeat-session + runHeartbeat (those serve the
+    // read-only digest path only). firedToday is already marked above.
+    if (mount.agentic?.enabled === true) {
+      digestInFlight.delete(threadIdStr); // launchAgentic owns its own in-flight guard
+      const secAddress: ChatAddress = {
+        channel: "telegram",
+        chatId,
+        threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
+      };
+      process.stdout.write(`[${new Date().toISOString()}] secretary heartbeat dispatch: thread=${threadIdStr} mount=${mount.path}\n`);
+      void launchAgentic(threadIdStr, chatId, buildSecretaryTask(mount.path), secAddress);
+      continue;
+    }
 
     // Resolve / create the per-thread heartbeat session UUID. First fire
     // generates a UUID and uses `--session-id` (claude creates the
@@ -2650,38 +2688,19 @@ function digestDispatch(): void {
           threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
         };
 
-        // Proactive watch-and-act (option 2): if this mount has agentic enabled
-        // and the read-only check found something, hand the findings to the gated
-        // executor (auto-do reversible, ask before risky) instead of just
-        // reporting. Same engine as /do — the digest is the trigger here.
-        if (mount.agentic?.enabled === true && result.status === "sent" && result.digestText) {
-          const proactiveTask = [
-            "Proactive check for this project. Here's what today's read-only scan surfaced:",
-            "",
-            result.digestText,
-            "",
-            "Handle what you can safely on your own — reversible, in-project actions, just do them.",
-            "For anything risky or outward (push, merge, delete, send a message, spend), ask me first.",
-            "If nothing actually needs doing, say so in one short line.",
-          ].join("\n");
-          try { await launchAgentic(threadIdStr, chatId, proactiveTask, address); }
+        // Deliver the read-only digest. (agentic-enabled mounts never reach here
+        // — they run the open-ended secretary heartbeat instead, branched before
+        // runHeartbeat.)
+        const shouldSend = result.status === "sent"
+          || (result.status === "empty" && mount.digest?.sendOnEmpty === true);
+        if (shouldSend) {
+          const body = result.status === "sent" && result.digestText
+            ? result.digestText
+            : "Nothing actionable today.";
+          const text = `📋 Daily digest\n\n${body}`;
+          try { await reply(address, text); }
           catch (e) {
-            process.stderr.write(`poller: proactive agentic launch failed: ${e instanceof Error ? e.message : String(e)}\n`);
-          }
-        } else {
-          const shouldSend = result.status === "sent"
-            || (result.status === "empty" && mount.digest?.sendOnEmpty === true);
-          if (shouldSend) {
-            const body = result.status === "sent" && result.digestText
-              ? result.digestText
-              : "Nothing actionable today.";
-            // Tag the message so it's distinguishable from interactive
-            // replies in Pager Watch and Telegram search.
-            const text = `📋 Daily digest\n\n${body}`;
-            try { await reply(address, text); }
-            catch (e) {
-              process.stderr.write(`poller: digest reply failed: ${e instanceof Error ? e.message : String(e)}\n`);
-            }
+            process.stderr.write(`poller: digest reply failed: ${e instanceof Error ? e.message : String(e)}\n`);
           }
         }
       } catch (e) {
