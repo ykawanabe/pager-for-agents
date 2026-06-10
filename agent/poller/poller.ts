@@ -52,7 +52,7 @@ import {
   writeState as writeHeartbeatState,
 } from "./heartbeat-checks/heartbeat-state";
 import { detectMissedTaskFire, shouldFireTask } from "./heartbeat-checks/scheduler";
-import { readTasks, type ScheduledTask } from "../tasks-store/tasks-store";
+import { readTasks, removeTask, setTaskEnabled, type ScheduledTask } from "../tasks-store/tasks-store";
 import { tasksJson, taskRunDir } from "../lib/paths";
 // Agentic 秘書 mode — gated executor + approval round-trip. The engine (policy,
 // approval store, gate hook, runner) lives under ./agentic; the poller wires the
@@ -1982,6 +1982,7 @@ async function handleHelp(ev: InboundMessageEvent): Promise<void> {
       "  /clear          — reset the conversation (new session UUID)",
       `  /effort <level> — set reasoning effort for this topic (${EFFORT_NAMES})`,
       "  /model <name>   — set model for this topic (opus|sonnet|haiku|full-id)",
+      "  /task           — scheduled tasks: list | run|on|off|rm <name>",
       "  /context        — approx context-window usage for this topic",
       "  /restart        — restart claude on this topic (keep session)",
       "  /stop           — abort the running turn (keeps session; queued messages stay)",
@@ -2092,6 +2093,7 @@ async function tryHandleCommand(ev: InboundMessageEvent): Promise<boolean> {
     case "/effort": await handleEffort(ev, args); return true;
     case "/model": await handleModel(ev, args); return true;
     case "/do":    await handleDo(ev, args); return true;
+    case "/task":  await handleTask(ev, args); return true;
     case "/help":  await handleHelp(ev); return true;
     default: {
       // TUI command framework: translated → run handler, hidden → reply,
@@ -2381,6 +2383,7 @@ const BOT_COMMAND_MENU = [
   { command: "effort",  description: `Set reasoning effort (${EFFORT_NAMES})` },
   { command: "model",   description: "Set model (opus|sonnet|haiku|full-id)" },
   { command: "do",      description: "Delegate a task — I act, asking before risky steps" },
+  { command: "task",    description: "Scheduled tasks: list / run / on / off / rm" },
 ];
 
 /** Publish the "/" command menu once at boot. Best-effort — a failure just
@@ -2549,6 +2552,73 @@ async function handleDo(ev: InboundMessageEvent, args: string): Promise<void> {
     return;
   }
   await launchAgentic(String(threadIdOf(ev)), dest.chatId, task, dest);
+}
+
+/** /task over Telegram — the chat-side handle on tasks.json. list / run / on /
+ *  off / rm cover the daily-driver needs; add/edit stay in the richer UIs
+ *  (Pager app Tasks tab, `cta task add`). Mutations go through tasks-store's
+ *  locked writers; the mtime bump makes refreshTasksIfChanged pick them up. */
+async function handleTask(ev: InboundMessageEvent, args: string): Promise<void> {
+  const dest = ev.address;
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  const sub = parts[0] ?? "list";
+  const name = parts[1] ?? "";
+  refreshTasksIfChanged();
+
+  if (sub === "list") {
+    if (tasksCache.length === 0) {
+      await reply(dest, "No scheduled tasks yet. Add one from the Pager app's Tasks tab or `cta task add …`.");
+      return;
+    }
+    const lines = tasksCache.map((t) => {
+      const days = Array.isArray(t.days) ? t.days.join(",") : t.days;
+      const src = t.checklist ? (t.checklist.split("/").pop() ?? "checklist") : "inline";
+      return `${t.enabled ? "🟢" : "⚪️"} ${t.name} — ${t.time} ${days} → ${String(t.topic)} (${src})`;
+    });
+    await reply(dest, ["Scheduled tasks:", ...lines, "", "Manage: /task run|on|off|rm <name>"].join("\n"));
+    return;
+  }
+
+  if (!["run", "on", "off", "rm"].includes(sub)) {
+    await reply(dest, "Usage: /task [list] | /task run <name> | /task on <name> | /task off <name> | /task rm <name>");
+    return;
+  }
+  if (!name) {
+    await reply(dest, `Usage: /task ${sub} <name> — see /task list`);
+    return;
+  }
+  // Existence check doubles as name sanitization: only names that passed
+  // tasks-store validation at add time can match, so `name` is safe to use
+  // as the run-now flag filename below.
+  const task = tasksCache.find((t) => t.name === name);
+  if (!task) {
+    await reply(dest, `No task named "${name}" — see /task list`);
+    return;
+  }
+
+  try {
+    switch (sub) {
+      case "run": {
+        mkdirSync(TASK_RUN_DIR, { recursive: true, mode: 0o700 });
+        writeFileSync(join(TASK_RUN_DIR, name), "");
+        await reply(dest, `▶️ Queued "${name}" — fires on the next tick (~5s).`);
+        return;
+      }
+      case "on":
+      case "off": {
+        await setTaskEnabled(name, sub === "on");
+        await reply(dest, `${sub === "on" ? "🟢 enabled" : "⚪️ disabled"} "${name}".`);
+        return;
+      }
+      case "rm": {
+        await removeTask(name);
+        await reply(dest, `🗑 Removed "${name}".`);
+        return;
+      }
+    }
+  } catch (e) {
+    await reply(dest, `⚠️ /task ${sub} failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 // ─── Scheduled tasks (proactive task scheduling) ─────────────────────────────
