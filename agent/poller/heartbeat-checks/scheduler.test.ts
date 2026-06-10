@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { detectMissedFire, shouldFire, type ShouldFireInput } from "./scheduler";
+import {
+  dayMatches, detectMissedFire, detectMissedTaskFire, shouldFire, shouldFireTask,
+  type ShouldFireInput, type ShouldFireTaskInput,
+} from "./scheduler";
 import { markFiredToday, type HeartbeatState } from "./heartbeat-state";
 
 const TZ = "Asia/Tokyo";
@@ -23,6 +26,97 @@ function input(overrides: Partial<ShouldFireInput> = {}): ShouldFireInput {
     ...overrides,
   };
 }
+
+describe("dayMatches", () => {
+  test("daily matches everything", () => {
+    for (const d of ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]) {
+      expect(dayMatches("daily", d)).toBe(true);
+    }
+  });
+  test("weekdays excludes sat/sun", () => {
+    expect(dayMatches("weekdays", "fri")).toBe(true);
+    expect(dayMatches("weekdays", "sat")).toBe(false);
+    expect(dayMatches("weekdays", "sun")).toBe(false);
+  });
+  test("explicit list", () => {
+    expect(dayMatches(["mon", "wed"], "wed")).toBe(true);
+    expect(dayMatches(["mon", "wed"], "tue")).toBe(false);
+  });
+});
+
+describe("shouldFireTask — scheduled-task gate", () => {
+  // 2026-06-01 is a MONDAY. 09:30 JST = 00:30 UTC.
+  function tinput(overrides: Partial<ShouldFireTaskInput> = {}): ShouldFireTaskInput {
+    return {
+      state: EMPTY,
+      taskKey: "task:morning-briefing",
+      time: "09:00",
+      days: "daily",
+      quietHours: null,
+      timezone: TZ,
+      isInFlight: () => false,
+      isMidTurn: () => false,
+      now: utc(2026, 6, 1, 0, 30),
+      ...overrides,
+    };
+  }
+
+  test("fires on a matching day past the time", () => {
+    const r = shouldFireTask(tinput());
+    expect(r.fire).toBe(true);
+    if (r.fire) expect(r.ymd).toBe("2026-06-01");
+  });
+
+  test("day-mismatch skips (weekdays task on Sunday)", () => {
+    // 2026-06-07 is a Sunday: 09:30 JST = 00:30 UTC.
+    const r = shouldFireTask(tinput({ days: "weekdays", now: utc(2026, 6, 7, 0, 30) }));
+    expect(r.fire).toBe(false);
+    if (!r.fire) expect(r.reason).toBe("day-mismatch");
+  });
+
+  test("already-fired wins over day-mismatch (dedupe first)", () => {
+    const state = markFiredToday(EMPTY, "task:morning-briefing", "2026-06-01");
+    const r = shouldFireTask(tinput({ state }));
+    expect(r.fire).toBe(false);
+    if (!r.fire) expect(r.reason).toBe("already-fired");
+  });
+
+  test("busy topic defers (in-flight), does NOT fire", () => {
+    const r = shouldFireTask(tinput({ isInFlight: () => true }));
+    expect(r.fire).toBe(false);
+    if (!r.fire) expect(r.reason).toBe("in-flight");
+  });
+
+  test("before task time → not-yet", () => {
+    // 08:30 JST = 23:30 UTC previous day
+    const r = shouldFireTask(tinput({ now: utc(2026, 5, 31, 23, 30) }));
+    expect(r.fire).toBe(false);
+    if (!r.fire) expect(r.reason).toBe("not-yet");
+  });
+});
+
+describe("detectMissedTaskFire — day-aware missed-day alert", () => {
+  // NOW = Monday 2026-06-08 09:30 JST (= 00:30 UTC). Yesterday = Sunday 06-07.
+  const MONDAY = utc(2026, 6, 8, 0, 30);
+  const KEY = "task:morning-briefing";
+
+  test("weekdays task does NOT alert about the (correctly skipped) Sunday", () => {
+    const state = markFiredToday(EMPTY, KEY, "2026-06-05"); // fired Friday
+    expect(detectMissedTaskFire({ state, taskKey: KEY, days: "weekdays", timezone: TZ, now: MONDAY }))
+      .toBe(null);
+  });
+
+  test("daily task DOES alert about a missed Sunday", () => {
+    const state = markFiredToday(EMPTY, KEY, "2026-06-06"); // fired Saturday, missed Sunday
+    expect(detectMissedTaskFire({ state, taskKey: KEY, days: "daily", timezone: TZ, now: MONDAY }))
+      .toBe("2026-06-07");
+  });
+
+  test("no older fire → no false alarm on first enabled day", () => {
+    expect(detectMissedTaskFire({ state: EMPTY, taskKey: KEY, days: "daily", timezone: TZ, now: MONDAY }))
+      .toBe(null);
+  });
+});
 
 describe("detectMissedFire — silently-skipped day alert", () => {
   // 09:30 JST 2026-06-03; yesterday in JST = 2026-06-02

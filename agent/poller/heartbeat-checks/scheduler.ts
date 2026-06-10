@@ -24,7 +24,7 @@
  */
 
 import { alreadyFiredToday, type HeartbeatState } from "./heartbeat-state";
-import { digestTimeReached, isInQuietHours, todayInTz, type QuietWindow } from "./quiet-hours";
+import { digestTimeReached, isInQuietHours, todayInTz, weekdayInTz, type QuietWindow } from "./quiet-hours";
 
 export interface ShouldFireInput {
   /** Persisted scheduler state (output of readState). */
@@ -62,6 +62,97 @@ export type SkipReason =
   | "quiet-hours"
   | "in-flight"
   | "user-busy";
+
+// ─── Scheduled tasks (proactive task scheduling) ─────────────────────────────
+
+/** Day spec for a scheduled task: every day, Mon-Fri, or an explicit list of
+ *  lowercase short weekdays ("mon".."sun"). */
+export type TaskDays = "daily" | "weekdays" | readonly string[];
+
+/** Does `weekday` (lowercase short, from weekdayInTz) satisfy the spec? */
+export function dayMatches(days: TaskDays, weekday: string): boolean {
+  if (days === "daily") return true;
+  if (days === "weekdays") return weekday !== "sat" && weekday !== "sun";
+  return days.includes(weekday);
+}
+
+export interface ShouldFireTaskInput {
+  readonly state: HeartbeatState;
+  /** Canonical task state key, e.g. "task:morning-briefing" — used verbatim
+   *  as the dayKey threadId segment, giving "task:<name>:<ymd>" keys that
+   *  can't collide with the legacy digest's "<threadId>:<ymd>". */
+  readonly taskKey: string;
+  /** Task-local fire time (HH:MM). */
+  readonly time: string;
+  readonly days: TaskDays;
+  readonly quietHours: QuietWindow | null | undefined;
+  readonly timezone: string;
+  /** The TARGET TOPIC's agentic in-flight guard. Critical: deciding "skip"
+   *  here (instead of marking fired and letting launchAgentic bounce off its
+   *  busy guard) means a busy topic DEFERS the task to the next tick rather
+   *  than silently losing it for the day. */
+  readonly isInFlight: () => boolean;
+  readonly isMidTurn: () => boolean;
+  readonly now: Date;
+}
+
+export type TaskSkipReason = SkipReason | "day-mismatch";
+
+export type ShouldFireTaskDecision =
+  | { readonly fire: false; readonly reason: TaskSkipReason }
+  | { readonly fire: true; readonly ymd: string };
+
+/** shouldFire generalized for scheduled tasks: same decision order with a
+ *  day-of-week gate inserted after the dedupe check. */
+export function shouldFireTask(input: ShouldFireTaskInput): ShouldFireTaskDecision {
+  const ymd = todayInTz(input.now, input.timezone);
+
+  if (alreadyFiredToday(input.state, input.taskKey, ymd)) {
+    return { fire: false, reason: "already-fired" };
+  }
+  if (!dayMatches(input.days, weekdayInTz(input.now, input.timezone))) {
+    return { fire: false, reason: "day-mismatch" };
+  }
+  if (!digestTimeReached(input.now, input.time, input.timezone)) {
+    return { fire: false, reason: "not-yet" };
+  }
+  if (isInQuietHours(input.now, input.quietHours, input.timezone)) {
+    return { fire: false, reason: "quiet-hours" };
+  }
+  if (input.isInFlight()) {
+    return { fire: false, reason: "in-flight" };
+  }
+  if (input.isMidTurn()) {
+    return { fire: false, reason: "user-busy" };
+  }
+  return { fire: true, ymd };
+}
+
+export interface MissedTaskFireInput {
+  readonly state: HeartbeatState;
+  readonly taskKey: string;
+  readonly days: TaskDays;
+  readonly timezone: string;
+  readonly now: Date;
+}
+
+/** detectMissedFire generalized for tasks: a day the task wasn't SCHEDULED to
+ *  run is never "missed" (a weekdays task must not alert every Monday about
+ *  the correctly-skipped Sunday). Same older-key guard against first-day
+ *  false alarms. */
+export function detectMissedTaskFire(input: MissedTaskFireInput): string | null {
+  const todayYmd = todayInTz(input.now, input.timezone);
+  const yesterday = new Date(input.now.getTime() - 86_400_000);
+  const yYmd = todayInTz(yesterday, input.timezone);
+  if (yYmd === todayYmd) return null; // degenerate tz math — bail safe
+  if (!dayMatches(input.days, weekdayInTz(yesterday, input.timezone))) return null;
+  if (alreadyFiredToday(input.state, input.taskKey, yYmd)) return null;
+  const prefix = `${input.taskKey}:`;
+  const hasOlderFire = Object.keys(input.state.firedToday).some(
+    (k) => k.startsWith(prefix) && k.slice(prefix.length) < yYmd,
+  );
+  return hasOlderFire ? yYmd : null;
+}
 
 export interface MissedFireInput {
   /** Persisted scheduler state (output of readState). */

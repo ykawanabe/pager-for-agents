@@ -44,6 +44,20 @@ export function todayInTz(now: Date, tz: string): string {
   }
 }
 
+/** Lowercase short weekday ("mon".."sun") for `now` in the given IANA tz.
+ *  DST-safe (Intl resolves the wall-clock per tz). Compute this and todayInTz
+ *  from the SAME `now` so a midnight boundary can't split them. */
+export function weekdayInTz(now: Date, tz: string): string {
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" })
+      .format(now)
+      .toLowerCase();
+  } catch {
+    // Unknown tz — fall back to UTC weekday.
+    return ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][now.getUTCDay()];
+  }
+}
+
 /** Extract minute-of-day (0-1439) for `now` in the given IANA tz. */
 export function minuteOfDayInTz(now: Date, tz: string): number {
   try {

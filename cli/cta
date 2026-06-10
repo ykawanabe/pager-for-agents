@@ -67,6 +67,9 @@ PAIRED_STATE_FILE="$STATE_DIR/paired.json"
 # shellcheck disable=SC2034  # not read by cta directly; kept as a state-path the tests/test_cta.sh guard verifies resolves from $STATE_DIR
 MOUNTS_FILE="$STATE_DIR/mounts.json"
 TOPICS_FILE="$STATE_DIR/topics.json"
+# shellcheck disable=SC2034  # written by tasks-store.ts; kept for the state-path guard
+TASKS_FILE="$STATE_DIR/tasks.json"
+TASK_RUN_DIR="$STATE_DIR/task-run"
 MOUNT_STORE_TS="$INSTALL_DIR/agent/mount-store/mount-store.ts"
 
 # Default emoji used by `cta config ack on`. Must be in Telegram's free-bot
@@ -1388,6 +1391,95 @@ _mount_store_path() {
   echo "$d/mount-store/mount-store.ts"
 }
 
+# Locate tasks-store.ts (scheduled tasks). Same CTA_AGENT_DIR seam as
+# mount-store so tests can point at the repo copy.
+_tasks_store_path() {
+  local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
+  echo "$d/tasks-store/tasks-store.ts"
+}
+
+# ─── Scheduled tasks (proactive task scheduling) ─────────────────────────────
+# `cta task` manages tasks.json (tasks-store.ts owns the locked/atomic writes).
+# Each task fires a gated agentic run at its own time/days into its own topic
+# — the morning briefing is just the first task. The poller hot-reloads
+# tasks.json on mtime change, so edits apply within ~5s, no restart.
+cmd_task() {
+  local sub="${1:-list}"
+  shift 2>/dev/null || true
+  local store
+  store=$(_tasks_store_path)
+  if [[ ! -f "$store" ]]; then
+    echo "tasks-store not found at $store (re-run install.sh)" >&2
+    return 1
+  fi
+  case "$sub" in
+    list)
+      if [[ "${1:-}" == "--json" ]]; then
+        bun run "$store" list
+      else
+        bun run "$store" list | python3 -c '
+import json, sys
+tasks = json.load(sys.stdin).get("tasks", [])
+if not tasks:
+    print("(no scheduled tasks — add one: cta task add <name> --time HH:MM --checklist <md>)")
+for t in tasks:
+    days = t.get("days", "daily")
+    if isinstance(days, list):
+        days = ",".join(days)
+    what = t.get("checklist") or (t.get("prompt") or "")[:48]
+    state = "on " if t.get("enabled", True) else "OFF"
+    print("[%s] %-24s %s  %-9s topic=%-5s %s" % (state, t.get("name","?"), t.get("time","?"), days, t.get("topic"), what))
+'
+      fi
+      ;;
+    add)
+      local name="${1:-}"
+      shift 2>/dev/null || true
+      if [[ -z "$name" ]]; then
+        echo "Usage: cta task add <name> --time HH:MM [--days daily|weekdays|mon,wed] (--checklist <md path> | --prompt <text>) [--topic dm|<id>] [--model m] [--effort e]" >&2
+        return 1
+      fi
+      bun run "$store" add "$name" "$@"
+      ;;
+    rm|remove)
+      bun run "$store" remove "${1:-}"
+      ;;
+    on)
+      bun run "$store" set-enabled "${1:-}" on
+      ;;
+    off)
+      bun run "$store" set-enabled "${1:-}" off
+      ;;
+    run)
+      local name="${1:-}"
+      if [[ -z "$name" ]]; then
+        echo "Usage: cta task run <name>" >&2
+        return 1
+      fi
+      local found
+      found=$(bun run "$store" get "$name") || return 1
+      if [[ "$found" == "null" ]]; then
+        echo "No task named '$name'. See: cta task list" >&2
+        return 1
+      fi
+      # touch-flag IPC, consumed (unlink-before-fire) by the poller's next
+      # housekeep tick. Does not consume today's scheduled fire.
+      mkdir -p "$TASK_RUN_DIR"
+      chmod 700 "$TASK_RUN_DIR" 2>/dev/null || true
+      touch "$TASK_RUN_DIR/$name"
+      if _poller_alive; then
+        echo "Queued '$name' — fires on the next poll tick (~5s)."
+      else
+        echo "Queued '$name' — but the poller is NOT running (cta start). It fires once the poller is back."
+      fi
+      ;;
+    *)
+      echo "Usage: cta task <list [--json] | add <name> … | rm <name> | on <name> | off <name> | run <name>>" >&2
+      return 1
+      ;;
+  esac
+}
+
 _watch_render_path() {
   local d="${CTA_AGENT_DIR:-$INSTALL_DIR/agent}"
   echo "$d/poller/watch-render.ts"
@@ -2301,6 +2393,10 @@ Usage:
   cta config timezone <IANA>      Set the tz used by digest-time + quiet-hours (e.g. Asia/Tokyo)
   cta config agentic-model <m>    Pin the agentic runner's model (opus|sonnet|haiku|id; 'off' = claude default)
   cta config agentic-effort <e>   Pin the agentic runner's reasoning effort (low|medium|high|xhigh|max; 'off' = default)
+  cta task list [--json]          List scheduled tasks (proactive agentic runs, each with own time/days/topic)
+  cta task add <name> --time HH:MM [--days d] (--checklist <md> | --prompt <t>) [--topic dm|<id>] [--model m] [--effort e]
+  cta task rm|on|off <name>       Remove / enable / disable a scheduled task
+  cta task run <name>             Fire a task NOW (touch-flag; doesn't consume today's scheduled fire)
   cta digest <thread> [on|off|init]
                                   Show or toggle per-mount H2 daily digest. \`init\`
                                   scaffolds HEARTBEAT.md in the mount dir
@@ -2340,6 +2436,7 @@ main() {
     pair) cmd_pair "$@" ;;
     unpair) cmd_unpair "$@" ;;
     config) cmd_config "$@" ;;
+    task) cmd_task "$@" ;;
     digest) cmd_digest "$@" ;;
     migrate-state) cmd_migrate_state "$@" ;;
     init) cmd_init "$@" ;;

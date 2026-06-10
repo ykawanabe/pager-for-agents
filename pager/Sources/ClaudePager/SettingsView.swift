@@ -150,6 +150,11 @@ struct SettingsView: View {
             PagerTab(caffeinate: caffeinate, monitor: monitor)
                 .tabItem { Label("Pager", systemImage: "macbook") }
 
+            // Scheduled tasks — proactive agentic runs (morning briefing etc.),
+            // each with its own time/days/topic. Replaced the daily digest.
+            TasksTab()
+                .tabItem { Label("Tasks", systemImage: "clock.badge.checkmark") }
+
             // Bot identity + access: token, allowlist, ack reaction. Everything
             // that ends up in ~/.claude/channels/telegram/{env,access.json}.
             TelegramTab(config: config)
@@ -277,8 +282,6 @@ private struct PagerTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            DigestSection()
         }
         .formStyle(.grouped)
         .onAppear {
@@ -914,185 +917,225 @@ private struct AboutTab: View {
     }
 }
 
-// MARK: - Daily digest section (H2)
+// MARK: - Tasks tab (scheduled proactive runs)
 
-/// Per-mount H2 daily-digest controls. v1 keeps Pager intentionally thin —
-/// the on/off toggle here writes via `cta digest <thread> on|off`; the
-/// reminder time / quiet hours / timezone all live in `cta config` (CLI
-/// only, per the H2 plan's "stable core / volatile edges" discipline).
-///
-/// The list refreshes on appear and after each toggle. Wildcard mounts
-/// ("*") are filtered out — they aren't a real topic the digest can fire
-/// against. Mounts without HEARTBEAT.md show a small inline hint about
-/// running `cta digest <thread> init`.
-private struct DigestSection: View {
+/// Scheduled tasks — the first-class schedule (replaced the legacy daily
+/// digest 2026-06-10). Each row is a task that fires a gated agentic run at
+/// its own time/days into its own topic; "Add Task…" opens a sheet. Reads go
+/// through `cta task list --json`; mutations through `cta task <verb>` — the
+/// poller hot-reloads tasks.json, so changes apply live.
+private struct TasksTab: View {
+    @State private var tasks: [CTAClient.TaskJSON] = []
     @State private var mounts: [CTAClient.MountJSON] = []
-    @State private var loading = false
-    @State private var error: String? = nil
-    // Scheduling state — mirrors $STATE_DIR/settings.json (read direct, write
-    // through cta; the poller live-reloads within ~25s, no restart needed).
-    @State private var fireTime: Date = DigestSection.date(fromHHMM: "09:00") ?? Date()
+    @State private var isGroup = false
     @State private var timezone: String = ""
     @State private var model: String = ""   // "" = claude default
     @State private var effort: String = ""  // "" = claude default
+    @State private var error: String? = nil
+    @State private var status: String? = nil
+    @State private var showAddSheet = false
+    @State private var refreshTimer: Timer? = nil
 
-    private let modelPresets: [(label: String, tag: String)] = [
+    fileprivate static let modelPresets: [(label: String, tag: String)] = [
         ("Default", ""), ("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku"),
     ]
-    private let effortPresets: [(label: String, tag: String)] = [
+    fileprivate static let effortPresets: [(label: String, tag: String)] = [
         ("Default", ""), ("Low", "low"), ("Medium", "medium"),
         ("High", "high"), ("XHigh", "xhigh"), ("Max", "max"),
     ]
 
     var body: some View {
-        Section {
-            if let err = error {
-                Label(err, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.red)
-                    .font(.caption)
-            }
-
-            DatePicker("Fire time", selection: Binding(
-                get: { fireTime },
-                set: { d in fireTime = d; applyFireTime(d) }
-            ), displayedComponents: .hourAndMinute)
-
-            HStack {
-                Text("Timezone")
-                Spacer()
-                TextField("Asia/Tokyo", text: $timezone)
-                    .frame(maxWidth: 160)
-                    .multilineTextAlignment(.trailing)
-                    .onSubmit { applyTimezone() }
-            }
-
-            Picker("Briefing model", selection: Binding(
-                get: { model },
-                set: { v in model = v; applyModel(v) }
-            )) {
-                ForEach(modelPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
-                // Reflect a full model id pinned via `cta config agentic-model`
-                if !model.isEmpty && !modelPresets.contains(where: { $0.tag == model }) {
-                    Text(model).tag(model)
+        Form {
+            Section {
+                if let err = error {
+                    Label(err, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                }
+                if tasks.isEmpty {
+                    Text("No scheduled tasks yet. Add one — each task fires an agentic run at its own time, into its own topic (the morning briefing is just a task).")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                } else {
+                    ForEach(tasks) { t in
+                        taskRow(t)
+                    }
+                }
+            } header: {
+                Text("Scheduled tasks")
+            } footer: {
+                if let s = status {
+                    Label(s, systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.caption)
+                } else {
+                    Text("Tasks run unattended through the safety gate: reads run silently, anything risky would pause — so task checklists stay read-only + drafts.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
-            Picker("Briefing effort", selection: Binding(
-                get: { effort },
-                set: { v in effort = v; applyEffort(v) }
-            )) {
-                ForEach(effortPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
+            Section {
+                HStack {
+                    Spacer()
+                    Button {
+                        showAddSheet = true
+                    } label: {
+                        Label("Add Task…", systemImage: "plus")
+                    }
+                }
             }
 
-            if mounts.isEmpty && !loading {
-                Text("No mounts yet. Mount a topic first (cta mount <thread> <path>).")
+            Section {
+                HStack {
+                    Text("Timezone")
+                    Spacer()
+                    TextField("Asia/Tokyo", text: $timezone)
+                        .frame(maxWidth: 160)
+                        .multilineTextAlignment(.trailing)
+                        .onSubmit { applyTimezone() }
+                }
+                Picker("Default model", selection: Binding(
+                    get: { model },
+                    set: { v in model = v; applyModel(v) }
+                )) {
+                    ForEach(Self.modelPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
+                    if !model.isEmpty && !Self.modelPresets.contains(where: { $0.tag == model }) {
+                        Text(model).tag(model)
+                    }
+                }
+                Picker("Default effort", selection: Binding(
+                    get: { effort },
+                    set: { v in effort = v; applyEffort(v) }
+                )) {
+                    ForEach(Self.effortPresets, id: \.tag) { p in Text(p.label).tag(p.tag) }
+                }
+            } header: {
+                Text("Defaults")
+            } footer: {
+                Text("Timezone applies to every task's fire time. Model/effort are the defaults for agentic runs (tasks + /do); Default inherits claude's own settings.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                    .font(.caption)
-            } else {
-                ForEach(filteredMounts, id: \.id) { mount in
-                    digestRow(mount: mount)
-                }
             }
-            Text("Quiet hours live in your terminal: cta config quiet-hours. Edit HEARTBEAT.md inside each project to control what shows up. Model/effort apply to the agentic briefing only — Default inherits claude's own settings.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } header: {
-            Text("Daily digest")
-        } footer: {
-            Text("A once-a-day summary of each project's open PRs, CI status, and any urgent TODOs you've flagged with HEARTBEAT_URGENT. Plays nice with quiet hours.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
-        .onAppear { reload(); reloadScheduling() }
+        .formStyle(.grouped)
+        .sheet(isPresented: $showAddSheet) {
+            AddTaskSheet(mounts: realMounts, isGroup: isGroup) { name, time, days, checklist, prompt, topic in
+                add(name: name, time: time, days: days, checklist: checklist, prompt: prompt, topic: topic)
+            }
+        }
+        .onAppear {
+            reload()
+            refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in reload() }
+        }
+        .onDisappear { refreshTimer?.invalidate(); refreshTimer = nil }
     }
 
-    private var filteredMounts: [CTAClient.MountJSON] {
-        mounts.filter { m in
-            // Skip the "*" wildcard mount — it's a catch-all template, not
-            // a real topic. The digest can't fire against it.
-            m.threadId.stringValue != "*"
-        }
+    private var realMounts: [CTAClient.MountJSON] {
+        mounts.filter { $0.threadId.stringValue != "*" }
     }
 
     @ViewBuilder
-    private func digestRow(mount: CTAClient.MountJSON) -> some View {
-        let threadStr = mount.threadId.stringValue
-        let enabled = mount.digest?.enabled ?? false
-        let topicName = mount.topicName ?? mount.label ?? threadStr
-        Toggle(isOn: Binding(
-            get: { enabled },
-            set: { on in toggle(thread: threadStr, on: on) }
-        )) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(topicName).font(.body)
-                Text("thread \(threadStr) · \(mount.path)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+    private func taskRow(_ t: CTAClient.TaskJSON) -> some View {
+        HStack(spacing: 8) {
+            Toggle(isOn: Binding(
+                get: { t.enabled },
+                set: { on in setEnabled(t.name, on) }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(t.name).font(.body)
+                    Text("\(t.time) · \(t.days.label) · \(topicLabel(t)) · \(sourceLabel(t))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
+            Spacer()
+            Button("Run now") { runNow(t.name) }
+                .buttonStyle(.borderless)
+                .help("Fire this task immediately (doesn't consume today's scheduled fire)")
+            Button { remove(t.name) } label: {
+                Image(systemName: "minus.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove")
         }
+    }
+
+    private func topicLabel(_ t: CTAClient.TaskJSON) -> String {
+        let topicStr = t.topic.stringValue
+        if let m = mounts.first(where: { $0.threadId.stringValue == topicStr }) {
+            if let n = m.topicName, !n.isEmpty { return n }
+            if let l = m.label, !l.isEmpty { return l }
+        }
+        if topicStr == "dm" { return isGroup ? "General" : "DM" }
+        return "#\(topicStr)"
+    }
+
+    private func sourceLabel(_ t: CTAClient.TaskJSON) -> String {
+        if let c = t.checklist, !c.isEmpty { return (c as NSString).lastPathComponent }
+        return "inline prompt"
     }
 
     private func reload() {
-        loading = true
-        error = nil
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let list = try CTAClient.listMounts()
+                let list = try CTAClient.listTasks()
+                let ms = try CTAClient.listMounts()
+                let group = (CTAClient.pairedState()?.chatId ?? 0) < 0
+                let tz = CTAClient.digestTimezone() ?? ""
+                let m = CTAClient.agenticModel() ?? ""
+                let e = CTAClient.agenticEffort() ?? ""
                 DispatchQueue.main.async {
-                    mounts = list
-                    loading = false
+                    tasks = list; mounts = ms; isGroup = group
+                    timezone = tz; model = m; effort = e
+                    error = nil
                 }
             } catch let e {
-                DispatchQueue.main.async {
-                    error = "Failed to load mounts: \(e.localizedDescription)"
-                    loading = false
-                }
+                DispatchQueue.main.async { error = "Failed to load tasks: \(e.localizedDescription)" }
             }
         }
     }
 
-    private func toggle(thread: String, on: Bool) {
+    private func add(name: String, time: String, days: String, checklist: String?, prompt: String?, topic: String) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                // sendOnEmpty default false in Pager v1 — operator can opt
-                // into it via `cta digest <thread> on --send-on-empty`.
-                // Pager's toggle is the binary "do you want daily digests
-                // for this project" question; the empty-day confirmation
-                // is a power-user preference.
-                _ = try CTAClient.setDigest(thread: thread, on: on)
+                _ = try CTAClient.taskAdd(name: name, time: time, days: days,
+                                          checklist: checklist, prompt: prompt, topic: topic)
                 DispatchQueue.main.async { reload() }
             } catch let e {
+                DispatchQueue.main.async { error = "Add failed: \(e.localizedDescription)" }
+            }
+        }
+    }
+
+    private func setEnabled(_ name: String, _ on: Bool) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { _ = try CTAClient.taskSetEnabled(name, on); DispatchQueue.main.async { reload() } }
+            catch let e { DispatchQueue.main.async { error = "Toggle failed: \(e.localizedDescription)" } }
+        }
+    }
+
+    private func remove(_ name: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do { _ = try CTAClient.taskRemove(name); DispatchQueue.main.async { reload() } }
+            catch let e { DispatchQueue.main.async { error = "Remove failed: \(e.localizedDescription)" } }
+        }
+    }
+
+    private func runNow(_ name: String) {
+        status = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                _ = try CTAClient.taskRun(name)
                 DispatchQueue.main.async {
-                    error = "Toggle failed: \(e.localizedDescription)"
+                    status = "Queued '\(name)' — fires on the next poll tick (~5s)."
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { status = nil }
                 }
+            } catch let e {
+                DispatchQueue.main.async { error = "Run failed: \(e.localizedDescription)" }
             }
-        }
-    }
-
-    // MARK: - Scheduling (digest-time / timezone / agentic model + effort)
-
-    private func reloadScheduling() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let t = CTAClient.digestTime()
-            let tz = CTAClient.digestTimezone() ?? ""
-            let m = CTAClient.agenticModel() ?? ""
-            let e = CTAClient.agenticEffort() ?? ""
-            DispatchQueue.main.async {
-                if let d = Self.date(fromHHMM: t) { fireTime = d }
-                timezone = tz
-                model = m
-                effort = e
-            }
-        }
-    }
-
-    private func applyFireTime(_ d: Date) {
-        let hhmm = Self.hhmm(from: d)
-        DispatchQueue.global(qos: .userInitiated).async {
-            do { _ = try CTAClient.setDigestTime(hhmm) }
-            catch let e { DispatchQueue.main.async { error = "Fire time: \(e.localizedDescription)" } }
         }
     }
 
@@ -1119,15 +1162,140 @@ private struct DigestSection: View {
         }
     }
 
-    private static func date(fromHHMM s: String) -> Date? {
+    fileprivate static func date(fromHHMM s: String) -> Date? {
         let parts = s.split(separator: ":")
         guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]),
               (0...23).contains(h), (0...59).contains(m) else { return nil }
         return Calendar.current.date(bySettingHour: h, minute: m, second: 0, of: Date())
     }
 
-    private static func hhmm(from d: Date) -> String {
+    fileprivate static func hhmm(from d: Date) -> String {
         let c = Calendar.current.dateComponents([.hour, .minute], from: d)
         return String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
+    }
+}
+
+/// "New task" sheet — name, fire time, days, what to run (checklist file or
+/// inline prompt), and target topic. Mirrors AddProjectSheet's structure.
+private struct AddTaskSheet: View {
+    let mounts: [CTAClient.MountJSON]
+    let isGroup: Bool
+    let onAdd: (_ name: String, _ time: String, _ days: String,
+                _ checklist: String?, _ prompt: String?, _ topic: String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String = ""
+    @State private var fireTime: Date = TasksTab.date(fromHHMM: "07:00") ?? Date()
+    @State private var daysChoice: String = "daily"   // daily | weekdays | custom
+    @State private var customDays: String = ""        // e.g. "mon,wed,fri"
+    @State private var sourceKind: String = "checklist"
+    @State private var checklistPath: String = ""
+    @State private var promptText: String = ""
+    @State private var topicSelection: String = "dm"
+
+    private var effectiveDays: String {
+        daysChoice == "custom" ? customDays.trimmingCharacters(in: .whitespaces) : daysChoice
+    }
+    private var isValid: Bool {
+        let nameOk = name.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]*$", options: .regularExpression) != nil
+        let sourceOk = sourceKind == "checklist"
+            ? !checklistPath.trimmingCharacters(in: .whitespaces).isEmpty
+            : !promptText.trimmingCharacters(in: .whitespaces).isEmpty
+        let daysOk = daysChoice != "custom" || !customDays.trimmingCharacters(in: .whitespaces).isEmpty
+        return nameOk && sourceOk && daysOk
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Name").font(.subheadline).foregroundStyle(.secondary)
+                        TextField("e.g. morning-briefing", text: $name)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    DatePicker("Fire time", selection: $fireTime, displayedComponents: .hourAndMinute)
+                    Picker("Days", selection: $daysChoice) {
+                        Text("Daily").tag("daily")
+                        Text("Weekdays").tag("weekdays")
+                        Text("Custom…").tag("custom")
+                    }
+                    if daysChoice == "custom" {
+                        TextField("mon,wed,fri", text: $customDays)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    Picker("Run", selection: $sourceKind) {
+                        Text("Checklist file").tag("checklist")
+                        Text("Inline prompt").tag("prompt")
+                    }
+                    if sourceKind == "checklist" {
+                        HStack(spacing: 6) {
+                            TextField("~/claude-home/HEARTBEAT.md", text: $checklistPath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.body, design: .monospaced))
+                            Button("Choose…") { pickChecklist() }
+                        }
+                    } else {
+                        TextEditor(text: $promptText)
+                            .font(.system(.body))
+                            .frame(height: 80)
+                            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+                    }
+                    Picker("Topic", selection: $topicSelection) {
+                        ForEach(mounts, id: \.id) { m in
+                            Text(topicLabel(m)).tag(m.threadId.stringValue)
+                        }
+                    }
+                } header: {
+                    Text("New task")
+                } footer: {
+                    Text("The task fires an agentic run with the checklist/prompt as its ENTIRE job — keep it read-only + drafts so unattended runs never stall on approvals.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+
+            Divider()
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Add") {
+                    let checklist = sourceKind == "checklist"
+                        ? (checklistPath as NSString).expandingTildeInPath : nil
+                    let prompt = sourceKind == "prompt" ? promptText : nil
+                    onAdd(name, TasksTab.hhmm(from: fireTime), effectiveDays, checklist, prompt, topicSelection)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!isValid)
+            }
+            .padding(12)
+        }
+        .frame(width: 480, height: 480)
+        .onAppear {
+            if !mounts.contains(where: { $0.threadId.stringValue == topicSelection }) {
+                topicSelection = mounts.first?.threadId.stringValue ?? "dm"
+            }
+        }
+    }
+
+    private func topicLabel(_ m: CTAClient.MountJSON) -> String {
+        if let n = m.topicName, !n.isEmpty { return n }
+        if let l = m.label, !l.isEmpty { return l }
+        let s = m.threadId.stringValue
+        return s == "dm" ? (isGroup ? "General" : "DM") : "#\(s)"
+    }
+
+    private func pickChecklist() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Pick the checklist markdown this task runs"
+        if panel.runModal() == .OK, let url = panel.url {
+            checklistPath = url.path
+        }
     }
 }

@@ -269,6 +269,85 @@ enum CTAClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    // MARK: - Scheduled tasks (proactive task scheduling)
+
+    /// One scheduled task from `cta task list --json` (tasks.json v1 — each
+    /// task fires a gated agentic run at its own time/days into its own
+    /// topic). Reads go through cta (the versioned UI contract), never by
+    /// reading tasks.json directly.
+    struct TaskJSON: Decodable, Equatable, Identifiable {
+        var id: String { name }
+        let name: String
+        let time: String
+        let days: DaysValue
+        let checklist: String?
+        let prompt: String?
+        let topic: MountJSON.ThreadIdValue
+        let model: String?
+        let effort: String?
+        let enabled: Bool
+
+        /// "daily"/"weekdays" or an explicit weekday list — same
+        /// string-or-other tolerant decode shape as ThreadIdValue.
+        enum DaysValue: Decodable, Equatable {
+            case preset(String)
+            case list([String])
+            init(from decoder: Decoder) throws {
+                let c = try decoder.singleValueContainer()
+                if let s = try? c.decode(String.self) { self = .preset(s) }
+                else { self = .list(try c.decode([String].self)) }
+            }
+            var label: String {
+                switch self {
+                case .preset(let s): return s == "weekdays" ? "Weekdays" : "Daily"
+                case .list(let l):
+                    return l.map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: ", ")
+                }
+            }
+        }
+    }
+
+    private struct TasksListJSON: Decodable {
+        let version: Int
+        let tasks: [TaskJSON]
+    }
+
+    /// List scheduled tasks. Blocking; call off the main thread.
+    static func listTasks() throws -> [TaskJSON] {
+        let data = try run(args: ["task", "list", "--json"])
+        return try JSONDecoder().decode(TasksListJSON.self, from: data).tasks
+    }
+
+    @discardableResult
+    static func taskAdd(name: String, time: String, days: String, checklist: String?,
+                        prompt: String?, topic: String) throws -> String {
+        var args = ["task", "add", name, "--time", time, "--days", days, "--topic", topic]
+        if let c = checklist, !c.isEmpty { args += ["--checklist", c] }
+        if let p = prompt, !p.isEmpty { args += ["--prompt", p] }
+        let data = try run(args: args)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    @discardableResult
+    static func taskRemove(_ name: String) throws -> String {
+        let data = try run(args: ["task", "rm", name])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    @discardableResult
+    static func taskSetEnabled(_ name: String, _ on: Bool) throws -> String {
+        let data = try run(args: ["task", on ? "on" : "off", name])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Queue an immediate fire (touch-flag consumed by the poller's next
+    /// tick). Does not consume the day's scheduled fire.
+    @discardableResult
+    static func taskRun(_ name: String) throws -> String {
+        let data = try run(args: ["task", "run", name])
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     /// Toggle the H2 daily-digest for a single mount. Shells to
     /// `cta digest <thread> on|off`. cta mutates mounts.json's `digest`
     /// field (v3 schema) via mount-store's set-digest verb; the poller

@@ -918,7 +918,7 @@ state_paths_resolve_from_state_dir() {
     source "'"$SCRIPT_DIR"'/cli/cta"
     # Each state-file path must contain $STATE_DIR (default ~/.pager) or
     # $INSTALL_DIR (default ~/.local/share/pager) when expanded.
-    for var in PAIRING_CODE_FILE PAIRED_STATE_FILE MOUNTS_FILE ENV_FILE CAFFEINATE_PID_FILE; do
+    for var in PAIRING_CODE_FILE PAIRED_STATE_FILE MOUNTS_FILE TASKS_FILE TASK_RUN_DIR ENV_FILE CAFFEINATE_PID_FILE; do
       val="${!var}"
       case "$val" in
         "$STATE_DIR"/*) ;;
@@ -943,7 +943,7 @@ overridden_state_dir_takes_effect() {
   CTA_STATE_DIR=/tmp/cta-test-state-$$ bash -c '
     set -uo pipefail
     source "'"$SCRIPT_DIR"'/cli/cta"
-    for var in PAIRING_CODE_FILE PAIRED_STATE_FILE MOUNTS_FILE ENV_FILE CAFFEINATE_PID_FILE; do
+    for var in PAIRING_CODE_FILE PAIRED_STATE_FILE MOUNTS_FILE TASKS_FILE TASK_RUN_DIR ENV_FILE CAFFEINATE_PID_FILE; do
       val="${!var}"
       case "$val" in
         /tmp/cta-test-state-*/*) ;;

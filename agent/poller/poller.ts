@@ -51,10 +51,9 @@ import {
   readState as readHeartbeatState,
   writeState as writeHeartbeatState,
 } from "./heartbeat-checks/heartbeat-state";
-import { detectMissedFire, shouldFire as digestShouldFire } from "./heartbeat-checks/scheduler";
-import { runHeartbeat } from "./heartbeat-checks/heartbeat-runner";
-import { appendFireLog } from "./heartbeat-checks/heartbeat-log";
-import { heartbeatSessionFile } from "../lib/paths";
+import { detectMissedTaskFire, shouldFireTask } from "./heartbeat-checks/scheduler";
+import { readTasks, type ScheduledTask } from "../tasks-store/tasks-store";
+import { tasksJson, taskRunDir } from "../lib/paths";
 // Agentic 秘書 mode — gated executor + approval round-trip. The engine (policy,
 // approval store, gate hook, runner) lives under ./agentic; the poller wires the
 // Telegram surface (cards, buttons, /do, proactive routing) here.
@@ -282,15 +281,12 @@ let agenticModel: string | undefined = undefined;
 // (currently xhigh) — pin lower via `cta config agentic-effort medium` to cut
 // scheduled-run cost without changing interactive sessions.
 let agenticEffort: string | undefined = undefined;
-// H2 daily-digest scheduler state. Loaded from disk on poller boot (the
+// Scheduled-task scheduler state. Loaded from disk on poller boot (the
 // `firedToday` map survives restarts so we never fire twice on the same
 // local-tz day, even if the poller relaunches mid-day). Mutated in
-// digestDispatch and persisted before the runner spawns (write-through —
-// a crash during runHeartbeat counts as "fired today" so we don't retry
-// on next tick). `digestInFlight` is the in-memory collision guard so two
-// housekeep ticks can't race a second runner for the same mount.
+// taskDispatch and persisted BEFORE the runner spawns (write-through — a
+// crash during fire counts as "fired today" so we don't retry on next tick).
 let heartbeatState: HeartbeatState = { version: 1, firedToday: {} };
-const digestInFlight = new Set<string>();
 let settingsMtimeMs = 0;
 // Idle-clear tuning. When an idle topic's transcript exceeds this many bytes,
 // the idle sweep flushes durable memory then rotates the session UUID (a real
@@ -2462,7 +2458,7 @@ function approvalDispatch(): void {
 
 /** Spawn the gated agentic executor for `task` in `threadId`'s mount, streaming
  *  progress back to the chat. Detached — never blocks the caller. */
-async function launchAgentic(threadId: string, chatId: number, task: string, dest: ChatAddress, runOpts?: { systemPrompt?: string }): Promise<void> {
+async function launchAgentic(threadId: string, chatId: number, task: string, dest: ChatAddress, runOpts?: { systemPrompt?: string; model?: string; effort?: string; sessionKey?: string }): Promise<void> {
   if (agenticInFlight.has(threadId)) {
     await reply(dest, "I'm still working on a task in this topic — let me finish this one first.");
     return;
@@ -2478,8 +2474,13 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
     mkdirSync(AGENTIC_LOG_DIR, { recursive: true, mode: 0o700 });
   } catch { /* best effort */ }
 
-  // Per-topic session UUID for --resume continuity (first run --session-id creates it).
-  const sessionFile = join(AGENTIC_SESSIONS_DIR, threadId);
+  // Session UUID for --resume continuity (first run --session-id creates it).
+  // sessionKey defaults to the topic; scheduled tasks pass "task-<name>" so
+  // each task keeps its own cross-day context. NOTE: threadId stays the real
+  // topic — it drives mount lookup, approval-card routing, and the in-flight
+  // guard; only the session FILE is per-task.
+  const sessionKey = runOpts?.sessionKey ?? threadId;
+  const sessionFile = join(AGENTIC_SESSIONS_DIR, sessionKey);
   let sessionUuid: string;
   let resumeExisting: boolean;
   try {
@@ -2494,10 +2495,10 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
 
   agenticInFlight.add(threadId);
   await reply(dest, "🤖 On it — I'll handle the safe steps myself and ask before anything risky.");
-  // Pin the model at dispatch time so a settings reload mid-run can't make the
-  // result log misattribute which model produced this run.
-  const model = agenticModel;
-  const effort = agenticEffort;
+  // Pin model/effort at dispatch time so a settings reload mid-run can't make
+  // the result log misattribute the run. Per-task overrides win over globals.
+  const model = runOpts?.model ?? agenticModel;
+  const effort = runOpts?.effort ?? agenticEffort;
   process.stdout.write(`[${new Date().toISOString()}] agentic dispatch: thread=${threadId} mount=${mountPath} model=${model ?? "default"} effort=${effort ?? "default"} task="${task.slice(0, 80)}"\n`);
 
   void (async () => {
@@ -2518,7 +2519,7 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
         settingsPath: AGENTIC_SETTINGS_FILE,
         sessionUuid,
         resumeExisting,
-        logFile: join(AGENTIC_LOG_DIR, `${threadId}.jsonl`),
+        logFile: join(AGENTIC_LOG_DIR, `${sessionKey}.jsonl`),
         onText: (t) => { streamedAny = true; void reply(dest, t); },
       });
       process.stdout.write(`[${new Date().toISOString()}] agentic result: thread=${threadId} status=${result.status} model=${model ?? "default"} effort=${effort ?? "default"} cost=$${result.totalCostUsd.toFixed(4)} dur=${result.durationMs}ms\n`);
@@ -2526,7 +2527,7 @@ async function launchAgentic(threadId: string, chatId: number, task: string, des
       // changed) → drop the session pointer so the next run recreates it fresh.
       if (result.status === "error" && resumeExisting
           && (result.errorMessage ?? "").includes("No conversation found")) {
-        try { unlinkSync(join(AGENTIC_SESSIONS_DIR, threadId)); } catch { /* gone */ }
+        try { unlinkSync(join(AGENTIC_SESSIONS_DIR, sessionKey)); } catch { /* gone */ }
       }
       if (result.status === "error") await reply(dest, `⚠️ Agentic run failed: ${result.errorMessage ?? "unknown error"}`);
       else if (result.status === "timeout") await reply(dest, "⏱ Agentic run hit its time budget and stopped.");
@@ -2550,24 +2551,71 @@ async function handleDo(ev: InboundMessageEvent, args: string): Promise<void> {
   await launchAgentic(String(threadIdOf(ev)), dest.chatId, task, dest);
 }
 
-/** The open-ended "secretary" task the proactive heartbeat runs through the gated
- *  executor (vs the narrow read-only open-prs digest). It reads inbox/calendar/
- *  PRs and PREPARES what it can (drafts, summaries, filing) — the NOTIFY/silent
- *  tier auto-does those — and only ASKS before sending/pushing/deleting. An
- *  optional HEARTBEAT.md in the mount is the user's checklist; absent → defaults. */
-function buildSecretaryTask(mountPath: string): string {
-  let checklist = "";
+// ─── Scheduled tasks (proactive task scheduling) ─────────────────────────────
+// tasks.json (tasks-store) is the first-class schedule: each task fires a
+// gated agentic run at its own time/days into its own topic. This REPLACED
+// the legacy "daily digest" (single global digestTime, read-only open-prs
+// summary) on 2026-06-10 — the morning briefing is simply task #1.
+
+/** Canonical task state key → firedToday rows "task:<name>:<ymd>" (cannot
+ *  collide with the legacy digest's "<threadId>:<ymd>" rows). */
+function taskKey(name: string): string { return `task:${name}`; }
+/** Per-task agentic-session filename. Distinct from the per-topic key so two
+ *  tasks on one topic don't share --resume context; the topic-level
+ *  agenticInFlight guard still serializes them at run time. */
+function taskSessionKey(name: string): string { return `task-${name}`; }
+
+// tasks.json hot-reload cache (mirrors refreshMountsIfChanged: mtime-gated,
+// parse failure keeps the last good cache).
+let tasksCache: ScheduledTask[] = [];
+let tasksMtimeMs = -1;
+const TASKS_FILE = tasksJson();
+const TASK_RUN_DIR = taskRunDir();
+function refreshTasksIfChanged(): void {
+  let mtimeMs = 0;
+  try { mtimeMs = statSync(TASKS_FILE).mtimeMs; } catch { /* missing → empty store */ }
+  if (mtimeMs === tasksMtimeMs) return;
   try {
-    const md = readFileSync(join(mountPath, "HEARTBEAT.md"), "utf8").trim();
-    if (md) checklist = `\nMy checklist for you (HEARTBEAT.md):\n${md}\n`;
-  } catch { /* no checklist → defaults below */ }
+    tasksCache = readTasks().tasks;
+    tasksMtimeMs = mtimeMs;
+    process.stdout.write(`[${new Date().toISOString()}] tasks reloaded (${tasksCache.length} entries)\n`);
+  } catch (e) {
+    tasksMtimeMs = mtimeMs;
+    process.stderr.write(`poller: tasks.json reload failed (keeping ${tasksCache.length} cached): ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
+/** Resolve a task's target topic to its mount, or null when unmounted (a task
+ *  may only fire into a real mounted topic — launchAgentic's wildcard/cwd
+ *  fallback would silently run in the wrong directory). */
+function resolveTaskTopic(task: ScheduledTask): { threadIdStr: string; mount: Mount } | null {
+  const key = task.topic === "dm" ? ("dm" as const) : Number(task.topic);
+  const mount = mountsCache.get(tgKey(key));
+  if (!mount) return null;
+  return { threadIdStr: String(task.topic), mount };
+}
+
+/** Build the prompt for a scheduled task. Inline `prompt` is used verbatim;
+ *  a `checklist` file is injected whole. Missing/unreadable checklist → null:
+ *  the caller skips the fire and warns — NEVER falls back to open-ended
+ *  secretary framing on an unattended run (that framing's exploration is
+ *  exactly what stalls on the approval gate with nobody awake). */
+function buildTaskPrompt(task: ScheduledTask): string | null {
+  let body: string | null = null;
+  if (task.prompt) {
+    body = task.prompt;
+  } else {
+    try {
+      const md = readFileSync(task.checklist ?? "", "utf8").trim();
+      if (md) body = md;
+    } catch { /* missing → null */ }
+  }
+  if (!body) return null;
   return [
-    "Daily secretary check-in — proactive, on your own initiative (I didn't prompt you just now).",
-    "Go through what's on my plate and PREPARE what you can: read my inbox, calendar, and this project's open PRs / CI as relevant; triage, summarize, file, and SAVE EMAIL DRAFTS for replies I'll likely need (do NOT send them).",
-    "For Gmail and Calendar use the `gog` CLI (e.g. `gog gmail list`, `gog gmail draft …`, `gog calendar list`) — in this background context the claude.ai Gmail/Calendar MCP connectors can stall, so prefer the CLI and don't wait on a hanging connector.",
-    "Do the safe, reversible things yourself without asking. For anything irreversible or outward — sending a message/email, git push, gh merge, deleting, spending — ASK me first; never do it unprompted.",
-    checklist,
-    "Then report back in ONE short Telegram message: what you handled, what's waiting for me (drafts to review, decisions to make), and anything urgent. If nothing genuinely needs attention, say so in one line.",
+    `Scheduled task "${task.name}" (I didn't prompt you just now — this is the scheduled fire).`,
+    "The instructions below are the ENTIRE job. Follow them exactly; do not do anything else.",
+    "",
+    body,
   ].join("\n");
 }
 
@@ -2584,27 +2632,14 @@ const DIGEST_ONLY_SYSTEM_PROMPT = [
   "Telegram renders your text as plain text — no markdown. Your streamed text IS the delivered briefing; always end with the briefing message itself.",
 ].join("\n");
 
-/** Task for the scheduled fire when the mount has a HEARTBEAT.md: the checklist
- *  verbatim, with none of buildSecretaryTask's open-ended framing. Falls back
- *  to the generic secretary task when HEARTBEAT.md is absent. */
-function buildDigestOnlyTask(mountPath: string): { task: string; digestOnly: boolean } {
-  let md = "";
-  try { md = readFileSync(join(mountPath, "HEARTBEAT.md"), "utf8").trim(); } catch { /* absent */ }
-  if (!md) return { task: buildSecretaryTask(mountPath), digestOnly: false };
-  return {
-    task: [
-      "Scheduled briefing run (I didn't prompt you just now — this is the daily fire).",
-      "The checklist below is the ENTIRE job. Follow it exactly; do not do anything else.",
-      "",
-      md,
-    ].join("\n"),
-    digestOnly: true,
-  };
-}
-
-function digestDispatch(): void {
-  // No paired chat → no place to deliver. Skip silently. (Tests construct
-  // mountsCache directly so they don't hit this gate unless they want to.)
+/** Scheduled-task dispatcher — runs every housekeep tick; fires each enabled
+ *  task at its own time/days through the gated agentic executor with the
+ *  digest-only system prompt. Busy topic → shouldFireTask returns in-flight
+ *  and the task DEFERS to the next tick (it is NOT marked fired — marking
+ *  happens only on actual hand-off, so a busy morning can't silently eat the
+ *  briefing for the day). */
+const taskWarnedOnce = new Set<string>();
+function taskDispatch(): void {
   const chatIdStr = effectiveChatId();
   if (!chatIdStr) return;
   const chatId = Number(chatIdStr);
@@ -2612,195 +2647,130 @@ function digestDispatch(): void {
 
   const now = new Date();
 
-  for (const mount of mountsCache.values()) {
-    if (mount.channel !== "telegram") continue;       // H2 is Telegram-only for v1
-    if (mount.thread_id === "*") continue;            // wildcard isn't a real topic
-    if (!mount.digest || mount.digest.enabled !== true) continue;
+  for (const task of tasksCache) {
+    if (task.enabled !== true) continue;
+    const resolved = resolveTaskTopic(task);
+    if (!resolved) {
+      if (!taskWarnedOnce.has(task.name)) {
+        taskWarnedOnce.add(task.name);
+        process.stderr.write(`poller: task "${task.name}" targets unmounted topic ${String(task.topic)} — skipping until mounted\n`);
+      }
+      continue;
+    }
+    const { threadIdStr, mount } = resolved;
+    const key = taskKey(task.name);
+    const dest: ChatAddress = {
+      channel: "telegram",
+      chatId,
+      threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
+    };
 
-    const threadIdStr = String(mount.thread_id);
-    if (digestInFlight.has(threadIdStr)) continue;
-
-    // Missed-fire alert: if the host slept past digestTime into the next
-    // calendar day, that day was silently skipped — surface it once so
-    // silence is never mistaken for success. Marking the missed ymd as
-    // fired is what makes the alert one-shot.
-    const missedYmd = detectMissedFire({ state: heartbeatState, threadId: threadIdStr, timezone: digestTimezone, now });
+    // Missed-day alert (one-shot; day-aware so a weekdays task never
+    // false-alarms about the correctly-skipped Sunday).
+    const missedYmd = detectMissedTaskFire({
+      state: heartbeatState, taskKey: key, days: task.days, timezone: digestTimezone, now,
+    });
     if (missedYmd) {
-      heartbeatState = markFiredToday(heartbeatState, threadIdStr, missedYmd);
-      try { writeHeartbeatState(heartbeatState); } catch { /* same best-effort as the fire path */ }
-      process.stdout.write(`[${new Date().toISOString()}] digest missed-fire: thread=${threadIdStr} ymd=${missedYmd}\n`);
-      void reply(
-        { channel: "telegram", chatId, threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined },
-        `⚠️ ${missedYmd} の briefing は発火しませんでした(おそらく ${digestTime} 時点で Mac がスリープ)。今日の分は通常どおり走ります。`,
-      );
+      heartbeatState = markFiredToday(heartbeatState, key, missedYmd);
+      try { writeHeartbeatState(heartbeatState); } catch { /* best effort */ }
+      process.stdout.write(`[${new Date().toISOString()}] task missed-fire: task=${task.name} ymd=${missedYmd}\n`);
+      void reply(dest, `⚠️ task "${task.name}" は ${missedYmd} に発火しませんでした(おそらく ${task.time} 時点で Mac がスリープ)。今日の分は通常どおり走ります。`);
     }
 
-    const decision = digestShouldFire({
+    const decision = shouldFireTask({
       state: heartbeatState,
-      threadId: threadIdStr,
-      digestTime,
+      taskKey: key,
+      time: task.time,
+      days: task.days,
       quietHours: digestQuietHours,
       timezone: digestTimezone,
-      isInFlight: () => digestInFlight.has(threadIdStr),
+      isInFlight: () => agenticInFlight.has(threadIdStr),
       isMidTurn: () => {
-        // The interactive daemon's state machine has 5 states; we treat
-        // pending / inFlight / released / crashed as "user-busy". "idle"
-        // and "absent" (no daemon for this thread yet) are both "not busy".
-        // Bug we hit on first live setup: getStatus returns the literal
-        // string "absent" for an unknown thread, NOT null — a null check
-        // here silently skipped every mount on a fresh boot.
+        // getStatus returns the literal string "absent" for an unknown thread,
+        // NOT null — a null check here silently skipped every fire on a fresh
+        // boot (same gotcha the digest dispatcher hit on first live setup).
         if (!daemonRegistry) return false;
         const s = daemonRegistry.getStatus(threadIdStr);
         return s !== "absent" && s !== "idle";
       },
       now,
     });
-
     if (!decision.fire) continue;
 
-    // Write-through: persist BEFORE spawn so a crash during fire still
-    // counts as "fired today" (we don't want a retry that double-sends).
-    heartbeatState = markFiredToday(heartbeatState, threadIdStr, decision.ymd);
+    const prompt = buildTaskPrompt(task);
+    if (prompt === null) {
+      // Missing checklist: mark fired (don't hammer retries all day) + warn.
+      heartbeatState = markFiredToday(heartbeatState, key, decision.ymd);
+      try { writeHeartbeatState(heartbeatState); } catch { /* best effort */ }
+      void reply(dest, `⚠️ task "${task.name}": checklist が読めません (${task.checklist ?? "?"}) — 今日の実行をスキップ。`);
+      continue;
+    }
+
+    // Write-through BEFORE spawn: a crash during fire counts as "fired today"
+    // (no same-day double-send).
+    heartbeatState = markFiredToday(heartbeatState, key, decision.ymd);
     try { writeHeartbeatState(heartbeatState); }
     catch (e) {
       process.stderr.write(`poller: heartbeat-state persist failed (continuing): ${e instanceof Error ? e.message : String(e)}\n`);
     }
-    digestInFlight.add(threadIdStr);
 
-    // Open-ended secretary heartbeat: for an agentic-enabled mount, run the gated
-    // EXECUTOR directly with a "be my secretary" task (read inbox/calendar/PRs,
-    // prepare/draft what's safe, ask before sending) instead of the narrow
-    // read-only open-prs digest. The gate + NOTIFY classifier do safe-vs-ask. We
-    // branch BEFORE the digest's heartbeat-session + runHeartbeat (those serve the
-    // read-only digest path only). firedToday is already marked above.
-    if (mount.agentic?.enabled === true) {
-      digestInFlight.delete(threadIdStr); // launchAgentic owns its own in-flight guard
-      const secAddress: ChatAddress = {
+    process.stdout.write(`[${new Date().toISOString()}] task dispatch: task=${task.name} topic=${threadIdStr} mount=${mount.path}\n`);
+    void launchAgentic(threadIdStr, chatId, prompt, dest, {
+      systemPrompt: DIGEST_ONLY_SYSTEM_PROMPT,
+      model: task.model,
+      effort: task.effort,
+      sessionKey: taskSessionKey(task.name),
+    });
+  }
+}
+
+/** Manual "run now": `cta task run <name>` touches $STATE_DIR/task-run/<name>;
+ *  consume on the next tick (unlink BEFORE firing — a crash drops the request,
+ *  never replays it; same contract as processInjectFlags). Bypasses the
+ *  time/day/firedToday gates but NOT the topic's in-flight guard, and does NOT
+ *  markFiredToday — the scheduled fire is still owed. */
+let taskRunSweepInFlight = false;
+function processTaskRunFlags(): void {
+  if (taskRunSweepInFlight) return;
+  taskRunSweepInFlight = true;
+  try {
+    let names: string[] = [];
+    try {
+      names = require("node:fs").readdirSync(TASK_RUN_DIR) as string[];
+    } catch { return; } // dir absent → nothing queued
+    if (names.length === 0) return;
+    const chatIdStr = effectiveChatId();
+    if (!chatIdStr) return;
+    const chatId = Number(chatIdStr);
+    for (const name of names) {
+      try { unlinkSync(join(TASK_RUN_DIR, name)); } catch { continue; }
+      const task = tasksCache.find((t) => t.name === name);
+      if (!task) {
+        process.stderr.write(`poller: task-run flag for unknown task "${name}" — ignored\n`);
+        continue;
+      }
+      const resolved = resolveTaskTopic(task);
+      if (!resolved) continue;
+      const dest: ChatAddress = {
         channel: "telegram",
         chatId,
-        threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
+        threadId: typeof resolved.mount.thread_id === "number" ? resolved.mount.thread_id : undefined,
       };
-      // Scheduled fire uses the digest-only task + system prompt when the mount
-      // has a HEARTBEAT.md (checklist-exact, no exploration — unattended runs
-      // must never stall on an approval card). /do keeps the full secretary
-      // framing; only this proactive caller is narrowed.
-      const { task: secTask, digestOnly } = buildDigestOnlyTask(mount.path);
-      process.stdout.write(`[${new Date().toISOString()}] secretary heartbeat dispatch: thread=${threadIdStr} mount=${mount.path} digestOnly=${digestOnly}\n`);
-      void launchAgentic(threadIdStr, chatId, secTask, secAddress,
-        digestOnly ? { systemPrompt: DIGEST_ONLY_SYSTEM_PROMPT } : undefined);
-      continue;
-    }
-
-    // Resolve / create the per-thread heartbeat session UUID. First fire
-    // generates a UUID and uses `--session-id` (claude creates the
-    // session). Subsequent fires read the UUID and use `--resume` so
-    // claude inherits yesterday's context. `resumeExisting` tracks
-    // which path we're on this call.
-    const sessionFile = heartbeatSessionFile(threadIdStr);
-    let sessionUuid: string;
-    let resumeExisting: boolean;
-    try {
-      sessionUuid = readFileSync(sessionFile, "utf8").trim();
-      if (!sessionUuid) throw new Error("empty");
-      resumeExisting = true;
-    } catch {
-      sessionUuid = randomUUID();
-      resumeExisting = false;
-      // Do NOT persist the UUID yet. runHeartbeat can short-circuit
-      // (no-heartbeat-md) BEFORE spawning claude — persisting here left a session
-      // file for a session claude never created, so the NEXT fire --resumed a
-      // non-existent session and errored "No conversation found with session ID".
-      // We write it only after the run confirms claude created it (post-run block
-      // below). 2026-06-10.
-    }
-
-    const startedAt = new Date().toISOString();
-    const mountPath = mount.path;
-    process.stdout.write(`[${new Date().toISOString()}] digest dispatch: thread=${threadIdStr} mount=${mountPath} ymd=${decision.ymd}\n`);
-
-    // Detached fire — never block the housekeep tick. The closure captures
-    // a snapshot of (chatId, threadId, mount) so a later mount change
-    // doesn't race the in-flight runner.
-    void (async () => {
-      try {
-        const result = await runHeartbeat({
-          mountPath,
-          threadId: threadIdStr,
-          sessionUuid,
-          resumeExisting,
-        });
-        process.stdout.write(`[${new Date().toISOString()}] digest result: thread=${threadIdStr} status=${result.status} cost=$${result.totalCostUsd.toFixed(4)} ran=[${result.checksRan.join(",")}] errored=[${result.checksErrored.join(",")}]\n`);
-
-        // Append per-fire log (cta digest log will tail this).
-        try {
-          appendFireLog({
-            thread_id: threadIdStr,
-            started_at: startedAt,
-            trigger: "daily",
-            duration_ms: result.durationMs,
-            checks_ran: result.checksRan,
-            checks_errored: result.checksErrored,
-            result: result.status,
-            total_cost_usd: result.totalCostUsd,
-            skip_reason: result.status === "no-heartbeat-md" ? "no-heartbeat-md" : null,
-            ...(result.errorMessage ? { error_message: result.errorMessage } : {}),
-          });
-        } catch (e) {
-          process.stderr.write(`poller: digest log append failed: ${e instanceof Error ? e.message : String(e)}\n`);
-        }
-
-        // Persist the heartbeat session UUID only once claude actually
-        // created/used it (status sent/empty), so a pre-spawn short-circuit never
-        // leaves a dangling --resume target; and self-heal a stale pointer if a
-        // --resume hit a session that no longer exists.
-        try {
-          if ((result.status === "sent" || result.status === "empty") && !resumeExisting) {
-            mkdirSync(join(STATE_DIR, "heartbeat-sessions"), { recursive: true, mode: 0o700 });
-            writeFileSync(sessionFile, sessionUuid + "\n", { mode: 0o600 });
-          } else if (result.status === "error" && resumeExisting
-                     && (result.errorMessage ?? "").includes("No conversation found")) {
-            try { unlinkSync(sessionFile); } catch { /* already gone */ }
-            process.stdout.write(`[${new Date().toISOString()}] heartbeat: cleared stale session for ${threadIdStr} (recreate next fire)\n`);
-          }
-        } catch (e) {
-          process.stderr.write(`poller: heartbeat-session persist failed (continuing): ${e instanceof Error ? e.message : String(e)}\n`);
-        }
-
-        // Decide whether to deliver. Three branches:
-        //  - status="sent": always deliver the model's digest text.
-        //  - status="empty" + digest.sendOnEmpty=true: deliver a fixed
-        //    "nothing actionable" confirmation so the operator gets a
-        //    daily heartbeat even on a quiet day.
-        //  - everything else (no-heartbeat-md, error, timeout, empty
-        //    without sendOnEmpty): no ping. operator inspects via
-        //    `cta digest log` / `cta digest doctor`.
-        const address: ChatAddress = {
-          channel: "telegram",
-          chatId,
-          threadId: typeof mount.thread_id === "number" ? mount.thread_id : undefined,
-        };
-
-        // Deliver the read-only digest. (agentic-enabled mounts never reach here
-        // — they run the open-ended secretary heartbeat instead, branched before
-        // runHeartbeat.)
-        const shouldSend = result.status === "sent"
-          || (result.status === "empty" && mount.digest?.sendOnEmpty === true);
-        if (shouldSend) {
-          const body = result.status === "sent" && result.digestText
-            ? result.digestText
-            : "Nothing actionable today.";
-          const text = `📋 Daily digest\n\n${body}`;
-          try { await reply(address, text); }
-          catch (e) {
-            process.stderr.write(`poller: digest reply failed: ${e instanceof Error ? e.message : String(e)}\n`);
-          }
-        }
-      } catch (e) {
-        process.stderr.write(`poller: digest run crashed: ${e instanceof Error ? e.message : String(e)}\n`);
-      } finally {
-        digestInFlight.delete(threadIdStr);
+      const prompt = buildTaskPrompt(task);
+      if (prompt === null) {
+        void reply(dest, `⚠️ task "${task.name}": checklist が読めません (${task.checklist ?? "?"}) — run-now を中止。`);
+        continue;
       }
-    })();
+      process.stdout.write(`[${new Date().toISOString()}] task run-now: task=${task.name} topic=${resolved.threadIdStr}\n`);
+      void launchAgentic(resolved.threadIdStr, chatId, prompt, dest, {
+        systemPrompt: DIGEST_ONLY_SYSTEM_PROMPT,
+        model: task.model,
+        effort: task.effort,
+        sessionKey: taskSessionKey(task.name),
+      });
+    }
+  } finally {
+    taskRunSweepInFlight = false;
   }
 }
 
@@ -2892,9 +2862,12 @@ export async function main(): Promise<void> {
         refreshMountsIfChanged();
         refreshPairedIfChanged();
         refreshSettingsIfChanged();
-        // H2 daily digest scheduler — pure-logic shouldFire() per mount,
-        // detached runHeartbeat on fire=true. Never blocks the tick.
-        digestDispatch();
+        // Scheduled tasks — pure-logic shouldFireTask() per task, detached
+        // gated agentic fire on fire=true. Never blocks the tick. run-now
+        // flags from `cta task run` are consumed on the same cadence.
+        refreshTasksIfChanged();
+        taskDispatch();
+        processTaskRunFlags();
         // Agentic approval cards — render pending requests the gate hook wrote,
         // reap expired ones. Detached sends; never blocks the tick.
         approvalDispatch();

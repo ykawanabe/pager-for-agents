@@ -80,6 +80,15 @@ export function heartbeatLogFile(threadId: string | "dm"): string {
  *  during fire() doesn't cause a same-day retry. */
 export function heartbeatStateFile(): string { return join(stateDir(), "heartbeat-state.json"); }
 export function caffeinatePidFile(): string { return join(stateDir(), "caffeinate.pid"); }
+
+// ─── Scheduled tasks (proactive task scheduling) ─────────────────────────────
+/** Task definitions: `{ version: 1, tasks: [{ name, time, days, checklist|prompt,
+ *  topic, model?, effort?, enabled }] }`. Written by tasks-store (bun, locked,
+ *  atomic); hot-reloaded by the poller on mtime change. */
+export function tasksJson(): string { return join(stateDir(), "tasks.json"); }
+/** Run-now flag dir: `cta task run <name>` touches `<name>` here; the poller's
+ *  housekeep consumes (unlink-before-fire) on the next tick. */
+export function taskRunDir(): string { return join(stateDir(), "task-run"); }
 export function sessionsDir(): string { return join(stateDir(), "sessions"); }
 export function typingDir(): string { return join(stateDir(), "typing"); }
 export function agentLog(): string { return join(stateDir(), "agent.log"); }
