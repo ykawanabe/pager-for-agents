@@ -86,6 +86,8 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `/list` | Anywhere | Show current mounts |
 | `/help` | Anywhere | List commands |
 | `/stop` | The active topic | Abort the running Claude turn; your next message resumes the same session |
+| `/do <task>` | The active topic | Delegate a one-off task — Claude acts on the safe, reversible steps and asks before anything risky |
+| `/task` | Anywhere | Scheduled tasks: list them, or `run` / `on` / `off` / `rm <name>` to manage |
 
 ### Host-side commands (terminal)
 
@@ -100,6 +102,8 @@ Send these inside Telegram (in the paired chat, as the paired user):
 | `cta config idle-evict <min>` | Evict idle Claude sessions after N minutes to free RAM (`0` = off; default off). Quiet topics are closed and resume on your next message; same knob as the Pager "Memory" toggle. Applies within ~25s, no restart |
 | `cta config interrupt-steer <on\|off>` | Mid-turn steering (`on` by default). When on, a message sent while Claude is working interrupts and redirects it after a ~1.5s debounce. Set `off` to make new messages queue until the current task finishes. Same knob as the Pager "Mid-turn steering" toggle. Applies within ~25s, no restart |
 | `cta config sleep-fix <on\|off\|status>` | Harden macOS power settings so the poller never freezes when the Mac idles. `on` runs `sudo pmset -a sleep 0 disksleep 0 standby 0 powernap 0`; `status` reports it. See [troubleshooting](docs/troubleshooting.md) |
+| `cta task list` | List proactive scheduled tasks + each one's last-fire status |
+| `cta task add\|template\|run\|on\|off\|rm …` | Create / scaffold / fire-now / toggle / remove a scheduled task — its own time, days (incl. `monthly:<1-31>` / `every:<N>`), and topic. Runs through the same safety gate (read-only + drafts unattended); `--notify-only-if <marker>` keeps quiet days silent. Also in the Pager app's Tasks tab |
 
 ### Troubleshooting
 
