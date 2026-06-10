@@ -32,7 +32,7 @@
              - /usr/local/bin — Intel Homebrew
              so the same plist works on both architectures. -->
         <key>PATH</key>
-        <string>__HOME__/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin</string>
+        <string>__HOME__/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin:__HOME__/go/bin</string>
         <key>HOME</key>
         <string>__HOME__</string>
     </dict>
