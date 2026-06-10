@@ -68,6 +68,23 @@ describe("bash — gog (Google Workspace CLI): read/draft silent, send/create as
   test("gog calendar create → ask", () => expect(classify(bash("gog calendar create --title x")).tier).toBe("ask"));
 });
 
+describe("bash — notion-cli (Notion CLI): read silent, write ask", () => {
+  // read verb may sit in toks[1] (e.g. `search`) or toks[2] (e.g. `db query`)
+  test("notion-cli db query → silent", () => expect(classify(bash("notion-cli db query DBID")).tier).toBe("silent"));
+  test("notion-cli search → silent (read verb in toks[1])", () => expect(classify(bash("notion-cli search foo")).tier).toBe("silent"));
+  test("notion-cli page get → silent", () => expect(classify(bash("notion-cli page get PAGEID")).tier).toBe("silent"));
+  test("notion-cli list → silent", () => expect(classify(bash("notion-cli list")).tier).toBe("silent"));
+  test("notion-cli db retrieve → silent", () => expect(classify(bash("notion-cli db retrieve DBID")).tier).toBe("silent"));
+  test("notion-cli page create → ask (outward)", () => {
+    const c = classify(bash("notion-cli page create --title x"));
+    expect(c.tier).toBe("ask");
+    expect(c.reversibility).toBe("outward");
+  });
+  test("notion-cli db update → ask", () => expect(classify(bash("notion-cli db update DBID")).tier).toBe("ask"));
+  test("notion-cli page delete → ask", () => expect(classify(bash("notion-cli page delete PAGEID")).tier).toBe("ask"));
+  test("notion-cli block append → ask", () => expect(classify(bash("notion-cli block append BLOCKID")).tier).toBe("ask"));
+});
+
 describe("bash — env builtins → silent", () => {
   test("export → silent", () => expect(classify(bash("export FOO=bar")).tier).toBe("silent"));
   test("cd → silent", () => expect(classify(bash("cd /tmp")).tier).toBe("silent"));
