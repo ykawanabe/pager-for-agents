@@ -66,6 +66,12 @@ describe("bash — gog (Google Workspace CLI): read/draft silent, send/create as
   test("gog gmail send → ask (outward)", () =>
     expect(classify(bash("gog gmail send --to recipient")).tier).toBe("ask"));
   test("gog calendar create → ask", () => expect(classify(bash("gog calendar create --title x")).tier).toBe("ask"));
+  test("gog gmail attachment → silent (downloads your own attachment — read)", () =>
+    expect(classify(bash("gog gmail attachment MSGID ATTID --out /tmp/x.pdf")).tier).toBe("silent"));
+  test("gog gmail messages/thread → silent", () => {
+    expect(classify(bash("gog gmail messages")).tier).toBe("silent");
+    expect(classify(bash("gog gmail thread 123")).tier).toBe("silent");
+  });
 });
 
 describe("bash — notion-cli (Notion CLI): read silent, write ask", () => {
