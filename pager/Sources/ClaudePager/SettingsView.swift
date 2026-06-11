@@ -934,6 +934,7 @@ private struct TasksTab: View {
     @State private var error: String? = nil
     @State private var status: String? = nil
     @State private var showAddSheet = false
+    @State private var detailTask: CTAClient.TaskJSON? = nil
     @State private var refreshTimer: Timer? = nil
     @State private var lastRuns: [String: String] = [:]
 
@@ -1026,6 +1027,9 @@ private struct TasksTab: View {
                     topic: topic, model: model, effort: effort, notifyOnlyIf: notifyOnlyIf)
             }
         }
+        .sheet(item: $detailTask) { t in
+            TaskDetailSheet(task: t, topicLabel: topicLabel(t), lastRun: lastRuns[t.name])
+        }
         .onAppear {
             reload()
             refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in reload() }
@@ -1063,6 +1067,11 @@ private struct TasksTab: View {
                 }
             }
             Spacer()
+            Button { detailTask = t } label: {
+                Image(systemName: "info.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("View this task's full details + checklist")
             Button("Run now") { runNow(t.name) }
                 .buttonStyle(.borderless)
                 .help("Fire this task immediately (doesn't consume today's scheduled fire)")
@@ -1240,6 +1249,10 @@ private struct AddTaskSheet: View {
                         Text("Name").font(.subheadline).foregroundStyle(.secondary)
                         TextField("e.g. morning-briefing", text: $name)
                             .textFieldStyle(.roundedBorder)
+                        if !name.isEmpty && name.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]*$", options: .regularExpression) == nil {
+                            Text("Start with a letter or digit, then letters/digits/. _ - only (no spaces). It becomes a filename.")
+                                .font(.caption2).foregroundStyle(.red)
+                        }
                     }
                     DatePicker("Fire time", selection: $fireTime, displayedComponents: .hourAndMinute)
                     Picker("Days", selection: $daysChoice) {
@@ -1343,6 +1356,91 @@ private struct AddTaskSheet: View {
         panel.message = "Pick the checklist markdown this task runs"
         if panel.runModal() == .OK, let url = panel.url {
             checklistPath = url.path
+        }
+    }
+}
+
+/// Read-only detail view for one scheduled task: full schedule + behavior +
+/// the actual instructions it runs (inline prompt, or the checklist file's
+/// contents). The list rows are compact; this is where you inspect "what does
+/// this task actually do".
+private struct TaskDetailSheet: View {
+    let task: CTAClient.TaskJSON
+    let topicLabel: String
+    let lastRun: String?
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var checklistBody: String = ""
+    @State private var loadingBody = false
+
+    private var checklistName: String {
+        guard let c = task.checklist else { return "" }
+        return (c as NSString).lastPathComponent
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section("Schedule") {
+                    LabeledContent("Time", value: task.time)
+                    LabeledContent("Days", value: task.days.label)
+                    LabeledContent("Topic", value: topicLabel)
+                    LabeledContent("Status", value: task.enabled ? "Enabled" : "Disabled")
+                    if let lr = lastRun { LabeledContent("Last run", value: lr) }
+                }
+                Section("Behavior") {
+                    LabeledContent("Model", value: task.model ?? "Default (global)")
+                    LabeledContent("Effort", value: task.effort ?? "Default (global)")
+                    LabeledContent("Notify") {
+                        Text(task.notifyOnlyIf.map { "only if result contains \"\($0)\"" } ?? "every run")
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                    }
+                }
+                Section(task.checklist != nil ? "Checklist — \(checklistName)" : "Inline prompt") {
+                    if let p = task.prompt {
+                        Text(p)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else if loadingBody {
+                        ProgressView().frame(maxWidth: .infinity)
+                    } else {
+                        ScrollView {
+                            Text(checklistBody.isEmpty ? "(empty or unreadable — the file may have moved)" : checklistBody)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 220)
+                        if let path = task.checklist {
+                            Button("Open in editor") {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+                            }
+                            .font(.caption)
+                        }
+                    }
+                }
+            }
+            .formStyle(.grouped)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        }
+        .frame(width: 500, height: 580)
+        .onAppear { loadChecklist() }
+    }
+
+    private func loadChecklist() {
+        guard let path = task.checklist else { return }
+        loadingBody = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let body = (try? String(contentsOfFile: (path as NSString).expandingTildeInPath, encoding: .utf8)) ?? ""
+            DispatchQueue.main.async { checklistBody = body; loadingBody = false }
         }
     }
 }
